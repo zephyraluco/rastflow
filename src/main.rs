@@ -4,6 +4,30 @@ mod utils;
 
 use gpui::*;
 use gpui_component::*;
+use rust_embed::RustEmbed;
+use std::borrow::Cow;
+
+#[derive(RustEmbed)]
+#[folder = "./assets"]
+#[include = "icons/**/*.svg"]
+pub struct Assets;
+
+impl AssetSource for Assets {
+    fn load(&self, path: &str) -> anyhow::Result<Option<Cow<'static, [u8]>>> {
+        if path.is_empty() {
+            return Ok(None);
+        }
+        Self::get(path)
+            .map(|f| Some(f.data))
+            .ok_or_else(|| anyhow::anyhow!("could not find asset at path \"{path}\""))
+    }
+
+    fn list(&self, path: &str) -> anyhow::Result<Vec<SharedString>> {
+        Ok(Self::iter()
+            .filter_map(|p| p.starts_with(path).then(|| p.into()))
+            .collect())
+    }
+}
 use tray_icon::{
     TrayIconBuilder, TrayIconEvent,
     MouseButton as TrayMouseButton,
@@ -24,7 +48,7 @@ pub const WIN_H: f32 = 520.0;
 // ---------- 入口 ----------
 
 fn main() {
-    gpui_platform::application().run(move |cx| {
+    gpui_platform::application().with_assets(Assets).run(move |cx| {
         gpui_component::init(cx);
         cx.set_global(AppSettings::default());
 

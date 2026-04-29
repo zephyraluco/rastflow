@@ -159,9 +159,18 @@ pub struct SettingsView;
 
 impl Render for SettingsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+        v_flex()
             .size_full()
             .bg(cx.theme().background)
+            .child(
+                TitleBar::new().child(
+                    div()
+                        .text_sm()
+                        .font_semibold()
+                        .text_color(cx.theme().foreground)
+                        .child("设置"),
+                ),
+            )
             .child(Settings::new("settings").pages(build_settings_pages()))
     }
 }

@@ -9,6 +9,8 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["fo
 gpui-component = { git = "https://github.com/longbridge/gpui-component" }
 tray-icon = "0.22"
 raw-window-handle = "0.6"
+rust-embed = { version = "8", features = ["interpolate-folder-path"] }
+anyhow = "1"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }

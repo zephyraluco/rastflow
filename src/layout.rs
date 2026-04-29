@@ -60,7 +60,7 @@ impl LauncherDelegate {
         Self {
             all_entries,
             filtered,
-            selected_index: None,
+            selected_index: Some(IndexPath::default()),
         }
     }
 
@@ -79,7 +79,29 @@ impl LauncherDelegate {
                 .cloned()
                 .collect()
         };
-        self.selected_index = None;
+        self.selected_index = if self.filtered.is_empty() {
+            None
+        } else {
+            Some(IndexPath::default())
+        };
+    }
+
+    pub fn navigate_selection(&mut self, forward: bool) {
+        let len = self.filtered.len();
+        if len == 0 {
+            self.selected_index = None;
+            return;
+        }
+        self.selected_index = Some(match self.selected_index {
+            None => IndexPath::default(),
+            Some(ix) => {
+                if forward {
+                    IndexPath { section: 0, row: (ix.row + 1).min(len - 1), column: 0 }
+                } else {
+                    IndexPath { section: 0, row: ix.row.saturating_sub(1), column: 0 }
+                }
+            }
+        });
     }
 }
 
@@ -259,11 +281,30 @@ impl LauncherView {
             }
         });
 
+        // 上下键导航列表选项（输入框始终保持焦点）
+        let keystroke_sub = cx.observe_keystrokes(|this, ev, window, cx| {
+            if ev.keystroke.modifiers.modified() {
+                return;
+            }
+            let key = &ev.keystroke.key;
+            if key != "down" && key != "up" {
+                return;
+            }
+            if !this.input_state.read(cx).focus_handle(cx).is_focused(window) {
+                return;
+            }
+            let forward = key == "down";
+            this.list_state.update(cx, |list, cx| {
+                list.delegate_mut().navigate_selection(forward);
+                cx.notify();
+            });
+        });
+
         Self {
             input_state,
             list_state,
             drag_start: None,
-            _subscriptions: vec![input_sub, bounds_sub, activation_sub],
+            _subscriptions: vec![input_sub, bounds_sub, activation_sub, keystroke_sub],
         }
     }
 }
@@ -348,8 +389,9 @@ impl Render for LauncherView {
                                             size: size(px(800.), px(600.)),
                                         })),
                                         titlebar: Some(TitlebarOptions {
-                                            title: Some("设置".into()),
-                                            ..Default::default()
+                                            title: None,
+                                            appears_transparent: true,
+                                            traffic_light_position: Some(point(px(9.), px(9.))),
                                         }),
                                         ..Default::default()
                                     },
