@@ -1,7 +1,7 @@
 use gpui::*;
 use gpui_component::{
     button::{Button, ButtonVariants},
-    input::{Input, InputEvent, InputState},
+    input::{Escape, Input, InputEvent, InputState, MoveDown, MoveUp},
     list::{List, ListDelegate, ListItem, ListState},
     *,
 };
@@ -86,13 +86,13 @@ impl LauncherDelegate {
         };
     }
 
-    pub fn navigate_selection(&mut self, forward: bool) {
+    /// 计算下一个选中 index（纯函数，不修改自身状态）
+    pub fn navigate_selection(&self, forward: bool) -> Option<IndexPath> {
         let len = self.filtered.len();
         if len == 0 {
-            self.selected_index = None;
-            return;
+            return None;
         }
-        self.selected_index = Some(match self.selected_index {
+        Some(match self.selected_index {
             None => IndexPath::default(),
             Some(ix) => {
                 if forward {
@@ -101,7 +101,7 @@ impl LauncherDelegate {
                     IndexPath { section: 0, row: ix.row.saturating_sub(1), column: 0 }
                 }
             }
-        });
+        })
     }
 }
 
@@ -241,7 +241,11 @@ impl LauncherView {
 
         let list_state = cx.new(|cx| {
             let delegate = LauncherDelegate::new();
-            ListState::new(delegate, window, cx)
+            let mut state = ListState::new(delegate, window, cx);
+            // 同步初始选中项：ListState 默认 selected_index 为 None，
+            // 必须在此处手动设置，否则第一帧不会高亮第一项
+            state.set_selected_index(Some(IndexPath::default()), window, cx);
+            state
         });
 
         let input_sub = cx.subscribe_in(
@@ -250,13 +254,29 @@ impl LauncherView {
             {
                 let input_state = input_state.clone();
                 let list_state = list_state.clone();
-                move |_this, _, ev: &InputEvent, _window, cx| {
-                    if matches!(ev, InputEvent::Change) {
-                        let value = input_state.read(cx).value().to_string();
-                        list_state.update(cx, |state, cx| {
-                            state.delegate_mut().filter(&value);
-                            cx.notify();
-                        });
+                move |_this, _, ev: &InputEvent, window, cx| {
+                    match ev {
+                        InputEvent::Change => {
+                            let value = input_state.read(cx).value().to_string();
+                            list_state.update(cx, |state, cx| {
+                                state.delegate_mut().filter(&value);
+                                // 同步 ListState::selected_index，否则视觉选中不生效
+                                let new_ix = state.delegate().selected_index;
+                                state.set_selected_index(new_ix, window, cx);                                // 滚动到第一项
+                                state.scroll_to_selected_item(window, cx);                            });
+                        }
+                        InputEvent::PressEnter { secondary } => {
+                            // 输入框聚焦时 Enter 不在 List 的 dispatch path 里，
+                            // 需要手动触发选中项的确认逻辑
+                            let secondary = *secondary;
+                            list_state.update(cx, |state, cx| {
+                                if let Some(ix) = state.selected_index() {
+                                    state.delegate_mut().confirm(secondary, window, cx);
+                                    let _ = ix; // suppress unused warning
+                                }
+                            });
+                        }
+                        _ => {}
                     }
                 }
             },
@@ -281,31 +301,15 @@ impl LauncherView {
             }
         });
 
-        // 上下键导航列表选项（输入框始终保持焦点）
-        let keystroke_sub = cx.observe_keystrokes(|this, ev, window, cx| {
-            if ev.keystroke.modifiers.modified() {
-                return;
-            }
-            let key = &ev.keystroke.key;
-            if key != "down" && key != "up" {
-                return;
-            }
-            if !this.input_state.read(cx).focus_handle(cx).is_focused(window) {
-                return;
-            }
-            let forward = key == "down";
-            this.list_state.update(cx, |list, cx| {
-                list.delegate_mut().navigate_selection(forward);
-                cx.notify();
-            });
-        });
-
-        Self {
-            input_state,
+        let view = Self {
+            input_state: input_state.clone(),
             list_state,
             drag_start: None,
-            _subscriptions: vec![input_sub, bounds_sub, activation_sub, keystroke_sub],
-        }
+            _subscriptions: vec![input_sub, bounds_sub, activation_sub],
+        };
+        // 窗口创建时立即聚焦输入框，无需鼠标点击即可输入
+        input_state.update(cx, |input, cx| input.focus(window, cx));
+        view
     }
 }
 
@@ -314,6 +318,42 @@ impl Render for LauncherView {
         v_flex()
             .size_full()
             .bg(cx.theme().background)
+            // Esc：清空输入框、重置列表、隐藏窗口
+            .capture_action(cx.listener(|this, _: &Escape, window, cx| {
+                // 清空输入框
+                this.input_state.update(cx, |input, cx| {
+                    input.set_value("", window, cx);
+                });
+                // 重置列表到全量 + 选中第一项
+                this.list_state.update(cx, |list, cx| {
+                    list.delegate_mut().filter("");
+                    let new_ix = list.delegate().selected_index;
+                    list.set_selected_index(new_ix, window, cx);
+                    list.scroll_to_selected_item(window, cx);
+                });
+                // 隐藏窗口
+                hide_window(window);
+                cx.stop_propagation();
+            }))
+            // 上下键切换列表选项（capture 阶段先于 InputState 的 bubble 阶段处理）
+            // 必须调用 set_selected_index 同时更新 ListState::selected_index 和
+            // delegate::selected_index，否则视觉高亮不会刷新
+            .capture_action(cx.listener(|this, _: &MoveDown, window, cx| {
+                let new_ix = this.list_state.read(cx).delegate().navigate_selection(true);
+                this.list_state.update(cx, |list, cx| {
+                    list.set_selected_index(new_ix, window, cx);
+                    list.scroll_to_selected_item(window, cx);
+                });
+                cx.stop_propagation();
+            }))
+            .capture_action(cx.listener(|this, _: &MoveUp, window, cx| {
+                let new_ix = this.list_state.read(cx).delegate().navigate_selection(false);
+                this.list_state.update(cx, |list, cx| {
+                    list.set_selected_index(new_ix, window, cx);
+                    list.scroll_to_selected_item(window, cx);
+                });
+                cx.stop_propagation();
+            }))
             // 搜索栏：声明为窗口拖动区域，同时监听长按手势
             .child(
                 div()

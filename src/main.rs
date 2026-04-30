@@ -79,6 +79,13 @@ fn main() {
                 )
                 .expect("Failed to open window");
 
+            // 激活窗口，使其获得键盘焦点
+            let _ = cx.update(|cx| {
+                window_handle
+                    .update(cx, |_, window, _cx| window.activate_window())
+                    .ok();
+            });
+
             // ── 系统托盘 ─────────────────────────────────────────────────
             // 构建右键菜单
             let tray_menu = TrayMenu::new();
