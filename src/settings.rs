@@ -1,5 +1,67 @@
-use gpui::*;
-use gpui_component::{setting::*, *};
+use gpui::{prelude::FluentBuilder as _, *};
+use gpui_component::{button::Button, setting::*, *};
+
+use crate::layout::{load_entries_from_file, upsert_custom_entry};
+
+// ---------- 文件选择对话框 ----------
+
+#[cfg(windows)]
+fn pick_program_file() -> Option<String> {
+    use windows::{
+        Win32::{
+            System::Com::{
+                CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL,
+                COINIT_APARTMENTTHREADED,
+            },
+            UI::Shell::{
+                Common::COMDLG_FILTERSPEC, FileOpenDialog, IFileOpenDialog,
+                SIGDN_FILESYSPATH,
+            },
+        },
+        core::w,
+    };
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let dialog: IFileOpenDialog =
+            CoCreateInstance(&FileOpenDialog, None, CLSCTX_ALL).ok()?;
+
+        let filters = [
+            COMDLG_FILTERSPEC {
+                pszName: w!("程序文件"),
+                pszSpec: w!("*.exe;*.lnk;*.url;*.cmd;*.bat"),
+            },
+            COMDLG_FILTERSPEC {
+                pszName: w!("所有文件"),
+                pszSpec: w!("*.*"),
+            },
+        ];
+        let _ = dialog.SetFileTypes(&filters);
+
+        if dialog.Show(None).is_err() {
+            return None;
+        }
+
+        let item = dialog.GetResult().ok()?;
+        let path_pwstr = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+
+        let mut ptr = path_pwstr.0;
+        let mut len = 0usize;
+        while *ptr != 0 {
+            ptr = ptr.add(1);
+            len += 1;
+        }
+        let slice = std::slice::from_raw_parts(path_pwstr.0, len);
+        let path = String::from_utf16_lossy(slice);
+        CoTaskMemFree(Some(path_pwstr.0 as *mut core::ffi::c_void as *const _));
+
+        Some(path)
+    }
+}
+
+#[cfg(not(windows))]
+fn pick_program_file() -> Option<String> {
+    None
+}
 
 // ---------- 全局设置 ----------
 
@@ -11,6 +73,8 @@ pub struct AppSettings {
     pub show_descriptions: bool,
     pub search_in_desc: bool,
     pub max_results: SharedString,
+    /// 自定义程序列表版本号，变更时触发设置页重渲染。
+    pub custom_programs_version: u64,
     /// 窗口上次所在屏幕，用于多屏居中时决定目标屏幕。
     pub last_display: Option<DisplayId>,
 }
@@ -26,6 +90,7 @@ impl Default for AppSettings {
             show_descriptions: true,
             search_in_desc: true,
             max_results: "15".into(),
+            custom_programs_version: 0,
             last_display: None,
         }
     }
@@ -150,12 +215,141 @@ pub fn build_settings_pages() -> Vec<SettingPage> {
                         .description("搜索结果列表最多显示的应用数量"),
                     ),
             ),
+        SettingPage::new("自定义程序")
+            .icon(Icon::new(IconName::Plus))
+            .group(
+                SettingGroup::new().item(SettingItem::render(|_opts, _win, cx| {
+                    // 读取版本号：使此闭包订阅 AppSettings 变更，添加程序后自动刷新
+                    let _v = cx.global::<AppSettings>().custom_programs_version;
+                    let entries: Vec<(String, String)> = load_entries_from_file()
+                        .into_iter()
+                        .filter(|e| e.category.as_ref() == "自定义程序")
+                        .map(|e| (e.name.to_string(), e.launch_target.unwrap_or_default()))
+                        .collect();
+
+                    let fg = cx.theme().foreground;
+                    let muted = cx.theme().muted_foreground;
+                    let border = cx.theme().border;
+                    let strip_a = cx.theme().background;
+                    let strip_b = cx.theme().muted;
+
+                    v_flex()
+                        .w_full()
+                        .gap_2()
+                        .when(entries.is_empty(), |this| {
+                            this.child(
+                                div()
+                                    .w_full()
+                                    .py_8()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_sm()
+                                    .text_color(muted)
+                                    .child("暂未添加自定义程序"),
+                            )
+                        })
+                        .when(!entries.is_empty(), |this| {
+                            this.child(
+                                v_flex()
+                                    .w_full()
+                                    .rounded_lg()
+                                    .border_1()
+                                    .border_color(border)
+                                    .overflow_hidden()
+                                    .children(entries.into_iter().enumerate().map(
+                                        |(i, (name, path))| {
+                                            h_flex()
+                                                .w_full()
+                                                .px_3()
+                                                .py_2()
+                                                .gap_3()
+                                                .bg(if i % 2 == 0 { strip_a } else { strip_b })
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .text_sm()
+                                                        .font_semibold()
+                                                        .text_color(fg)
+                                                        .overflow_hidden()
+                                                        .child(name),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_shrink_0()
+                                                        .text_xs()
+                                                        .text_color(muted)
+                                                        .max_w_64()
+                                                        .overflow_hidden()
+                                                        .child(path),
+                                                )
+                                        },
+                                    )),
+                            )
+                        })
+                        .child(
+                            div()
+                                .w_full()
+                                .pt_3()
+                                .flex()
+                                .justify_center()
+                                .child(
+                                    Button::new("add-program-btn")
+                                        .child("添加程序")
+                                        .on_click(|_, _, cx| {
+                                            // 必须在独立 OS 线程上运行 COM 文件对话框，
+                                            // 否则 dialog.Show() 的内部消息泵会在
+                                            // App RefCell 已借用时触发 gpui 回调 → panic。
+                                            let (tx, rx) =
+                                                std::sync::mpsc::sync_channel::<Option<String>>(1);
+                                            std::thread::spawn(move || {
+                                                tx.send(pick_program_file()).ok();
+                                            });
+                                            cx.spawn(async move |async_cx: &mut gpui::AsyncApp| {
+                                                let picked: Option<String> = async_cx
+                                                    .background_executor()
+                                                    .spawn(async move {
+                                                        rx.recv().ok().flatten()
+                                                    })
+                                                    .await;
+                                                if let Some(path) = picked {
+                                                    async_cx
+                                                        .update(|cx| {
+                                                            if let Err(e) = upsert_custom_entry(
+                                                                "", "", "", &path,
+                                                            ) {
+                                                                eprintln!("添加程序失败: {e}");
+                                                            }
+                                                            cx.global_mut::<AppSettings>()
+                                                                .custom_programs_version +=
+                                                                1;
+                                                        })
+                                                        ;
+                                                }
+                                            })
+                                            .detach();
+                                        }),
+                                ),
+                        )
+                })),
+            ),
     ]
 }
 
 // ---------- 设置窗口视图 ----------
 
-pub struct SettingsView;
+pub struct SettingsView {
+    // 订阅 AppSettings 全局变更，确保添加程序后列表自动刷新
+    _global_sub: Subscription,
+}
+
+impl SettingsView {
+    pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let _global_sub =
+            cx.observe_global::<AppSettings>(|_, cx| cx.notify());
+        Self { _global_sub }
+    }
+}
 
 impl Render for SettingsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

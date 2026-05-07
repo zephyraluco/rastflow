@@ -4781,6 +4781,8 @@ dependencies = [
  "gpui_platform",
  "raw-window-handle",
  "rust-embed",
+ "serde",
+ "serde_json",
  "tray-icon",
  "windows 0.62.2",
 ]

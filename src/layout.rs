@@ -5,6 +5,10 @@ use gpui_component::{
     list::{List, ListDelegate, ListItem, ListState},
     *,
 };
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Instant;
 
 use crate::settings::{AppSettings, SettingsView};
@@ -17,6 +21,8 @@ pub struct AppEntry {
     pub name: SharedString,
     pub description: SharedString,
     pub category: SharedString,
+    pub launch_target: Option<String>,
+    pub launch_seq: u64,
 }
 
 impl AppEntry {
@@ -25,8 +31,322 @@ impl AppEntry {
             name: name.into(),
             description: description.into(),
             category: category.into(),
+            launch_target: None,
+            launch_seq: 0,
         }
     }
+
+    pub fn with_launch_target(
+        name: &str,
+        description: &str,
+        category: &str,
+        launch_target: Option<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            category: category.into(),
+            launch_target,
+            launch_seq: 0,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct StoredAppEntry {
+    name: String,
+    description: String,
+    category: String,
+    #[serde(default)]
+    launch_target: Option<String>,
+    #[serde(default)]
+    launch_seq: u64,
+}
+
+impl From<StoredAppEntry> for AppEntry {
+    fn from(value: StoredAppEntry) -> Self {
+        AppEntry::with_launch_target(
+            &value.name,
+            &value.description,
+            &value.category,
+            value.launch_target,
+        )
+        .with_launch_seq(value.launch_seq)
+    }
+}
+
+impl AppEntry {
+    fn with_launch_seq(mut self, launch_seq: u64) -> Self {
+        self.launch_seq = launch_seq;
+        self
+    }
+}
+
+fn app_list_path() -> PathBuf {
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("list.json")
+}
+
+fn default_test_entries() -> Vec<AppEntry> {
+    vec![
+        AppEntry::new("Visual Studio Code", "强大的跨平台代码编辑器", "开发工具"),
+        AppEntry::new("Firefox", "Mozilla 开源网页浏览器", "浏览器"),
+        AppEntry::new("Chrome", "Google 高速网页浏览器", "浏览器"),
+        AppEntry::new("Terminal", "系统命令行终端模拟器", "系统"),
+        AppEntry::new("Finder", "macOS 文件管理器", "系统"),
+        AppEntry::new("Spotify", "全球最大音乐流媒体平台", "娱乐"),
+        AppEntry::new("Slack", "团队实时沟通协作工具", "通讯"),
+        AppEntry::new("Notion", "一体化笔记与知识管理", "效率"),
+        AppEntry::new("Figma", "专业界面与原型设计工具", "设计"),
+        AppEntry::new("Postman", "API 接口调试与测试工具", "开发工具"),
+        AppEntry::new("Docker", "容器化应用开发与部署平台", "开发工具"),
+        AppEntry::new("iTerm2", "功能强大的终端增强工具", "系统"),
+        AppEntry::new("Obsidian", "本地优先的知识图谱笔记", "效率"),
+        AppEntry::new("Discord", "游戏玩家社区语音聊天工具", "通讯"),
+        AppEntry::new("Xcode", "Apple 官方 IDE 开发工具", "开发工具"),
+    ]
+}
+
+fn load_entries_from_json(path: &Path) -> Option<Vec<AppEntry>> {
+    let content = fs::read_to_string(path).ok()?;
+    let raw: Vec<StoredAppEntry> = serde_json::from_str(&content).ok()?;
+    if raw.is_empty() {
+        return None;
+    }
+    Some(raw.into_iter().map(Into::into).collect())
+}
+
+fn save_entries_to_json(path: &Path, entries: &[AppEntry]) {
+    let raw: Vec<StoredAppEntry> = entries
+        .iter()
+        .map(|e| StoredAppEntry {
+            name: e.name.to_string(),
+            description: e.description.to_string(),
+            category: e.category.to_string(),
+            launch_target: e.launch_target.clone(),
+            launch_seq: e.launch_seq,
+        })
+        .collect();
+
+    if let Ok(json) = serde_json::to_string_pretty(&raw) {
+        let _ = fs::write(path, json);
+    }
+}
+
+pub fn upsert_custom_entry(
+    name: &str,
+    description: &str,
+    category: &str,
+    launch_target: &str,
+) -> Result<(), String> {
+    let launch_target = launch_target.trim();
+    if launch_target.is_empty() {
+        return Err("请输入程序路径".into());
+    }
+
+    let target_path = Path::new(launch_target);
+    if !target_path.exists() {
+        return Err("程序路径不存在".into());
+    }
+
+    let resolved_name = if name.trim().is_empty() {
+        target_path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(launch_target)
+            .trim()
+            .to_string()
+    } else {
+        name.trim().to_string()
+    };
+
+    let resolved_description = if description.trim().is_empty() {
+        "用户添加的自定义程序".to_string()
+    } else {
+        description.trim().to_string()
+    };
+
+    let resolved_category = if category.trim().is_empty() {
+        "自定义程序".to_string()
+    } else {
+        category.trim().to_string()
+    };
+
+    let mut entries = load_or_discover_entries();
+    if let Some(existing) = entries.iter_mut().find(|entry| {
+        entry
+            .launch_target
+            .as_deref()
+            .is_some_and(|target| target.eq_ignore_ascii_case(launch_target))
+    }) {
+        existing.name = resolved_name.into();
+        existing.description = resolved_description.into();
+        existing.category = resolved_category.into();
+    } else {
+        entries.push(AppEntry::with_launch_target(
+            &resolved_name,
+            &resolved_description,
+            &resolved_category,
+            Some(launch_target.to_string()),
+        ));
+    }
+
+    sort_entries_by_launch(&mut entries);
+    save_entries_to_json(&app_list_path(), &entries);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn discover_windows_apps() -> Vec<AppEntry> {
+    use std::collections::HashSet;
+
+    fn should_keep(name: &str) -> bool {
+        let lowered = name.to_lowercase();
+        !lowered.is_empty() && !lowered.contains("uninstall") && !lowered.contains("卸载")
+    }
+
+    fn collect_from_dir(dir: &Path, seen: &mut HashSet<String>, out: &mut Vec<AppEntry>) {
+        if let Ok(read_dir) = fs::read_dir(dir) {
+            for entry in read_dir.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    collect_from_dir(&path, seen, out);
+                    continue;
+                }
+
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.to_ascii_lowercase())
+                    .unwrap_or_default();
+
+                if ext != "lnk" && ext != "url" {
+                    continue;
+                }
+
+                let Some(name) = path.file_stem().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+
+                let name = name.trim();
+                if !should_keep(name) {
+                    continue;
+                }
+
+                let key = name.to_lowercase();
+                if seen.insert(key) {
+                    out.push(AppEntry::with_launch_target(
+                        name,
+                        "系统检测到的程序",
+                        "系统程序",
+                        Some(path.to_string_lossy().to_string()),
+                    ));
+                }
+            }
+        }
+    }
+
+    let mut roots = Vec::new();
+    if let Ok(program_data) = std::env::var("ProgramData") {
+        roots.push(PathBuf::from(program_data).join("Microsoft\\Windows\\Start Menu\\Programs"));
+    }
+    if let Ok(app_data) = std::env::var("APPDATA") {
+        roots.push(PathBuf::from(app_data).join("Microsoft\\Windows\\Start Menu\\Programs"));
+    }
+
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for root in roots {
+        if root.exists() {
+            collect_from_dir(&root, &mut seen, &mut out);
+        }
+    }
+
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+#[cfg(not(windows))]
+fn discover_windows_apps() -> Vec<AppEntry> {
+    Vec::new()
+}
+
+/// Load all entries stored in list.json without triggering system discovery.
+/// Returns an empty Vec if the file doesn't exist or can't be parsed.
+pub fn load_entries_from_file() -> Vec<AppEntry> {
+    let path = app_list_path();
+    load_entries_from_json(&path).unwrap_or_default()
+}
+
+fn load_or_discover_entries() -> Vec<AppEntry> {
+    let list_path = app_list_path();
+
+    if list_path.exists() {
+        if let Some(entries) = load_entries_from_json(&list_path) {
+            #[cfg(windows)]
+            {
+                let has_launch_target = entries.iter().any(|e| e.launch_target.is_some());
+                if !has_launch_target {
+                    let discovered = discover_windows_apps();
+                    if !discovered.is_empty() {
+                        save_entries_to_json(&list_path, &discovered);
+                        return discovered;
+                    }
+                }
+            }
+            let mut entries = entries;
+            sort_entries_by_launch(&mut entries);
+            return entries;
+        }
+    }
+
+    let mut entries = discover_windows_apps();
+    if entries.is_empty() {
+        entries = default_test_entries();
+    }
+
+    sort_entries_by_launch(&mut entries);
+    save_entries_to_json(&list_path, &entries);
+    entries
+}
+
+fn sort_entries_by_launch(entries: &mut [AppEntry]) {
+    entries.sort_by(|a, b| {
+        b.launch_seq
+            .cmp(&a.launch_seq)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+}
+
+fn entry_identity(entry: &AppEntry) -> (String, String) {
+    (
+        entry.name.to_string(),
+        entry.launch_target.clone().unwrap_or_default(),
+    )
+}
+
+#[cfg(windows)]
+fn launch_entry(entry: &AppEntry) -> std::io::Result<()> {
+    let mut cmd = Command::new("cmd");
+    cmd.args(["/C", "start", ""]);
+
+    if let Some(target) = &entry.launch_target {
+        cmd.arg(target);
+    } else {
+        cmd.arg(entry.name.to_string());
+    }
+
+    cmd.spawn().map(|_| ())
+}
+
+#[cfg(not(windows))]
+fn launch_entry(_entry: &AppEntry) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "当前平台尚未实现程序启动",
+    ))
 }
 
 // ---------- List Delegate ----------
@@ -39,29 +359,18 @@ pub struct LauncherDelegate {
 
 impl LauncherDelegate {
     pub fn new() -> Self {
-        let all_entries = vec![
-            AppEntry::new("Visual Studio Code", "强大的跨平台代码编辑器", "开发工具"),
-            AppEntry::new("Firefox", "Mozilla 开源网页浏览器", "浏览器"),
-            AppEntry::new("Chrome", "Google 高速网页浏览器", "浏览器"),
-            AppEntry::new("Terminal", "系统命令行终端模拟器", "系统"),
-            AppEntry::new("Finder", "macOS 文件管理器", "系统"),
-            AppEntry::new("Spotify", "全球最大音乐流媒体平台", "娱乐"),
-            AppEntry::new("Slack", "团队实时沟通协作工具", "通讯"),
-            AppEntry::new("Notion", "一体化笔记与知识管理", "效率"),
-            AppEntry::new("Figma", "专业界面与原型设计工具", "设计"),
-            AppEntry::new("Postman", "API 接口调试与测试工具", "开发工具"),
-            AppEntry::new("Docker", "容器化应用开发与部署平台", "开发工具"),
-            AppEntry::new("iTerm2", "功能强大的终端增强工具", "系统"),
-            AppEntry::new("Obsidian", "本地优先的知识图谱笔记", "效率"),
-            AppEntry::new("Discord", "游戏玩家社区语音聊天工具", "通讯"),
-            AppEntry::new("Xcode", "Apple 官方 IDE 开发工具", "开发工具"),
-        ];
+        let all_entries = load_or_discover_entries();
         let filtered = all_entries.clone();
         Self {
             all_entries,
             filtered,
             selected_index: Some(IndexPath::default()),
         }
+    }
+
+    pub fn reload(&mut self, query: &str) {
+        self.all_entries = load_or_discover_entries();
+        self.filter(query);
     }
 
     pub fn filter(&mut self, query: &str) {
@@ -84,6 +393,43 @@ impl LauncherDelegate {
         } else {
             Some(IndexPath::default())
         };
+    }
+
+    fn mark_launched(&mut self, launched: &AppEntry) {
+        let launched_key = entry_identity(launched);
+        let next_seq = self
+            .all_entries
+            .iter()
+            .map(|e| e.launch_seq)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+
+        if let Some(item) = self
+            .all_entries
+            .iter_mut()
+            .find(|e| entry_identity(e) == launched_key)
+        {
+            item.launch_seq = next_seq;
+        }
+
+        if let Some(item) = self
+            .filtered
+            .iter_mut()
+            .find(|e| entry_identity(e) == launched_key)
+        {
+            item.launch_seq = next_seq;
+        }
+
+        sort_entries_by_launch(&mut self.all_entries);
+        sort_entries_by_launch(&mut self.filtered);
+        self.selected_index = if self.filtered.is_empty() {
+            None
+        } else {
+            Some(IndexPath::default())
+        };
+
+        save_entries_to_json(&app_list_path(), &self.all_entries);
     }
 
     /// 计算下一个选中 index（纯函数，不修改自身状态）
@@ -199,12 +545,19 @@ impl ListDelegate for LauncherDelegate {
     fn confirm(
         &mut self,
         _secondary: bool,
-        _window: &mut Window,
-        _cx: &mut Context<ListState<Self>>,
+        window: &mut Window,
+        cx: &mut Context<ListState<Self>>,
     ) {
         if let Some(ix) = self.selected_index {
             if let Some(entry) = self.filtered.get(ix.row) {
-                println!("🚀 启动应用: {}", entry.name);
+                let launched = entry.clone();
+                if let Err(err) = launch_entry(&launched) {
+                    eprintln!("启动失败 [{}]: {err}", entry.name);
+                } else {
+                    self.mark_launched(&launched);
+                    cx.notify();
+                    hide_window(window);
+                }
             }
         }
     }
@@ -290,11 +643,21 @@ impl LauncherView {
             }
         });
 
-        // 失去焦点时彻底隐藏（SW_HIDE）；获得焦点时居中（从托盘唤出场景）
-        let activation_sub = cx.observe_window_activation(window, |_, window, cx| {
+        // 失去焦点时彻底隐藏（SW_HIDE）；获得焦点时居中并刷新列表排序
+        let activation_sub = cx.observe_window_activation(window, |this, window, cx| {
             if window.is_window_active() {
-                // 再次居中（作为保险，主要居中逻辑在托盘事件处理中）
+                // 居中（作为保险，主要居中逻辑在托盘事件处理中）
                 center_window(window, cx);
+                // 清空输入框，并按最新启动序号重排列表
+                this.input_state.update(cx, |input, cx| {
+                    input.set_value("", window, cx);
+                });
+                this.list_state.update(cx, |list, cx| {
+                    list.delegate_mut().reload("");
+                    let new_ix = list.delegate().selected_index;
+                    list.set_selected_index(new_ix, window, cx);
+                    list.scroll_to_selected_item(window, cx);
+                });
             } else {
                 // SW_HIDE：彻底隐藏，不产生桌面图标
                 hide_window(window);
@@ -436,7 +799,7 @@ impl Render for LauncherView {
                                         ..Default::default()
                                     },
                                     |window, cx| {
-                                        let view = cx.new(|_| SettingsView);
+                                        let view = cx.new(|cx| SettingsView::new(window, cx));
                                         cx.new(|cx| Root::new(view, window, cx))
                                     },
                                 );
