@@ -330,6 +330,9 @@ fn entry_identity(entry: &AppEntry) -> (String, String) {
 
 #[cfg(windows)]
 fn launch_entry(entry: &AppEntry) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
     let mut cmd = Command::new("cmd");
     cmd.args(["/C", "start", ""]);
 
@@ -339,7 +342,7 @@ fn launch_entry(entry: &AppEntry) -> std::io::Result<()> {
         cmd.arg(entry.name.to_string());
     }
 
-    cmd.spawn().map(|_| ())
+    cmd.creation_flags(CREATE_NO_WINDOW).spawn().map(|_| ())
 }
 
 #[cfg(not(windows))]
