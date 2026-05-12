@@ -2,6 +2,7 @@ use gpui::{prelude::FluentBuilder as _, *};
 use gpui_component::{button::Button, setting::*, *};
 
 use crate::layout::{load_entries_from_file, upsert_custom_entry};
+use crate::locale::t;
 
 // ---------- 文件选择对话框 ----------
 
@@ -77,6 +78,8 @@ pub struct AppSettings {
     pub custom_programs_version: u64,
     /// 窗口上次所在屏幕，用于多屏居中时决定目标屏幕。
     pub last_display: Option<DisplayId>,
+    /// 唤出界面的全局快捷键，格式如 "alt+space"。
+    pub hotkey: SharedString,
 }
 
 impl Global for AppSettings {}
@@ -92,42 +95,52 @@ impl Default for AppSettings {
             max_results: "15".into(),
             custom_programs_version: 0,
             last_display: None,
+            hotkey: "alt+space".into(),
         }
     }
 }
 
 // ---------- 设置页面数据 ----------
 
-pub fn build_settings_pages() -> Vec<SettingPage> {
+pub fn build_settings_pages(lang: &str) -> Vec<SettingPage> {
     let default = AppSettings::default();
+    // 将语言克隆到 'static str 用于闭包捕获
+    let lang: &'static str = Box::leak(lang.to_string().into_boxed_str());
 
     vec![
-        SettingPage::new("外观")
+        SettingPage::new(zh_en(lang, "外观", "Appearance"))
             .icon(Icon::new(IconName::Settings2))
             .group(
                 SettingGroup::new()
-                    .title("主题与语言")
+                    .title(zh_en(lang, "主题与语言", "Theme & Language"))
                     .item(
                         SettingItem::new(
-                            "配色主题",
+                            zh_en(lang, "配色主题", "Color Theme"),
                             SettingField::dropdown(
                                 vec![
-                                    ("system".into(), "跟随系统".into()),
-                                    ("light".into(), "浅色".into()),
-                                    ("dark".into(), "深色".into()),
+                                    ("system".into(), zh_en(lang, "跟随系统", "Follow System").into()),
+                                    ("light".into(),  zh_en(lang, "浅色", "Light").into()),
+                                    ("dark".into(),   zh_en(lang, "深色", "Dark").into()),
                                 ],
                                 |cx: &App| cx.global::<AppSettings>().theme.clone(),
                                 |val: SharedString, cx: &mut App| {
-                                    cx.global_mut::<AppSettings>().theme = val;
+                                    cx.global_mut::<AppSettings>().theme = val.clone();
+                                    // 即时应用主题
+                                    match val.as_ref() {
+                                        "dark"   => Theme::change(ThemeMode::Dark, None, cx),
+                                        "light"  => Theme::change(ThemeMode::Light, None, cx),
+                                        _        => Theme::sync_system_appearance(None, cx),
+                                    }
+                                    cx.refresh_windows();
                                 },
                             )
                             .default_value(default.theme.clone()),
                         )
-                        .description("选择应用程序的配色主题"),
+                        .description(zh_en(lang, "选择应用程序的配色主题", "Choose the color theme for the application")),
                     )
                     .item(
                         SettingItem::new(
-                            "界面语言",
+                            zh_en(lang, "界面语言", "Language"),
                             SettingField::dropdown(
                                 vec![
                                     ("zh".into(), "简体中文".into()),
@@ -136,19 +149,20 @@ pub fn build_settings_pages() -> Vec<SettingPage> {
                                 |cx: &App| cx.global::<AppSettings>().language.clone(),
                                 |val: SharedString, cx: &mut App| {
                                     cx.global_mut::<AppSettings>().language = val;
+                                    cx.refresh_windows();
                                 },
                             )
                             .default_value(default.language.clone()),
                         )
-                        .description("选择界面显示语言"),
+                        .description(zh_en(lang, "选择界面显示语言", "Select the display language")),
                     ),
             )
             .group(
                 SettingGroup::new()
-                    .title("显示")
+                    .title(zh_en(lang, "显示", "Display"))
                     .item(
                         SettingItem::new(
-                            "显示应用描述",
+                            zh_en(lang, "显示应用描述", "Show App Descriptions"),
                             SettingField::switch(
                                 |cx: &App| cx.global::<AppSettings>().show_descriptions,
                                 |val: bool, cx: &mut App| {
@@ -157,17 +171,17 @@ pub fn build_settings_pages() -> Vec<SettingPage> {
                             )
                             .default_value(default.show_descriptions),
                         )
-                        .description("在列表中显示应用程序的描述文字"),
+                        .description(zh_en(lang, "在列表中显示应用程序的描述文字", "Show app descriptions in the list")),
                     ),
             ),
-        SettingPage::new("行为")
+        SettingPage::new(zh_en(lang, "行为", "Behavior"))
             .icon(Icon::new(IconName::Settings))
             .group(
                 SettingGroup::new()
-                    .title("启动")
+                    .title(zh_en(lang, "启动", "Startup"))
                     .item(
                         SettingItem::new(
-                            "开机自动启动",
+                            zh_en(lang, "开机自动启动", "Launch at Login"),
                             SettingField::switch(
                                 |cx: &App| cx.global::<AppSettings>().auto_launch,
                                 |val: bool, cx: &mut App| {
@@ -176,15 +190,15 @@ pub fn build_settings_pages() -> Vec<SettingPage> {
                             )
                             .default_value(default.auto_launch),
                         )
-                        .description("系统启动时自动运行程序启动器"),
+                        .description(zh_en(lang, "系统启动时自动运行程序启动器", "Automatically start the launcher at system boot")),
                     ),
             )
             .group(
                 SettingGroup::new()
-                    .title("搜索")
+                    .title(zh_en(lang, "搜索", "Search"))
                     .item(
                         SettingItem::new(
-                            "搜索包含描述",
+                            zh_en(lang, "搜索包含描述", "Search in Descriptions"),
                             SettingField::switch(
                                 |cx: &App| cx.global::<AppSettings>().search_in_desc,
                                 |val: bool, cx: &mut App| {
@@ -193,17 +207,17 @@ pub fn build_settings_pages() -> Vec<SettingPage> {
                             )
                             .default_value(default.search_in_desc),
                         )
-                        .description("搜索时同时匹配应用程序的描述文字"),
+                        .description(zh_en(lang, "搜索时同时匹配应用程序的描述文字", "Include app descriptions when searching")),
                     )
                     .item(
                         SettingItem::new(
-                            "最大显示数量",
+                            zh_en(lang, "最大显示数量", "Max Results"),
                             SettingField::dropdown(
                                 vec![
-                                    ("5".into(), "5 条".into()),
-                                    ("10".into(), "10 条".into()),
-                                    ("15".into(), "15 条".into()),
-                                    ("20".into(), "20 条".into()),
+                                    ("5".into(),  zh_en(lang, "5 条",  "5").into()),
+                                    ("10".into(), zh_en(lang, "10 条", "10").into()),
+                                    ("15".into(), zh_en(lang, "15 条", "15").into()),
+                                    ("20".into(), zh_en(lang, "20 条", "20").into()),
                                 ],
                                 |cx: &App| cx.global::<AppSettings>().max_results.clone(),
                                 |val: SharedString, cx: &mut App| {
@@ -212,10 +226,40 @@ pub fn build_settings_pages() -> Vec<SettingPage> {
                             )
                             .default_value(default.max_results.clone()),
                         )
-                        .description("搜索结果列表最多显示的应用数量"),
+                        .description(zh_en(lang, "搜索结果列表最多显示的应用数量", "Maximum number of results shown in the list")),
                     ),
             ),
-        SettingPage::new("自定义程序")
+        SettingPage::new(zh_en(lang, "快捷键", "Hotkeys"))
+            .icon(Icon::new(IconName::Star))
+            .group(
+                SettingGroup::new()
+                    .title(zh_en(lang, "全局快捷键", "Global Hotkeys"))
+                    .item(
+                        SettingItem::new(
+                            zh_en(lang, "唤出界面", "Show Launcher"),
+                            SettingField::dropdown(
+                                vec![
+                                    ("alt+space".into(),        "Alt + Space".into()),
+                                    ("ctrl+space".into(),       "Ctrl + Space".into()),
+                                    ("ctrl+alt+space".into(),   "Ctrl + Alt + Space".into()),
+                                    ("super+space".into(),      "Win + Space".into()),
+                                    ("ctrl+shift+space".into(), "Ctrl + Shift + Space".into()),
+                                ],
+                                |cx: &App| cx.global::<AppSettings>().hotkey.clone(),
+                                |val: SharedString, cx: &mut App| {
+                                    cx.global_mut::<AppSettings>().hotkey = val;
+                                },
+                            )
+                            .default_value(default.hotkey.clone()),
+                        )
+                        .description(zh_en(
+                            lang,
+                            "按下此快捷键可随时从任意窗口唤出启动器界面",
+                            "Press this hotkey to open the launcher from anywhere",
+                        )),
+                    ),
+            ),
+        SettingPage::new(zh_en(lang, "自定义程序", "Custom Apps"))
             .icon(Icon::new(IconName::Plus))
             .group(
                 SettingGroup::new().item(SettingItem::render(|_opts, _win, cx| {
@@ -246,7 +290,7 @@ pub fn build_settings_pages() -> Vec<SettingPage> {
                                     .justify_center()
                                     .text_sm()
                                     .text_color(muted)
-                                    .child("暂未添加自定义程序"),
+                                    .child(zh_en(lang, "暂未添加自定义程序", "No custom apps added yet")),
                             )
                         })
                         .when(!entries.is_empty(), |this| {
@@ -295,7 +339,7 @@ pub fn build_settings_pages() -> Vec<SettingPage> {
                                 .justify_center()
                                 .child(
                                     Button::new("add-program-btn")
-                                        .child("添加程序")
+                                        .child(zh_en(lang, "添加程序", "Add App"))
                                         .on_click(|_, _, cx| {
                                             // 必须在独立 OS 线程上运行 COM 文件对话框，
                                             // 否则 dialog.Show() 的内部消息泵会在
@@ -336,6 +380,13 @@ pub fn build_settings_pages() -> Vec<SettingPage> {
     ]
 }
 
+// ---------- 辅助函数 ----------
+
+/// 根据语言返回中文或英文字符串。
+fn zh_en(lang: &str, zh: &'static str, en: &'static str) -> &'static str {
+    if lang == "en" { en } else { zh }
+}
+
 // ---------- 设置窗口视图 ----------
 
 pub struct SettingsView {
@@ -353,6 +404,8 @@ impl SettingsView {
 
 impl Render for SettingsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let lang = cx.global::<AppSettings>().language.to_string();
+        let title = t("settings.title", cx);
         v_flex()
             .size_full()
             .bg(cx.theme().background)
@@ -362,9 +415,9 @@ impl Render for SettingsView {
                         .text_sm()
                         .font_semibold()
                         .text_color(cx.theme().foreground)
-                        .child("设置"),
+                        .child(title),
                 ),
             )
-            .child(Settings::new("settings").pages(build_settings_pages()))
+            .child(Settings::new("settings").pages(build_settings_pages(&lang)))
     }
 }

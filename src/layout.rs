@@ -13,6 +13,7 @@ use std::time::Instant;
 
 use crate::settings::{AppSettings, SettingsView};
 use crate::utils::{center_window, hide_window};
+use crate::locale::t;
 
 // ---------- 数据结构 ----------
 
@@ -565,14 +566,14 @@ impl ListDelegate for LauncherDelegate {
     fn render_empty(
         &mut self,
         _window: &mut Window,
-        _cx: &mut Context<ListState<Self>>,
+        cx: &mut Context<ListState<Self>>,
     ) -> impl IntoElement {
         div()
             .flex()
             .items_center()
             .justify_center()
             .p_8()
-            .child("没有找到匹配的应用程序")
+            .child(t("search.empty", cx))
     }
 }
 
@@ -589,7 +590,7 @@ pub struct LauncherView {
 impl LauncherView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input_state = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("搜索应用程序...")
+            InputState::new(window, cx).placeholder(t("search.placeholder", cx))
         });
 
         let list_state = cx.new(|cx| {
@@ -664,11 +665,23 @@ impl LauncherView {
             }
         });
 
+        // 语言切换时更新搜索框占位符并通知重绘
+        let settings_sub = cx.observe_global_in::<AppSettings>(window, {
+            let input_state = input_state.clone();
+            move |_, window, cx| {
+                let new_placeholder = t("search.placeholder", cx);
+                input_state.update(cx, |input, cx| {
+                    input.set_placeholder(new_placeholder, window, cx);
+                });
+                cx.notify();
+            }
+        });
+
         let view = Self {
             input_state: input_state.clone(),
             list_state,
             drag_start: None,
-            _subscriptions: vec![input_sub, bounds_sub, activation_sub],
+            _subscriptions: vec![input_sub, bounds_sub, activation_sub, settings_sub],
         };
         // 窗口创建时立即聚焦输入框，无需鼠标点击即可输入
         input_state.update(cx, |input, cx| input.focus(window, cx));
@@ -776,9 +789,9 @@ impl Render for LauncherView {
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .items_center()
-                    .child("↑↓ 选择")
-                    .child("↵ 启动")
-                    .child("Esc 关闭")
+                    .child(t("hint.select", cx))
+                    .child(t("hint.launch", cx))
+                    .child(t("hint.close", cx))
                     .child(div().flex_1())
                     .child(
                         Button::new("settings-btn")

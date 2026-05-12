@@ -2,12 +2,14 @@
 name = "rastflow"
 version = "0.1.0"
 edition = "2024"
+authors = ["zephyraluco <zephyraluco@gmail.com>"]
 
 [dependencies]
 gpui = { git = "https://github.com/zed-industries/zed" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
 gpui-component = { git = "https://github.com/longbridge/gpui-component" }
 tray-icon = "0.22"
+global-hotkey = "0.8"
 raw-window-handle = "0.6"
 rust-embed = { version = "8", features = ["interpolate-folder-path"] }
 anyhow = "1"
@@ -21,4 +23,5 @@ windows = { version = "0.62", features = [
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
     "Win32_System_Com",
+    "Win32_System_Registry",
 ] }

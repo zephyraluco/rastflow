@@ -105,3 +105,129 @@ pub fn center_window(window: &mut Window, cx: &impl Deref<Target = App>) {
     #[cfg(not(windows))]
     let _ = bounds;
 }
+
+// ---------- 开机自启 ----------
+
+/// 注册表运行键路径（当前用户）。
+const AUTO_LAUNCH_REG_PATH: &str =
+    "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+/// 注册表值名称（即本程序在 Run 键下的条目名）。
+const AUTO_LAUNCH_VALUE: &str = "rastflow";
+
+/// 从注册表读取当前是否已启用开机自启。
+#[cfg(windows)]
+pub fn auto_launch_is_enabled() -> bool {
+    use windows::{
+        Win32::System::Registry::{
+            RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY_CURRENT_USER, KEY_READ,
+        },
+        core::PCWSTR,
+    };
+
+    let key_path: Vec<u16> = AUTO_LAUNCH_REG_PATH
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let value_name: Vec<u16> = AUTO_LAUNCH_VALUE
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    unsafe {
+        let mut hkey = Default::default();
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(key_path.as_ptr()),
+            None,
+            KEY_READ,
+            &mut hkey,
+        )
+        .is_err()
+        {
+            return false;
+        }
+        let result = RegQueryValueExW(
+            hkey,
+            PCWSTR(value_name.as_ptr()),
+            None,
+            None,
+            None,
+            None,
+        );
+        let _ = RegCloseKey(hkey);
+        result.is_ok()
+    }
+}
+
+/// 启用或禁用开机自启（写入/删除注册表 Run 键条目）。
+#[cfg(windows)]
+pub fn auto_launch_set(enable: bool) {
+    use windows::{
+        Win32::System::Registry::{
+            RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegSetValueExW,
+            HKEY_CURRENT_USER, KEY_WRITE, REG_SZ,
+        },
+        core::PCWSTR,
+    };
+
+    let key_path: Vec<u16> = AUTO_LAUNCH_REG_PATH
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let value_name: Vec<u16> = AUTO_LAUNCH_VALUE
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    unsafe {
+        let mut hkey = Default::default();
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(key_path.as_ptr()),
+            None,
+            KEY_WRITE,
+            &mut hkey,
+        )
+        .is_err()
+        {
+            eprintln!("auto_launch_set: 无法打开注册表键");
+            return;
+        }
+
+        if enable {
+            if let Ok(exe) = std::env::current_exe() {
+                // 路径带引号，防止路径含空格时启动失败
+                let quoted = format!("\"{}\"", exe.to_string_lossy());
+                let data: Vec<u16> =
+                    quoted.encode_utf16().chain(std::iter::once(0)).collect();
+                let bytes = std::slice::from_raw_parts(
+                    data.as_ptr() as *const u8,
+                    data.len() * 2,
+                );
+                let result = RegSetValueExW(
+                    hkey,
+                    PCWSTR(value_name.as_ptr()),
+                    None,
+                    REG_SZ,
+                    Some(bytes),
+                );
+                if result != windows::Win32::Foundation::NO_ERROR {
+                    eprintln!("auto_launch_set: 写入注册表失败: {:?}", result);
+                }
+            }
+        } else {
+            // 删除条目；若不存在则忽略错误
+            let _ = RegDeleteValueW(hkey, PCWSTR(value_name.as_ptr()));
+        }
+
+        let _ = RegCloseKey(hkey);
+    }
+}
+
+#[cfg(not(windows))]
+pub fn auto_launch_is_enabled() -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+pub fn auto_launch_set(_enable: bool) {}
