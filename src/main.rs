@@ -4,6 +4,7 @@ mod settings;
 mod layout;
 mod locale;
 mod utils;
+mod icons;
 
 use gpui::*;
 use gpui_component::*;
