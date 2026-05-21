@@ -361,7 +361,7 @@ pub fn build_settings_pages(lang: &str) -> Vec<SettingPage> {
                                                     async_cx
                                                         .update(|cx| {
                                                             if let Err(e) = upsert_custom_entry(
-                                                                "", "", "", &path,
+                                                                "", "", &path,
                                                             ) {
                                                                 eprintln!("添加程序失败: {e}");
                                                             }

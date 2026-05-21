@@ -74,7 +74,6 @@ impl LauncherDelegate {
                 .iter()
                 .filter(|e| {
                     e.name.to_lowercase().contains(&q)
-                        || e.description.to_lowercase().contains(&q)
                         || e.category.to_lowercase().contains(&q)
                 })
                 .cloned()
@@ -89,20 +88,13 @@ impl LauncherDelegate {
 
     fn mark_launched(&mut self, launched: &AppEntry) {
         let launched_key = entry_identity(launched);
-        let next_seq = self
-            .all_entries
-            .iter()
-            .map(|e| e.launch_seq)
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
 
         if let Some(item) = self
             .all_entries
             .iter_mut()
             .find(|e| entry_identity(e) == launched_key)
         {
-            item.launch_seq = next_seq;
+            item.launch_count += 1;
         }
 
         if let Some(item) = self
@@ -110,7 +102,7 @@ impl LauncherDelegate {
             .iter_mut()
             .find(|e| entry_identity(e) == launched_key)
         {
-            item.launch_seq = next_seq;
+            item.launch_count += 1;
         }
 
         sort_entries_by_launch(&mut self.all_entries);

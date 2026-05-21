@@ -8,40 +8,36 @@ use std::sync::OnceLock;
 #[derive(Clone)]
 pub struct AppEntry {
     pub name: SharedString,
-    pub description: SharedString,
     pub category: SharedString,
     pub launch_target: Option<String>,
-    pub launch_seq: u64,
+    pub launch_count: u64,
 }
 
 impl AppEntry {
-    pub fn new(name: &str, description: &str, category: &str) -> Self {
+    pub fn new(name: &str, category: &str) -> Self {
         Self {
             name: name.into(),
-            description: description.into(),
             category: category.into(),
             launch_target: None,
-            launch_seq: 0,
+            launch_count: 0,
         }
     }
 
     pub fn with_launch_target(
         name: &str,
-        description: &str,
         category: &str,
         launch_target: Option<String>,
     ) -> Self {
         Self {
             name: name.into(),
-            description: description.into(),
             category: category.into(),
             launch_target,
-            launch_seq: 0,
+            launch_count: 0,
         }
     }
 
-    pub fn with_launch_seq(mut self, launch_seq: u64) -> Self {
-        self.launch_seq = launch_seq;
+    pub fn with_launch_count(mut self, launch_count: u64) -> Self {
+        self.launch_count = launch_count;
         self
     }
 }
@@ -74,10 +70,9 @@ fn pool() -> &'static SqlitePool {
             sqlx::query(
                 "CREATE TABLE IF NOT EXISTS app_entries (
                     name         TEXT    NOT NULL,
-                    description  TEXT    NOT NULL DEFAULT '',
                     category     TEXT    NOT NULL DEFAULT '',
                     launch_target TEXT,
-                    launch_seq   INTEGER NOT NULL DEFAULT 0
+                    launch_count INTEGER NOT NULL DEFAULT 0
                 )",
             )
             .execute(&pool)
@@ -93,28 +88,28 @@ fn pool() -> &'static SqlitePool {
 pub fn db_path() -> PathBuf {
     std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
-        .join("rastflow.db")
+        .join("applist.db")
 }
 
 // ---------- 默认数据 ----------
 
 fn default_test_entries() -> Vec<AppEntry> {
     vec![
-        AppEntry::new("Visual Studio Code", "强大的跨平台代码编辑器", "开发工具"),
-        AppEntry::new("Firefox", "Mozilla 开源网页浏览器", "浏览器"),
-        AppEntry::new("Chrome", "Google 高速网页浏览器", "浏览器"),
-        AppEntry::new("Terminal", "系统命令行终端模拟器", "系统"),
-        AppEntry::new("Finder", "macOS 文件管理器", "系统"),
-        AppEntry::new("Spotify", "全球最大音乐流媒体平台", "娱乐"),
-        AppEntry::new("Slack", "团队实时沟通协作工具", "通讯"),
-        AppEntry::new("Notion", "一体化笔记与知识管理", "效率"),
-        AppEntry::new("Figma", "专业界面与原型设计工具", "设计"),
-        AppEntry::new("Postman", "API 接口调试与测试工具", "开发工具"),
-        AppEntry::new("Docker", "容器化应用开发与部署平台", "开发工具"),
-        AppEntry::new("iTerm2", "功能强大的终端增强工具", "系统"),
-        AppEntry::new("Obsidian", "本地优先的知识图谱笔记", "效率"),
-        AppEntry::new("Discord", "游戏玩家社区语音聊天工具", "通讯"),
-        AppEntry::new("Xcode", "Apple 官方 IDE 开发工具", "开发工具"),
+        AppEntry::new("Visual Studio Code", "开发工具"),
+        AppEntry::new("Firefox", "浏览器"),
+        AppEntry::new("Chrome", "浏览器"),
+        AppEntry::new("Terminal", "系统"),
+        AppEntry::new("Finder", "系统"),
+        AppEntry::new("Spotify", "娱乐"),
+        AppEntry::new("Slack", "通讯"),
+        AppEntry::new("Notion", "效率"),
+        AppEntry::new("Figma", "设计"),
+        AppEntry::new("Postman", "开发工具"),
+        AppEntry::new("Docker", "开发工具"),
+        AppEntry::new("iTerm2", "系统"),
+        AppEntry::new("Obsidian", "效率"),
+        AppEntry::new("Discord", "通讯"),
+        AppEntry::new("Xcode", "开发工具"),
     ]
 }
 
@@ -124,7 +119,7 @@ fn load_all_from_db() -> Vec<AppEntry> {
     let p = pool(); // 必须在 block_on 外部获取，避免嵌套 block_on panic
     runtime().block_on(async move {
         let rows = sqlx::query(
-            "SELECT name, description, category, launch_target, launch_seq FROM app_entries",
+            "SELECT name, category, launch_target, launch_count FROM app_entries",
         )
         .fetch_all(p)
         .await
@@ -133,10 +128,9 @@ fn load_all_from_db() -> Vec<AppEntry> {
         rows.into_iter()
             .map(|row| AppEntry {
                 name: row.get::<String, _>("name").into(),
-                description: row.get::<String, _>("description").into(),
                 category: row.get::<String, _>("category").into(),
                 launch_target: row.get("launch_target"),
-                launch_seq: row.get::<i64, _>("launch_seq") as u64,
+                launch_count: row.get::<i64, _>("launch_count") as u64,
             })
             .collect()
     })
@@ -153,14 +147,13 @@ pub fn save_entries(entries: &[AppEntry]) {
             .expect("delete entries");
         for e in &owned {
             sqlx::query(
-                "INSERT INTO app_entries (name, description, category, launch_target, launch_seq)
-                 VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO app_entries (name, category, launch_target, launch_count)
+                 VALUES (?, ?, ?, ?)",
             )
             .bind(e.name.as_ref())
-            .bind(e.description.as_ref())
             .bind(e.category.as_ref())
             .bind(e.launch_target.as_deref())
-            .bind(e.launch_seq as i64)
+            .bind(e.launch_count as i64)
             .execute(&mut *tx)
             .await
             .expect("insert entry");
@@ -171,7 +164,6 @@ pub fn save_entries(entries: &[AppEntry]) {
 
 pub fn upsert_custom_entry(
     name: &str,
-    description: &str,
     category: &str,
     launch_target: &str,
 ) -> Result<(), String> {
@@ -198,12 +190,6 @@ pub fn upsert_custom_entry(
         name.trim().to_string()
     };
 
-    let resolved_description = if description.trim().is_empty() {
-        "用户添加的自定义程序".to_string()
-    } else {
-        description.trim().to_string()
-    };
-
     let resolved_category = if category.trim().is_empty() {
         "自定义程序".to_string()
     } else {
@@ -217,12 +203,10 @@ pub fn upsert_custom_entry(
             .is_some_and(|t| t.eq_ignore_ascii_case(launch_target))
     }) {
         existing.name = resolved_name.into();
-        existing.description = resolved_description.into();
         existing.category = resolved_category.into();
     } else {
         entries.push(AppEntry::with_launch_target(
             &resolved_name,
-            &resolved_description,
             &resolved_category,
             Some(launch_target.to_string()),
         ));
@@ -273,7 +257,6 @@ pub fn discover_windows_apps() -> Vec<AppEntry> {
                 if seen.insert(key) {
                     out.push(AppEntry::with_launch_target(
                         name,
-                        "系统检测到的程序",
                         "系统程序",
                         Some(path.to_string_lossy().to_string()),
                     ));
@@ -356,8 +339,8 @@ pub fn load_or_discover_entries() -> Vec<AppEntry> {
 
 pub fn sort_entries_by_launch(entries: &mut [AppEntry]) {
     entries.sort_by(|a, b| {
-        b.launch_seq
-            .cmp(&a.launch_seq)
+        b.launch_count
+            .cmp(&a.launch_count)
             .then_with(|| a.name.cmp(&b.name))
     });
 }
