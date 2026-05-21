@@ -2,7 +2,7 @@ use gpui::{prelude::FluentBuilder as _, *};
 use gpui_component::{button::Button, setting::*, *};
 
 use crate::icons::IconName;
-use crate::layout::{load_entries_from_file, upsert_custom_entry};
+use crate::config::{load_entries_from_file, upsert_custom_entry};
 use crate::locale::t;
 
 // ---------- 文件选择对话框 ----------
