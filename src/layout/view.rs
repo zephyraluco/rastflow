@@ -171,20 +171,23 @@ impl LauncherView {
             if window.is_window_active() {
                 // 居中（作为保险，主要居中逻辑在托盘事件处理中）
                 center_window(window, cx);
-                // 每次重新显示都重置到启动器模式
-                this.ai_mode = false;
-                this.chat_messages.clear();
-                // 清空输入框，并按最新启动序号重排列表
-                this.input_state.update(cx, |input, cx| {
-                    input.set_value("", window, cx);
-                    input.set_placeholder(t("search.placeholder", cx), window, cx);
-                });
-                this.list_state.update(cx, |list, cx| {
-                    list.delegate_mut().reload("");
-                    let new_ix = list.delegate().selected_index;
-                    list.set_selected_index(new_ix, window, cx);
-                    list.scroll_to_selected_item(window, cx);
-                });
+                if this.ai_mode {
+                    // AI 模式：保留对话内容，仅滚动到底部
+                    this.chat_scroll.scroll_to_bottom();
+                    cx.notify();
+                } else {
+                    // 启动器模式：清空输入框并按最新启动序号重排列表
+                    this.input_state.update(cx, |input, cx| {
+                        input.set_value("", window, cx);
+                        input.set_placeholder(t("search.placeholder", cx), window, cx);
+                    });
+                    this.list_state.update(cx, |list, cx| {
+                        list.delegate_mut().reload("");
+                        let new_ix = list.delegate().selected_index;
+                        list.set_selected_index(new_ix, window, cx);
+                        list.scroll_to_selected_item(window, cx);
+                    });
+                }
             } else {
                 // SW_HIDE：彻底隐藏，不产生桌面图标
                 hide_window(window);
