@@ -1,6 +1,5 @@
 #![windows_subsystem = "windows"]
 
-mod ai;
 mod config;
 mod settings;
 mod layout;
@@ -83,15 +82,12 @@ fn main() {
     gpui_platform::application().with_assets(Assets).run(move |cx| {
         gpui_component::init(cx);
         cx.set_global(AppSettings::default());
-        // 从 settings.json 加载持久化设置（AI Key、模型、主题、语言等）
+        // 从 settings.json 加载持久化设置（主题、语言等）
         {
             let persisted = settings::load_settings();
             let s = cx.global_mut::<AppSettings>();
             if !persisted.theme.is_empty() { s.theme = persisted.theme.into(); }
             if !persisted.language.is_empty() { s.language = persisted.language.into(); }
-            s.ai_api_key = persisted.ai_api_key.into();
-            s.ai_base_url = persisted.ai_base_url.into();
-            s.ai_model = persisted.ai_model.into();
         }
         // 设置变更时自动写入 settings.json
         cx.observe_global::<AppSettings>(|cx| {

@@ -1,4 +1,4 @@
-/// 启动器主视图：渲染搜索栏、应用列表与 AI 对话面板
+/// 启动器主视图：渲染搜索栏、应用列表与 Everything 文件搜索面板
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
@@ -6,20 +6,18 @@ use gpui_component::{
     button::{Button, ButtonVariants},
     input::{Escape, Input, InputEvent, InputState, MoveDown, MoveUp},
     list::{List, ListDelegate, ListState},
-    text,
     *,
 };
 use std::time::Instant;
 
-use crate::ai;
 use crate::locale::t;
 use crate::settings::{AppSettings, SettingsView};
 use crate::utils::{center_window, hide_window};
 
-use super::chat::{ChatMessage, ChatRole};
 use super::delegate::LauncherDelegate;
+use super::everything::{EverythingStatus, open_everything_gui, open_path, search_with_es};
 
-actions!(launcher, [ToggleAiMode]);
+actions!(launcher, [ToggleEverythingMode]);
 
 // ---------- 启动器主视图 ----------
 
@@ -28,19 +26,21 @@ pub struct LauncherView {
     list_state: Entity<ListState<LauncherDelegate>>,
     /// 鼠标按下的时刻，用于判断长按拖动
     drag_start: Option<Instant>,
-    /// 是否处于 AI 对话模式
-    ai_mode: bool,
-    /// 已发送的对话消息列表（含用户与 AI 回复）
-    chat_messages: Vec<ChatMessage>,
-    /// 对话区域的滚动句柄，用于自动滚到底部
-    chat_scroll: ScrollHandle,
+    /// 是否处于 Everything 搜索模式
+    everything_mode: bool,
+    /// Everything 安装检测状态
+    everything_status: EverythingStatus,
+    /// Everything 搜索结果（文件路径列表）
+    everything_results: Vec<String>,
+    /// Everything 搜索结果中当前选中的索引
+    everything_selected: usize,
     _subscriptions: Vec<Subscription>,
 }
 
 impl LauncherView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        // 注册 Tab 项：在 Launcher 上下文中按下 Tab 触发 ToggleAiMode
-        cx.bind_keys([KeyBinding::new("tab", ToggleAiMode, Some("Launcher"))]);
+        // 注册 Tab 键：在 Launcher 上下文中切换 Everything 搜索模式
+        cx.bind_keys([KeyBinding::new("tab", ToggleEverythingMode, Some("Launcher"))]);
 
         let input_state = cx.new(|cx| {
             InputState::new(window, cx).placeholder(t("search.placeholder", cx))
@@ -64,90 +64,72 @@ impl LauncherView {
                 move |this, _, ev: &InputEvent, window, cx| {
                     match ev {
                         InputEvent::Change => {
-                            if this.ai_mode {
-                                // AI 模式：刷新对话预览
-                                cx.notify();
+                            if this.everything_mode {
+                                // Everything 模式：触发后台文件搜索
+                                let query = input_state.read(cx).value().to_string();
+                                this.everything_selected = 0;
+                                let status = this.everything_status.clone();
+                                let entity = cx.entity().downgrade();
+                                cx.spawn(async move |_this, cx: &mut gpui::AsyncApp| {
+                                    let results = cx
+                                        .background_executor()
+                                        .spawn(async move {
+                                            match &status {
+                                                EverythingStatus::ReadyWithEs { es_path, .. } => {
+                                                    search_with_es(es_path, &query, 50)
+                                                }
+                                                _ => vec![],
+                                            }
+                                        })
+                                        .await;
+                                    let _ = cx.update(|app| {
+                                        let _ = entity.update(app, |this, cx| {
+                                            this.everything_results = results;
+                                            this.everything_selected = 0;
+                                            cx.notify();
+                                        });
+                                    });
+                                })
+                                .detach();
                             } else {
                                 let value = input_state.read(cx).value().to_string();
                                 list_state.update(cx, |state, cx| {
                                     state.delegate_mut().filter(&value);
-                                    // 同步 ListState::selected_index，否则视觉选中不生效
                                     let new_ix = state.delegate().selected_index;
                                     state.set_selected_index(new_ix, window, cx);
-                                    // 滚动到第一项
                                     state.scroll_to_selected_item(window, cx);
                                 });
                             }
                         }
                         InputEvent::PressEnter { secondary } => {
-                            if this.ai_mode {
-                                // AI 模式：发送消息，并触发后台 AI 调用
-                                let value = input_state.read(cx).value().to_string();
-                                if !value.trim().is_empty() {
-                                    // 添加用户消息
-                                    this.chat_messages.push(ChatMessage {
-                                        role: ChatRole::User,
-                                        content: value.clone(),
-                                        loading: false,
-                                    });
-                                    // 添加 AI 占位消息（加载中）
-                                    let ai_idx = this.chat_messages.len();
-                                    this.chat_messages.push(ChatMessage {
-                                        role: ChatRole::Assistant,
-                                        content: String::new(),
-                                        loading: true,
-                                    });
-                                    input_state.update(cx, |input, cx| {
-                                        input.set_value("", window, cx);
-                                    });
-                                    this.chat_scroll.scroll_to_bottom();
-                                    cx.notify();
-
-                                    // 读取 AI 设置
-                                    let settings = cx.global::<AppSettings>();
-                                    let api_key = if !settings.ai_api_key.is_empty() {
-                                        settings.ai_api_key.to_string()
-                                    } else {
-                                        std::env::var("ANTHROPIC_API_KEY").unwrap_or_default()
-                                    };
-                                    let base_url = settings.ai_base_url.to_string();
-                                    let model = settings.ai_model.to_string();
-
-                                    // 发送给 AI，在后台线程运行，通过 oneshot channel 返回结果
-                                    let rx = ai::send_message(value, api_key, base_url, model);
-                                    let entity = cx.entity().downgrade();
-
-                                    cx.spawn(async move |_this, cx: &mut gpui::AsyncApp| {
-                                        let result = rx.await;
-                                        let _ = cx.update(move |app| {
-                                            let _ = entity.update(app, move |this, cx| {
-                                                if let Some(msg) = this.chat_messages.get_mut(ai_idx) {
-                                                    match result {
-                                                        Ok(Ok(response)) => {
-                                                            msg.content = response;
-                                                        }
-                                                        Ok(Err(e)) => {
-                                                            msg.content = format!("错误: {e}");
-                                                        }
-                                                        Err(_) => {
-                                                            msg.content = "请求已取消".to_string();
-                                                        }
-                                                    }
-                                                    msg.loading = false;
-                                                }
-                                                this.chat_scroll.scroll_to_bottom();
-                                                cx.notify();
-                                            });
-                                        });
-                                    }).detach();
+                            if this.everything_mode {
+                                let query = input_state.read(cx).value().to_string();
+                                match &this.everything_status {
+                                    EverythingStatus::ReadyWithEs { .. } => {
+                                        // 打开选中的文件
+                                        if let Some(path) =
+                                            this.everything_results.get(this.everything_selected)
+                                        {
+                                            let path = path.clone();
+                                            open_path(&path);
+                                        }
+                                    }
+                                    EverythingStatus::InstalledOnly { exe_path } => {
+                                        // 在 Everything GUI 中搜索
+                                        if !query.trim().is_empty() {
+                                            let exe = exe_path.clone();
+                                            let q = query.clone();
+                                            open_everything_gui(&exe, &q);
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             } else {
-                                // 启动器模式：启动选中项
                                 let secondary = *secondary;
                                 list_state.update(cx, |state, cx| {
                                     if let Some(ix) = state.selected_index() {
                                         state.delegate_mut().confirm(secondary, window, cx);
-                                        let _ = ix; // suppress unused warning
+                                        let _ = ix;
                                     }
                                 });
                             }
@@ -166,17 +148,13 @@ impl LauncherView {
             }
         });
 
-        // 失去焦点时彻底隐藏（SW_HIDE）；获得焦点时居中并刷新列表排序
+        // 失去焦点时彻底隐藏；获得焦点时居中并刷新列表
         let activation_sub = cx.observe_window_activation(window, |this, window, cx| {
             if window.is_window_active() {
-                // 居中（作为保险，主要居中逻辑在托盘事件处理中）
                 center_window(window, cx);
-                if this.ai_mode {
-                    // AI 模式：保留对话内容，仅滚动到底部
-                    this.chat_scroll.scroll_to_bottom();
+                if this.everything_mode {
                     cx.notify();
                 } else {
-                    // 启动器模式：清空输入框并按最新启动序号重排列表
                     this.input_state.update(cx, |input, cx| {
                         input.set_value("", window, cx);
                         input.set_placeholder(t("search.placeholder", cx), window, cx);
@@ -189,12 +167,11 @@ impl LauncherView {
                     });
                 }
             } else {
-                // SW_HIDE：彻底隐藏，不产生桌面图标
                 hide_window(window);
             }
         });
 
-        // 语言切换时更新搜索框占位符并通知重绘
+        // 语言切换时更新搜索框占位符
         let settings_sub = cx.observe_global_in::<AppSettings>(window, {
             let input_state = input_state.clone();
             move |_, window, cx| {
@@ -210,14 +187,33 @@ impl LauncherView {
             input_state: input_state.clone(),
             list_state,
             drag_start: None,
-            ai_mode: false,
-            chat_messages: Vec::new(),
-            chat_scroll: ScrollHandle::new(),
+            everything_mode: false,
+            everything_status: EverythingStatus::Unknown,
+            everything_results: Vec::new(),
+            everything_selected: 0,
             _subscriptions: vec![input_sub, bounds_sub, activation_sub, settings_sub],
         };
-        // 窗口创建时立即聚焦输入框，无需鼠标点击即可输入
         input_state.update(cx, |input, cx| input.focus(window, cx));
         view
+    }
+
+    /// 在后台线程中检测 Everything，完成后更新状态并通知重绘
+    fn detect_everything(&mut self, cx: &mut Context<Self>) {
+        self.everything_status = EverythingStatus::Unknown;
+        let entity = cx.entity().downgrade();
+        cx.spawn(async move |_this, cx: &mut gpui::AsyncApp| {
+            let status = cx
+                .background_executor()
+                .spawn(async { super::everything::detect() })
+                .await;
+            let _ = cx.update(|app| {
+                let _ = entity.update(app, |this, cx| {
+                    this.everything_status = status;
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
     }
 }
 
@@ -227,16 +223,20 @@ impl Render for LauncherView {
             .size_full()
             .bg(cx.theme().background)
             .key_context("Launcher")
-            // Tab：切换 AI 对话模式
-            .capture_action(cx.listener(|this, _: &ToggleAiMode, window, cx| {
-                this.ai_mode = !this.ai_mode;
-                if this.ai_mode {
+            // Tab：切换 Everything 搜索模式
+            .capture_action(cx.listener(|this, _: &ToggleEverythingMode, window, cx| {
+                this.everything_mode = !this.everything_mode;
+                if this.everything_mode {
+                    this.everything_results.clear();
+                    this.everything_selected = 0;
                     this.input_state.update(cx, |input, cx| {
                         input.set_value("", window, cx);
-                        input.set_placeholder("输入问题，按 Enter 发送...", window, cx);
+                        input.set_placeholder("搜索文件...", window, cx);
                     });
+                    // 后台检测 Everything 安装状态
+                    this.detect_everything(cx);
                 } else {
-                    this.chat_messages.clear();
+                    this.everything_results.clear();
                     this.input_state.update(cx, |input, cx| {
                         input.set_value("", window, cx);
                         input.set_placeholder(t("search.placeholder", cx), window, cx);
@@ -251,11 +251,11 @@ impl Render for LauncherView {
                 cx.stop_propagation();
                 cx.notify();
             }))
-            // Esc：AI 模式下退出对话，普通模式下隐藏窗口
+            // Esc：Everything 模式下退出，普通模式下隐藏窗口
             .capture_action(cx.listener(|this, _: &Escape, window, cx| {
-                if this.ai_mode {
-                    this.ai_mode = false;
-                    this.chat_messages.clear();
+                if this.everything_mode {
+                    this.everything_mode = false;
+                    this.everything_results.clear();
                     this.input_state.update(cx, |input, cx| {
                         input.set_value("", window, cx);
                         input.set_placeholder(t("search.placeholder", cx), window, cx);
@@ -280,9 +280,15 @@ impl Render for LauncherView {
                 }
                 cx.stop_propagation();
             }))
-            // 上下键切换列表选项（仅在展示列表时生效）
+            // 上下键：启动器模式切换选项，Everything 模式切换搜索结果
             .capture_action(cx.listener(|this, _: &MoveDown, window, cx| {
-                if !this.ai_mode {
+                if this.everything_mode {
+                    if !this.everything_results.is_empty() {
+                        this.everything_selected =
+                            (this.everything_selected + 1).min(this.everything_results.len() - 1);
+                        cx.notify();
+                    }
+                } else {
                     let new_ix = this.list_state.read(cx).delegate().navigate_selection(true);
                     this.list_state.update(cx, |list, cx| {
                         list.set_selected_index(new_ix, window, cx);
@@ -292,7 +298,12 @@ impl Render for LauncherView {
                 cx.stop_propagation();
             }))
             .capture_action(cx.listener(|this, _: &MoveUp, window, cx| {
-                if !this.ai_mode {
+                if this.everything_mode {
+                    if this.everything_selected > 0 {
+                        this.everything_selected -= 1;
+                        cx.notify();
+                    }
+                } else {
                     let new_ix = this.list_state.read(cx).delegate().navigate_selection(false);
                     this.list_state.update(cx, |list, cx| {
                         list.set_selected_index(new_ix, window, cx);
@@ -301,16 +312,14 @@ impl Render for LauncherView {
                 }
                 cx.stop_propagation();
             }))
-            // 搜索栏：声明为窗口拖动区域，同时监听长按手势
+            // 搜索栏
             .child(
                 div()
                     .px_4()
                     .py_3()
                     .border_b_1()
                     .border_color(cx.theme().border)
-                    // Windows 原生：将此区域标记为标题栏拖动区
                     .window_control_area(WindowControlArea::Drag)
-                    // 跨平台：长按 200ms 后触发 start_window_move
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _ev: &MouseDownEvent, _window, _cx| {
@@ -338,14 +347,14 @@ impl Render for LauncherView {
                             .child(
                                 div()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(if self.ai_mode { "💬" } else { "🔍" }),
+                                    .child(if self.everything_mode { "📁" } else { "🔍" }),
                             )
                             .child(
                                 Input::new(&self.input_state)
                                     .appearance(false)
                                     .flex_1(),
                             )
-                            .when(!self.ai_mode, |this| {
+                            .when(!self.everything_mode, |this| {
                                 this.child(
                                     h_flex()
                                         .gap_1()
@@ -353,7 +362,7 @@ impl Render for LauncherView {
                                         .flex_shrink_0()
                                         .text_xs()
                                         .text_color(cx.theme().muted_foreground)
-                                        .child("问 AI")
+                                        .child("文件搜索")
                                         .child(
                                             div()
                                                 .px_1()
@@ -367,115 +376,24 @@ impl Render for LauncherView {
                                                 .child("Tab"),
                                         ),
                                 )
+                            })
+                            .when(self.everything_mode, |this| {
+                                this.child(
+                                    div()
+                                        .px_2()
+                                        .py_px()
+                                        .rounded_sm()
+                                        .bg(cx.theme().accent)
+                                        .text_xs()
+                                        .text_color(cx.theme().accent_foreground)
+                                        .child("Everything"),
+                                )
                             }),
                     ),
             )
-            // 内容区：AI 对话 或 应用列表
-            .child(if self.ai_mode {
-                let current_input = self.input_state.read(cx).value().to_string();
-                let accent = cx.theme().accent;
-                let accent_fg = cx.theme().accent_foreground;
-                let muted_fg = cx.theme().muted_foreground;
-                let border_color = cx.theme().border;
-                let messages = self.chat_messages.clone();
-                let is_empty = messages.is_empty() && current_input.is_empty();
-                v_flex()
-                    .id("chat-area")
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.chat_scroll)
-                    .p_4()
-                    .gap_3()
-                    .when(is_empty, |this| {
-                        this.child(
-                            div()
-                                .flex_1()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .text_sm()
-                                .text_color(muted_fg)
-                                .child("输入问题，按 Enter 发送"),
-                        )
-                    })
-                    .children(messages.into_iter().enumerate().map(move |(idx, msg)| {
-                        match msg.role {
-                            ChatRole::User => {
-                                // 用户消息：右对齐，accent 背景
-                                h_flex()
-                                    .w_full()
-                                    .justify_end()
-                                    .child(
-                                        div()
-                                            .max_w(px(440.))
-                                            .px_3()
-                                            .py_2()
-                                            .rounded_lg()
-                                            .bg(accent)
-                                            .child(
-                                                text::TextView::markdown(
-                                                    format!("chat-user-{idx}"),
-                                                    msg.content,
-                                                )
-                                                .selectable(true)
-                                                .text_sm()
-                                                .text_color(accent_fg),
-                                            ),
-                                    )
-                                    .into_any_element()
-                            }
-                            ChatRole::Assistant => {
-                                // AI 消息：左对齐，muted 背景 / 加载中显示省略号
-                                let content = if msg.loading {
-                                    "…".to_string()
-                                } else {
-                                    msg.content.clone()
-                                };
-                                h_flex()
-                                    .w_full()
-                                    .justify_start()
-                                    .child(
-                                        div()
-                                            .max_w(px(440.))
-                                            .px_3()
-                                            .py_2()
-                                            .rounded_lg()
-                                            .border_1()
-                                            .border_color(border_color)
-                                            .child(
-                                                text::TextView::markdown(
-                                                    format!("chat-ai-{idx}"),
-                                                    content,
-                                                )
-                                                .selectable(true)
-                                                .text_sm()
-                                                .text_color(muted_fg),
-                                            ),
-                                    )
-                                    .into_any_element()
-                            }
-                        }
-                    }))
-                    .when(!current_input.is_empty(), |this| {
-                        this.child(
-                            h_flex()
-                                .w_full()
-                                .justify_end()
-                                .child(
-                                    div()
-                                        .max_w(px(440.))
-                                        .px_3()
-                                        .py_2()
-                                        .rounded_lg()
-                                        .border_1()
-                                        .border_color(border_color)
-                                        .text_sm()
-                                        .text_color(muted_fg)
-                                        .child(current_input),
-                                ),
-                        )
-                    })
-                    .into_any_element()
+            // 内容区
+            .child(if self.everything_mode {
+                self.render_everything_content(cx).into_any_element()
             } else {
                 List::new(&self.list_state).flex_1().into_any_element()
             })
@@ -522,3 +440,220 @@ impl Render for LauncherView {
             )
     }
 }
+
+// ---------- Everything 内容面板 ----------
+
+impl LauncherView {
+    fn render_everything_content(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted_fg = cx.theme().muted_foreground;
+        let fg = cx.theme().foreground;
+        let border = cx.theme().border;
+        let accent = cx.theme().accent;
+        let accent_fg = cx.theme().accent_foreground;
+        let muted_bg = cx.theme().muted;
+
+        match &self.everything_status {
+            // 正在检测
+            EverythingStatus::Unknown => v_flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(muted_fg)
+                        .child("正在检测 Everything..."),
+                )
+                .into_any_element(),
+
+            // 未安装
+            EverythingStatus::NotInstalled => v_flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .gap_4()
+                .p_6()
+                .child(
+                    div()
+                        .text_2xl()
+                        .child("📁"),
+                )
+                .child(
+                    v_flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_semibold()
+                                .text_color(fg)
+                                .child("未检测到 Everything"),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(muted_fg)
+                                .child("需要安装 Everything 才能使用文件搜索功能"),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("install-btn")
+                                .child("前往下载")
+                                .on_click(|_, _, _cx| {
+                                    // 打开 Everything 官网下载页
+                                    let _ = std::process::Command::new("cmd")
+                                        .args(["/C", "start", "", "https://www.voidtools.com/downloads/"])
+                                        .spawn();
+                                }),
+                        )
+                        .child(
+                            Button::new("redetect-btn")
+                                .ghost()
+                                .child("重新检测")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.detect_everything(cx);
+                                })),
+                        ),
+                )
+                .into_any_element(),
+
+            // 已安装但无 es.exe（只能跳转到 GUI）
+            EverythingStatus::InstalledOnly { exe_path } => {
+                let query = self.input_state.read(cx).value().to_string();
+                let exe = exe_path.clone();
+                let exe2 = exe_path.clone();
+                let has_query = !query.trim().is_empty();
+                v_flex()
+                    .flex_1()
+                    .p_4()
+                    .gap_3()
+                    .child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .rounded_lg()
+                            .bg(muted_bg)
+                            .border_1()
+                            .border_color(border)
+                            .text_xs()
+                            .text_color(muted_fg)
+                            .child("已安装 Everything，但未找到 es.exe 命令行工具。输入关键词后按 Enter 可在 Everything 中搜索，或下载 es.exe 以在此处显示结果。"),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("open-everything-btn")
+                                    .child("打开 Everything")
+                                    .on_click(move |_, _, _cx| {
+                                        open_everything_gui(&exe, "");
+                                    }),
+                            )
+                            .when(has_query, |this| {
+                                let q = query.clone();
+                                this.child(
+                                    Button::new("search-everything-btn")
+                                        .ghost()
+                                        .child(format!("搜索 \"{}\"", query))
+                                        .on_click(move |_, _, _cx| {
+                                            open_everything_gui(&exe2, &q);
+                                        }),
+                                )
+                            })
+                            .child(
+                                Button::new("dl-es-btn")
+                                    .ghost()
+                                    .child("下载 es.exe")
+                                    .on_click(|_, _, _cx| {
+                                        let _ = std::process::Command::new("cmd")
+                                            .args(["/C", "start", "", "https://www.voidtools.com/downloads/"])
+                                            .spawn();
+                                    }),
+                            ),
+                    )
+                    .into_any_element()
+            }
+
+            // 完整模式：显示内联搜索结果
+            EverythingStatus::ReadyWithEs { .. } => {
+                let results = &self.everything_results;
+                let selected = self.everything_selected;
+
+                if results.is_empty() {
+                    v_flex()
+                        .flex_1()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(muted_fg)
+                                .child("输入关键词搜索文件"),
+                        )
+                        .into_any_element()
+                } else {
+                    v_flex()
+                        .id("ev-results")
+                        .flex_1()
+                        .overflow_y_scroll()
+                        .children(results.iter().enumerate().map(|(i, path)| {
+                            let is_selected = i == selected;
+                            let file_name = std::path::Path::new(path)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| path.clone());
+                            let dir_path = std::path::Path::new(path)
+                                .parent()
+                                .map(|p| p.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            let path_clone = path.clone();
+
+                            div()
+                                .id(("ev-result", i))
+                                .px_4()
+                                .py_2()
+                                .cursor_pointer()
+                                .when(is_selected, |this| this.bg(accent))
+                                .when(!is_selected, |this| {
+                                    this.hover(|s| s.bg(cx.theme().secondary))
+                                })
+                                .on_click(move |_, _, _cx| {
+                                    open_path(&path_clone);
+                                })
+                                .child(
+                                    v_flex()
+                                        .gap_px()
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_semibold()
+                                                .text_color(if is_selected { accent_fg } else { fg })
+                                                .overflow_hidden()
+                                                .whitespace_nowrap()
+                                                .child(file_name),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(if is_selected {
+                                                    accent_fg
+                                                } else {
+                                                    muted_fg
+                                                })
+                                                .overflow_hidden()
+                                                .whitespace_nowrap()
+                                                .child(dir_path),
+                                        ),
+                                )
+                        }))
+                        .into_any_element()
+                }
+            }
+        }
+    }
+}
+

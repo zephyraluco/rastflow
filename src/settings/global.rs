@@ -16,12 +16,6 @@ pub struct AppSettings {
     pub last_display: Option<DisplayId>,
     /// 唤出界面的全局快捷键，格式如 "alt+space"。
     pub hotkey: SharedString,
-    /// AI 模型 API Key
-    pub ai_api_key: SharedString,
-    /// AI API Base URL（留空使用 Anthropic 官方地址）
-    pub ai_base_url: SharedString,
-    /// AI 模型名称，如 "claude-opus-4-5"
-    pub ai_model: SharedString,
 }
 
 impl Global for AppSettings {}
@@ -38,9 +32,6 @@ impl Default for AppSettings {
             custom_programs_version: 0,
             last_display: None,
             hotkey: "alt+space".into(),
-            ai_api_key: "".into(),
-            ai_base_url: "".into(),
-            ai_model: "claude-opus-4-5".into(),
         }
     }
 }

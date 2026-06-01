@@ -9,9 +9,6 @@ use super::global::AppSettings;
 pub struct PersistedSettings {
     pub theme: String,
     pub language: String,
-    pub ai_api_key: String,
-    pub ai_base_url: String,
-    pub ai_model: String,
 }
 
 impl Default for PersistedSettings {
@@ -20,9 +17,6 @@ impl Default for PersistedSettings {
         Self {
             theme: d.theme.to_string(),
             language: d.language.to_string(),
-            ai_api_key: d.ai_api_key.to_string(),
-            ai_base_url: d.ai_base_url.to_string(),
-            ai_model: d.ai_model.to_string(),
         }
     }
 }
@@ -46,9 +40,6 @@ pub fn save_settings(s: &AppSettings) {
     let p = PersistedSettings {
         theme: s.theme.to_string(),
         language: s.language.to_string(),
-        ai_api_key: s.ai_api_key.to_string(),
-        ai_base_url: s.ai_base_url.to_string(),
-        ai_model: s.ai_model.to_string(),
     };
     if let Ok(data) = serde_json::to_string_pretty(&p) {
         let _ = std::fs::write(settings_path(), data);
