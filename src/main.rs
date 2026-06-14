@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod config;
+mod bindings;
 mod settings;
 mod layout;
 mod locale;

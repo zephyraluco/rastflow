@@ -36,10 +36,6 @@ impl AppEntry {
         }
     }
 
-    pub fn with_launch_count(mut self, launch_count: u64) -> Self {
-        self.launch_count = launch_count;
-        self
-    }
 }
 
 // ---------- 运行时 & 连接池（单连接，无线程池）----------

@@ -35,21 +35,11 @@ fn zh(key: &str) -> &'static str {
         "item.language.desc"         => "选择界面显示语言",
         "opt.lang.zh"                => "简体中文",
         "opt.lang.en"                => "English",
-        "group.display"              => "显示",
-        "item.show_desc"             => "显示应用描述",
-        "item.show_desc.desc"        => "在列表中显示应用程序的描述文字",
-
         // 设置 - 行为
         "page.behavior"              => "行为",
         "group.startup"              => "启动",
         "item.auto_launch"           => "开机自动启动",
         "item.auto_launch.desc"      => "系统启动时自动运行程序启动器",
-        "group.search"               => "搜索",
-        "item.search_in_desc"        => "搜索包含描述",
-        "item.search_in_desc.desc"   => "搜索时同时匹配应用程序的描述文字",
-        "item.max_results"           => "最大显示数量",
-        "item.max_results.desc"      => "搜索结果列表最多显示的应用数量",
-
         // 设置 - 快捷键
         "page.hotkey"                => "快捷键",
         "group.global_hotkey"        => "全局快捷键",
@@ -91,21 +81,11 @@ fn en(key: &str) -> &'static str {
         "item.language.desc"         => "Select the display language",
         "opt.lang.zh"                => "简体中文",
         "opt.lang.en"                => "English",
-        "group.display"              => "Display",
-        "item.show_desc"             => "Show App Descriptions",
-        "item.show_desc.desc"        => "Show app descriptions in the list",
-
         // Settings - Behavior
         "page.behavior"              => "Behavior",
         "group.startup"              => "Startup",
         "item.auto_launch"           => "Launch at Login",
         "item.auto_launch.desc"      => "Automatically start the launcher when the system boots",
-        "group.search"               => "Search",
-        "item.search_in_desc"        => "Search in Descriptions",
-        "item.search_in_desc.desc"   => "Include app descriptions when searching",
-        "item.max_results"           => "Max Results",
-        "item.max_results.desc"      => "Maximum number of results shown in the list",
-
         // Settings - Hotkey
         "page.hotkey"                => "Hotkeys",
         "group.global_hotkey"        => "Global Hotkeys",

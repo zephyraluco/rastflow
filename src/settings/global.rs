@@ -7,9 +7,6 @@ pub struct AppSettings {
     pub theme: SharedString,
     pub language: SharedString,
     pub auto_launch: bool,
-    pub show_descriptions: bool,
-    pub search_in_desc: bool,
-    pub max_results: SharedString,
     /// 自定义程序列表版本号，变更时触发设置页重渲染。
     pub custom_programs_version: u64,
     /// 窗口上次所在屏幕，用于多屏居中时决定目标屏幕。
@@ -26,9 +23,6 @@ impl Default for AppSettings {
             theme: "system".into(),
             language: "zh".into(),
             auto_launch: false,
-            show_descriptions: true,
-            search_in_desc: true,
-            max_results: "15".into(),
             custom_programs_version: 0,
             last_display: None,
             hotkey: "alt+space".into(),

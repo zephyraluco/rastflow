@@ -1,7 +1,6 @@
 /// Everything 文件搜索集成模块
 ///
-/// 检测 Everything 是否已安装，并通过 es.exe（命令行工具）或直接启动
-/// Everything GUI 来执行文件搜索。
+/// 检测 Everything 是否已安装，并直接启动 Everything GUI 来执行文件搜索。
 
 use std::path::PathBuf;
 
@@ -12,10 +11,10 @@ pub enum EverythingStatus {
     Unknown,
     /// 未安装 Everything
     NotInstalled,
-    /// 已安装 Everything，但未找到 es.exe（仅能跳转到 Everything GUI）
-    InstalledOnly { exe_path: PathBuf },
-    /// 已安装 Everything 且找到 es.exe（可在窗口内显示搜索结果）
-    ReadyWithEs { exe_path: PathBuf, es_path: PathBuf },
+    /// 已安装 Everything，但当前用户下没有索引数据库
+    NotIndexed { exe_path: PathBuf },
+    /// 已安装 Everything，且当前用户下已有索引数据库
+    Indexed { exe_path: PathBuf },
 }
 
 /// 在常见路径和注册表中搜索 Everything.exe
@@ -127,78 +126,21 @@ fn find_everything_in_registry() -> Option<PathBuf> {
     }
 }
 
-/// 在 Everything 安装目录和 PATH 中搜索 es.exe
-pub fn find_es_exe(everything_path: &PathBuf) -> Option<PathBuf> {
-    // 同目录下查找
-    if let Some(dir) = everything_path.parent() {
-        let es = dir.join("es.exe");
-        if es.exists() {
-            return Some(es);
-        }
-    }
-    // PATH 中查找
-    #[cfg(windows)]
-    if let Ok(output) = {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        std::process::Command::new("where")
-            .arg("es.exe")
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-    } {
-        if output.status.success() {
-            let s = String::from_utf8_lossy(&output.stdout);
-            let line = s.lines().next().unwrap_or("").trim().to_string();
-            if !line.is_empty() {
-                return Some(PathBuf::from(line));
-            }
-        }
-    }
-    None
-}
-
 /// 检测 Everything 安装状态（同步，在后台线程调用）
 pub fn detect() -> EverythingStatus {
     match find_everything_exe() {
         None => EverythingStatus::NotInstalled,
-        Some(exe_path) => {
-            match find_es_exe(&exe_path) {
-                Some(es_path) => EverythingStatus::ReadyWithEs { exe_path, es_path },
-                None => EverythingStatus::InstalledOnly { exe_path },
-            }
-        }
+        Some(exe_path) if everything_db_exists() => EverythingStatus::Indexed { exe_path },
+        Some(exe_path) => EverythingStatus::NotIndexed { exe_path },
     }
 }
 
-/// 用 es.exe 搜索文件，返回路径列表（同步，在后台线程调用）
-pub fn search_with_es(es_path: &PathBuf, query: &str, max: usize) -> Vec<String> {
-    if query.trim().is_empty() {
-        return vec![];
-    }
-    #[cfg(windows)]
-    let output = {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        std::process::Command::new(es_path)
-            .args(["-n", &max.to_string(), "-sort", "date-recently-changed", query])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-    };
-    #[cfg(not(windows))]
-    let output = std::process::Command::new(es_path)
-        .args(["-n", &max.to_string(), "-sort", "date-recently-changed", query])
-        .output();
-
-    match output {
-        Ok(out) if out.status.success() => {
-            let text = String::from_utf8_lossy(&out.stdout);
-            text.lines()
-                .map(|l| l.trim().to_string())
-                .filter(|l| !l.is_empty())
-                .collect()
-        }
-        _ => vec![],
-    }
+/// 检查当前用户 Everything 索引数据库是否存在。
+fn everything_db_exists() -> bool {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .map(|path| path.join("Everything").join("Everything.db"))
+        .is_some_and(|path| path.exists())
 }
 
 /// 用 Everything.exe 打开 GUI 并预填查询词
@@ -220,19 +162,3 @@ pub fn open_everything_gui(exe_path: &PathBuf, query: &str) {
     }
 }
 
-/// 用系统默认方式打开文件或文件夹
-pub fn open_path(path: &str) {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        let _ = std::process::Command::new("explorer")
-            .arg(path)
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn();
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = std::process::Command::new("xdg-open").arg(path).spawn();
-    }
-}

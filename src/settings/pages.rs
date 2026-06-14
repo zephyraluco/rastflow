@@ -131,23 +131,6 @@ pub fn build_settings_pages(lang: &str) -> Vec<SettingPage> {
                         )
                         .description(zh_en(lang, "选择界面显示语言", "Select the display language")),
                     ),
-            )
-            .group(
-                SettingGroup::new()
-                    .title(zh_en(lang, "显示", "Display"))
-                    .item(
-                        SettingItem::new(
-                            zh_en(lang, "显示应用描述", "Show App Descriptions"),
-                            SettingField::switch(
-                                |cx: &App| cx.global::<AppSettings>().show_descriptions,
-                                |val: bool, cx: &mut App| {
-                                    cx.global_mut::<AppSettings>().show_descriptions = val;
-                                },
-                            )
-                            .default_value(default.show_descriptions),
-                        )
-                        .description(zh_en(lang, "在列表中显示应用程序的描述文字", "Show app descriptions in the list")),
-                    ),
             ),
         SettingPage::new(zh_en(lang, "行为", "Behavior"))
             .icon(Icon::new(IconName::Settings))
@@ -166,42 +149,6 @@ pub fn build_settings_pages(lang: &str) -> Vec<SettingPage> {
                             .default_value(default.auto_launch),
                         )
                         .description(zh_en(lang, "系统启动时自动运行程序启动器", "Automatically start the launcher at system boot")),
-                    ),
-            )
-            .group(
-                SettingGroup::new()
-                    .title(zh_en(lang, "搜索", "Search"))
-                    .item(
-                        SettingItem::new(
-                            zh_en(lang, "搜索包含描述", "Search in Descriptions"),
-                            SettingField::switch(
-                                |cx: &App| cx.global::<AppSettings>().search_in_desc,
-                                |val: bool, cx: &mut App| {
-                                    cx.global_mut::<AppSettings>().search_in_desc = val;
-                                },
-                            )
-                            .default_value(default.search_in_desc),
-                        )
-                        .description(zh_en(lang, "搜索时同时匹配应用程序的描述文字", "Include app descriptions when searching")),
-                    )
-                    .item(
-                        SettingItem::new(
-                            zh_en(lang, "最大显示数量", "Max Results"),
-                            SettingField::dropdown(
-                                vec![
-                                    ("5".into(),  zh_en(lang, "5 条",  "5").into()),
-                                    ("10".into(), zh_en(lang, "10 条", "10").into()),
-                                    ("15".into(), zh_en(lang, "15 条", "15").into()),
-                                    ("20".into(), zh_en(lang, "20 条", "20").into()),
-                                ],
-                                |cx: &App| cx.global::<AppSettings>().max_results.clone(),
-                                |val: SharedString, cx: &mut App| {
-                                    cx.global_mut::<AppSettings>().max_results = val;
-                                },
-                            )
-                            .default_value(default.max_results.clone()),
-                        )
-                        .description(zh_en(lang, "搜索结果列表最多显示的应用数量", "Maximum number of results shown in the list")),
                     ),
             ),
         SettingPage::new(zh_en(lang, "快捷键", "Hotkeys"))

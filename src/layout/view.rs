@@ -15,7 +15,7 @@ use crate::settings::{AppSettings, SettingsView};
 use crate::utils::{center_window, hide_window};
 
 use super::delegate::LauncherDelegate;
-use super::everything::{EverythingStatus, open_everything_gui, open_path, search_with_es};
+use super::everything::{EverythingStatus, open_everything_gui};
 
 actions!(launcher, [ToggleEverythingMode]);
 
@@ -65,32 +65,9 @@ impl LauncherView {
                     match ev {
                         InputEvent::Change => {
                             if this.everything_mode {
-                                // Everything 模式：触发后台文件搜索
-                                let query = input_state.read(cx).value().to_string();
+                                // Everything 模式只检测安装状态，搜索交给 Everything GUI。
                                 this.everything_selected = 0;
-                                let status = this.everything_status.clone();
-                                let entity = cx.entity().downgrade();
-                                cx.spawn(async move |_this, cx: &mut gpui::AsyncApp| {
-                                    let results = cx
-                                        .background_executor()
-                                        .spawn(async move {
-                                            match &status {
-                                                EverythingStatus::ReadyWithEs { es_path, .. } => {
-                                                    search_with_es(es_path, &query, 50)
-                                                }
-                                                _ => vec![],
-                                            }
-                                        })
-                                        .await;
-                                    let _ = cx.update(|app| {
-                                        let _ = entity.update(app, |this, cx| {
-                                            this.everything_results = results;
-                                            this.everything_selected = 0;
-                                            cx.notify();
-                                        });
-                                    });
-                                })
-                                .detach();
+                                this.everything_results.clear();
                             } else {
                                 let value = input_state.read(cx).value().to_string();
                                 list_state.update(cx, |state, cx| {
@@ -105,16 +82,8 @@ impl LauncherView {
                             if this.everything_mode {
                                 let query = input_state.read(cx).value().to_string();
                                 match &this.everything_status {
-                                    EverythingStatus::ReadyWithEs { .. } => {
-                                        // 打开选中的文件
-                                        if let Some(path) =
-                                            this.everything_results.get(this.everything_selected)
-                                        {
-                                            let path = path.clone();
-                                            open_path(&path);
-                                        }
-                                    }
-                                    EverythingStatus::InstalledOnly { exe_path } => {
+                                    EverythingStatus::Indexed { exe_path }
+                                    | EverythingStatus::NotIndexed { exe_path } => {
                                         // 在 Everything GUI 中搜索
                                         if !query.trim().is_empty() {
                                             let exe = exe_path.clone();
@@ -448,8 +417,6 @@ impl LauncherView {
         let muted_fg = cx.theme().muted_foreground;
         let fg = cx.theme().foreground;
         let border = cx.theme().border;
-        let accent = cx.theme().accent;
-        let accent_fg = cx.theme().accent_foreground;
         let muted_bg = cx.theme().muted;
 
         match &self.everything_status {
@@ -521,10 +488,9 @@ impl LauncherView {
                 )
                 .into_any_element(),
 
-            // 已安装但无 es.exe（只能跳转到 GUI）
-            EverythingStatus::InstalledOnly { exe_path } => {
+            // 已安装 Everything，但当前用户还没有索引数据库
+            EverythingStatus::NotIndexed { exe_path } => {
                 let query = self.input_state.read(cx).value().to_string();
-                let exe = exe_path.clone();
                 let exe2 = exe_path.clone();
                 let has_query = !query.trim().is_empty();
                 v_flex()
@@ -541,18 +507,11 @@ impl LauncherView {
                             .border_color(border)
                             .text_xs()
                             .text_color(muted_fg)
-                            .child("已安装 Everything，但未找到 es.exe 命令行工具。输入关键词后按 Enter 可在 Everything 中搜索，或下载 es.exe 以在此处显示结果。"),
+                            .child("Everything 未检索。请先打开 Everything 完成索引后再使用搜索。"),
                     )
                     .child(
                         h_flex()
                             .gap_2()
-                            .child(
-                                Button::new("open-everything-btn")
-                                    .child("打开 Everything")
-                                    .on_click(move |_, _, _cx| {
-                                        open_everything_gui(&exe, "");
-                                    }),
-                            )
                             .when(has_query, |this| {
                                 let q = query.clone();
                                 this.child(
@@ -563,95 +522,15 @@ impl LauncherView {
                                             open_everything_gui(&exe2, &q);
                                         }),
                                 )
-                            })
-                            .child(
-                                Button::new("dl-es-btn")
-                                    .ghost()
-                                    .child("下载 es.exe")
-                                    .on_click(|_, _, _cx| {
-                                        let _ = std::process::Command::new("cmd")
-                                            .args(["/C", "start", "", "https://www.voidtools.com/downloads/"])
-                                            .spawn();
-                                    }),
-                            ),
+                            }),
                     )
                     .into_any_element()
             }
 
-            // 完整模式：显示内联搜索结果
-            EverythingStatus::ReadyWithEs { .. } => {
-                let results = &self.everything_results;
-                let selected = self.everything_selected;
-
-                if results.is_empty() {
-                    v_flex()
-                        .flex_1()
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(muted_fg)
-                                .child("输入关键词搜索文件"),
-                        )
-                        .into_any_element()
-                } else {
-                    v_flex()
-                        .id("ev-results")
-                        .flex_1()
-                        .overflow_y_scroll()
-                        .children(results.iter().enumerate().map(|(i, path)| {
-                            let is_selected = i == selected;
-                            let file_name = std::path::Path::new(path)
-                                .file_name()
-                                .map(|n| n.to_string_lossy().to_string())
-                                .unwrap_or_else(|| path.clone());
-                            let dir_path = std::path::Path::new(path)
-                                .parent()
-                                .map(|p| p.to_string_lossy().to_string())
-                                .unwrap_or_default();
-                            let path_clone = path.clone();
-
-                            div()
-                                .id(("ev-result", i))
-                                .px_4()
-                                .py_2()
-                                .cursor_pointer()
-                                .when(is_selected, |this| this.bg(accent))
-                                .when(!is_selected, |this| {
-                                    this.hover(|s| s.bg(cx.theme().secondary))
-                                })
-                                .on_click(move |_, _, _cx| {
-                                    open_path(&path_clone);
-                                })
-                                .child(
-                                    v_flex()
-                                        .gap_px()
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .font_semibold()
-                                                .text_color(if is_selected { accent_fg } else { fg })
-                                                .overflow_hidden()
-                                                .whitespace_nowrap()
-                                                .child(file_name),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(if is_selected {
-                                                    accent_fg
-                                                } else {
-                                                    muted_fg
-                                                })
-                                                .overflow_hidden()
-                                                .whitespace_nowrap()
-                                                .child(dir_path),
-                                        ),
-                                )
-                        }))
-                        .into_any_element()
-                }
+            // 已安装 Everything 且已有数据库，不额外提示
+            EverythingStatus::Indexed { .. } => {
+                // TODO: 处理 Everything 已安装且当前用户已有索引数据库的状态。
+                div().flex_1().into_any_element()
             }
         }
     }
