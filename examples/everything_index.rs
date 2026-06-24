@@ -7,10 +7,28 @@
 #[path = "../src/bindings.rs"]
 mod bindings;
 
+use std::path::PathBuf;
+use std::thread;
+use std::time::{Duration, Instant};
+
 fn main() {
     use bindings::*;
 
     unsafe {
+        if let Some(exe_path) = find_everything_exe() {
+            if let Err(err) = start_everything_silent(&exe_path) {
+                eprintln!("Failed to start Everything silently: {err}");
+            }
+        } else {
+            eprintln!("Everything.exe not found in common install locations or PATH.");
+        }
+
+        let db_loaded = wait_for_db_loaded(Duration::from_secs(3));
+        println!("DB loaded: {db_loaded}");
+        if !db_loaded {
+            eprintln!("Everything database is not loaded. Wait for indexing before querying.");
+        }
+
         println!(
             "Everything version: {}.{}.{}.{}",
             Everything_GetMajorVersion(),
@@ -19,20 +37,14 @@ fn main() {
             Everything_GetBuildNumber()
         );
 
-        let db_loaded = Everything_IsDBLoaded() != 0;
-        println!("DB loaded: {db_loaded}");
-        if !db_loaded {
-            eprintln!("Everything database is not loaded. Start Everything and wait for indexing before querying.");
-        }
-
         // 写索引：请求 Everything 更新所有文件夹索引并保存数据库。
         // 这要求 Everything 正在运行；失败时可用 Everything_GetLastError 查看原因。
-        if Everything_UpdateAllFolderIndexes() == 0 {
-            print_last_error("Everything_UpdateAllFolderIndexes");
-        }
-        if Everything_SaveDB() == 0 {
-            print_last_error("Everything_SaveDB");
-        }
+        // if Everything_UpdateAllFolderIndexes() == 0 {
+        //     print_last_error("Everything_UpdateAllFolderIndexes");
+        // }
+        // if Everything_SaveDB() == 0 {
+        //     print_last_error("Everything_SaveDB");
+        // }
 
         // 读索引：从当前 Everything 索引中查询并打印最多 20 条结果。
         let query = wide("*");
@@ -64,6 +76,62 @@ fn main() {
         Everything_CleanUp();
     }
 }
+
+fn find_everything_exe() -> Option<PathBuf> {
+    let candidates = [
+        r"C:\Program Files\Everything\Everything.exe",
+        r"C:\Program Files (x86)\Everything\Everything.exe",
+        r"C:\Users\Public\Everything\Everything.exe",
+    ];
+
+    for candidate in candidates {
+        let path = PathBuf::from(candidate);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    let output = std::process::Command::new("where")
+        .arg("Everything.exe")
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(PathBuf::from)
+}
+
+fn start_everything_silent(exe_path: &PathBuf) -> std::io::Result<()> {
+    std::process::Command::new(exe_path)
+        .arg("-startup")
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()?;
+    Ok(())
+}
+
+fn wait_for_db_loaded(timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if unsafe { bindings::Everything_IsDBLoaded() != 0 } {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+
+    unsafe { bindings::Everything_IsDBLoaded() != 0 }
+}
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
