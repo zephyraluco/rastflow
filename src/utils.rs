@@ -1,8 +1,31 @@
 use std::ops::Deref;
+use std::path::PathBuf;
 
 use gpui::*;
 
 use crate::settings::AppSettings;
+
+// ---------- 应用数据目录 ----------
+
+/// 返回 `%LOCALAPPDATA%\rastflow\`，自动创建目录。
+///
+/// 在所有 Windows 用户上下文中均可写，包括开机自启场景。
+/// 若 LOCALAPPDATA 不可用（极端情况），回落至 exe 所在目录。
+pub fn app_data_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Ok(dir) = std::env::var("LOCALAPPDATA") {
+            let path = PathBuf::from(dir).join("rastflow");
+            let _ = std::fs::create_dir_all(&path);
+            return path;
+        }
+    }
+    // 回退
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
 
 // ---------- 窗口可见性 ----------
 

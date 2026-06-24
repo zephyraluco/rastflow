@@ -7,7 +7,9 @@ use gpui_component::{
     list::{List, ListDelegate, ListItem, ListState},
     *,
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+const EVERYTHING_SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
 
 use crate::locale::t;
 use crate::settings::{AppSettings, SettingsView};
@@ -115,6 +117,9 @@ impl ListDelegate for EverythingDelegate {
         _window: &mut Window,
         cx: &mut Context<ListState<Self>>,
     ) {
+        if self.selected_index == ix {
+            return;
+        }
         self.selected_index = ix;
         cx.notify();
     }
@@ -353,6 +358,19 @@ impl LauncherView {
 
         let entity = cx.entity().downgrade();
         cx.spawn(async move |_this, cx: &mut gpui::AsyncApp| {
+            cx.background_executor()
+                .timer(EVERYTHING_SEARCH_DEBOUNCE)
+                .await;
+            let should_search = cx
+                .update(|app| {
+                    entity
+                        .read_with(app, |this, _| this.everything_search_generation == generation)
+                        .unwrap_or(false)
+                });
+            if !should_search {
+                return;
+            }
+
             let result = cx
                 .background_executor()
                 .spawn(async move { search_everything_index(&query) })
@@ -773,7 +791,7 @@ impl LauncherView {
                 .flex_1()
                 .p_2()
                 .gap_1()
-                .when(self.everything_searching, |this| {
+                .when(self.everything_searching && self.everything_results.is_empty(), |this| {
                     this.child(
                         div()
                             .px_2()

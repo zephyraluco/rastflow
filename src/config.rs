@@ -41,7 +41,7 @@ impl AppEntry {
 // ---------- 运行时 & 连接池（单连接，无线程池）----------
 
 static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-static POOL: OnceLock<SqlitePool> = OnceLock::new();
+static POOL: OnceLock<Option<SqlitePool>> = OnceLock::new();
 
 fn runtime() -> &'static tokio::runtime::Runtime {
     RT.get_or_init(|| {
@@ -52,18 +52,24 @@ fn runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
-fn pool() -> &'static SqlitePool {
-    POOL.get_or_init(|| {
+fn pool() -> Option<&'static SqlitePool> {
+    let opt: &Option<SqlitePool> = POOL.get_or_init(|| {
         runtime().block_on(async {
             let opts = SqliteConnectOptions::new()
                 .filename(db_path())
                 .create_if_missing(true);
-            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            let pool = match sqlx::sqlite::SqlitePoolOptions::new()
                 .max_connections(1)
                 .connect_with(opts)
                 .await
-                .expect("failed to open sqlite db");
-            sqlx::query(
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("[rastflow] 无法打开 SQLite 数据库: {e}");
+                    return None;
+                }
+            };
+            if let Err(e) = sqlx::query(
                 "CREATE TABLE IF NOT EXISTS app_entries (
                     name         TEXT    NOT NULL,
                     category     TEXT    NOT NULL DEFAULT '',
@@ -73,18 +79,20 @@ fn pool() -> &'static SqlitePool {
             )
             .execute(&pool)
             .await
-            .expect("failed to create app_entries table");
-            pool
+            {
+                eprintln!("[rastflow] 无法创建数据库表: {e}");
+                return None;
+            }
+            Some(pool)
         })
-    })
+    });
+    opt.as_ref()
 }
 
 // ---------- 路径 ----------
 
 pub fn db_path() -> PathBuf {
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join("applist.db")
+    crate::utils::app_data_dir().join("applist.db")
 }
 
 // ---------- 默认数据 ----------
@@ -112,7 +120,10 @@ fn default_test_entries() -> Vec<AppEntry> {
 // ---------- 数据库读写 ----------
 
 fn load_all_from_db() -> Vec<AppEntry> {
-    let p = pool(); // 必须在 block_on 外部获取，避免嵌套 block_on panic
+    let p = match pool() {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
     runtime().block_on(async move {
         let rows = sqlx::query(
             "SELECT name, category, launch_target, launch_count FROM app_entries",
@@ -133,7 +144,10 @@ fn load_all_from_db() -> Vec<AppEntry> {
 }
 
 pub fn save_entries(entries: &[AppEntry]) {
-    let p = pool(); // 必须在 block_on 外部获取，避免嵌套 block_on panic
+    let p = match pool() {
+        Some(p) => p,
+        None => return,
+    };
     let owned: Vec<AppEntry> = entries.to_vec();
     runtime().block_on(async move {
         let mut tx = p.begin().await.expect("begin transaction");

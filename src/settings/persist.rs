@@ -22,9 +22,7 @@ impl Default for PersistedSettings {
 }
 
 pub fn settings_path() -> std::path::PathBuf {
-    std::env::current_dir()
-        .unwrap_or_default()
-        .join("settings.json")
+    crate::utils::app_data_dir().join("settings.json")
 }
 
 /// 从 settings.json 加载持久化设置，文件不存在时返回默认值。

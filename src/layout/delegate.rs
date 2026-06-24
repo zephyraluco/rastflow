@@ -216,6 +216,9 @@ impl ListDelegate for LauncherDelegate {
         _window: &mut Window,
         cx: &mut Context<ListState<Self>>,
     ) {
+        if self.selected_index == ix {
+            return;
+        }
         self.selected_index = ix;
         cx.notify();
     }
