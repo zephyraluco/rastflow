@@ -2,7 +2,7 @@
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
-use gpui_component::{button::Button, setting::*, *};
+use gpui_kit::component::{button::Button, setting::*, *};
 
 use crate::config::{load_entries_from_file, upsert_custom_entry};
 use crate::icons::IconName;

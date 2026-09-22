@@ -1,7 +1,7 @@
 /// 设置窗口视图
 
 use gpui::*;
-use gpui_component::{setting::*, *};
+use gpui_kit::component::{setting::*, *};
 
 use crate::locale::t;
 

@@ -1,1 +1,4 @@
 /target
+
+# cargo-packager 的输出目录（安装包与中间产物）
+/dist

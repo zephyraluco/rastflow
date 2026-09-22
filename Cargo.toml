@@ -3,12 +3,61 @@ name = "rastflow"
 version = "0.1.0"
 edition = "2024"
 authors = ["zephyraluco <zephyraluco@gmail.com>"]
+description = "基于 Rust + GPUI 的 Windows 快速启动器"
+license = "Apache-2.0"
+
+# ── cargo-packager 打包配置 ──────────────────────────────────────────────
+# 打包：cargo packager --release
+#
+# 放在 Cargo.toml 而不是独立的 Packager.toml 是有原因的：只有这条路径下
+# cargo-packager 才会用 cargo metadata 自动推导 binaries / binariesDir / outDir
+# （见 cli/config.rs 的 load_configs_from_cargo_workspace）。独立配置文件里
+# 这些必须手写，且 binariesDir 只能写死 target/release，一旦改了
+# CARGO_TARGET_DIR 就会失效。
+#
+# 键名是 camelCase：Config 结构体为 #[serde(rename_all = "camelCase",
+# deny_unknown_fields)]，官网文档里 TOML 示例的 kebab-case 写法是错的。
+[package.metadata.packager]
+productName = "rastflow"
+# 反向域名，安装信息、开始菜单快捷方式与卸载注册表项都用它。
+# 注意 publisher 默认取这里的第二段（zephyraluco）。
+identifier = "com.zephyraluco.rastflow"
+longDescription = "rastflow 是一个常驻托盘的 Windows 快速启动器：全局快捷键唤出，搜索并快速启动本机程序，并可切换到 Everything 模式按文件名搜索全盘文件。"
+category = "Utility"
+licenseFile = "LICENSE"
+
+# 装包时先构建 release 二进制
+beforePackagingCommand = "cargo build --release"
+
+# 只做 NSIS 安装包：单文件 exe、默认无需管理员权限、Windows 上零额外依赖。
+# 若要 .msi，需先装 WiX Toolset，再把 "wix" 加进来。
+formats = ["nsis"]
+
+outDir = "dist"
+
+# 安装器图标与快捷方式图标。exe 自身的图标由 build.rs 通过 winresource 嵌入。
+icons = ["assets/app-icon.ico"]
+
+[package.metadata.packager.nsis]
+# 安装器窗口与「添加或删除程序」里显示的图标
+installerIcon = "assets/app-icon.ico"
+# 第一个语言是兜底语言；安装器优先跟随系统语言（中文系统显示中文）
+languages = ["SimpChinese", "English"]
+# 应用把数据放在 %LOCALAPPDATA%\rastflow（见 src/utils.rs 的 app_data_dir）。
+# 声明后，卸载时会给用户一个「是否一并删除这些数据」的选项。
+appdataPaths = ["$LOCALAPPDATA/rastflow"]
+# 默认装到 %LOCALAPPDATA%\Programs，不需要管理员权限
+installMode = "currentUser"
+
+[package.metadata.packager.windows]
+# 不允许用旧版本覆盖已装的新版本，避免降级后数据不兼容
+allowDowngrades = false
 
 [dependencies]
-gpui = { git = "https://github.com/zed-industries/zed" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
-gpui-component = { git = "https://github.com/longbridge/gpui-component" }
-tray-icon = "0.24"
+gpui = { version = "0.3", package = "gpui-pre" }
+gpui-kit = { git = "https://github.com/longbridge/gpui-kit", default-features = false, features = ["component"] }
+# 没有用 tray-icon：系统托盘与右键菜单由 src/tray.rs 直连 Win32 实现
+# （Shell_NotifyIconW + TrackPopupMenu），少一棵依赖树。
 global-hotkey = "0.8"
 raw-window-handle = "0.6"
 rust-embed = { version = "8", features = ["interpolate-folder-path"] }
@@ -17,13 +66,24 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+# 用于构造 gpui 的 RenderImage 与图标缩放（版本须与 gpui-pre 一致）
+image = { version = "0.25", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Controls",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
     "Win32_System_Com",
     "Win32_System_Registry",
 ] }
+
+[target.'cfg(windows)'.build-dependencies]
+# 把 assets/app-icon.ico 与版本信息写进 exe 的资源段，
+# 否则打包出来的程序在资源管理器/任务栏里是默认空白图标。
+winresource = "0.1"

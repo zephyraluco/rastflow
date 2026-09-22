@@ -7,9 +7,11 @@ mod layout;
 mod locale;
 mod utils;
 mod icons;
+mod app_icon;
+mod tray;
 
 use gpui::*;
-use gpui_component::*;
+use gpui_kit::component::*;
 use rust_embed::RustEmbed;
 use std::borrow::Cow;
 
@@ -34,16 +36,12 @@ impl AssetSource for Assets {
             .collect())
     }
 }
-use tray_icon::{
-    TrayIconBuilder, TrayIconEvent,
-    MouseButton as TrayMouseButton,
-    menu::{Menu as TrayMenu, MenuEvent, MenuItem, PredefinedMenuItem},
-};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 
 use layout::LauncherView;
 use settings::AppSettings;
+use tray::TrayEvent;
 use utils::{auto_launch_is_enabled, auto_launch_set, center_window, hide_window, show_window};
 
 // ---------- 快捷键解析 ----------
@@ -70,6 +68,32 @@ fn parse_hotkey(s: &str) -> Option<HotKey> {
     code.map(|c| HotKey::new(if mods.is_empty() { None } else { Some(mods) }, c))
 }
 
+// ---------- 托盘图标 ----------
+
+/// 系统托盘图标应使用的边长（像素）。
+///
+/// 取 `SM_CXSMICON`，也就是通知区域当前用的小图标尺寸：96 DPI 下是 16，
+/// 150% 缩放是 24，200% 是 32。写死 16 的话，高分屏上图标会被系统硬放大而发糊。
+///
+/// 两点说明：
+/// - 未设置 DPI 上下文时 `GetSystemMetrics` 返回的是**系统** DPI 下的取值
+///   （PerMonitorV2 进程亦然）。托盘通常就在主显示器上，够用。
+/// - 只在启动时算一次，所以之后改变缩放或把任务栏拖到别的显示器，
+///   托盘图标不会重建 —— 要做的话得在 `WM_DPICHANGED` 时重新 `set_icon`。
+fn tray_icon_size() -> u32 {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
+
+        let size = unsafe { GetSystemMetrics(SM_CXSMICON) };
+        if size > 0 {
+            // 夹一下，避免异常的系统度量把图标做成一张巨图
+            return (size as u32).clamp(8, 64);
+        }
+    }
+    16
+}
+
 // ---------- 常量 ----------
 
 /// 启动器窗口的逻辑宽度（gpui Pixels 单位）。
@@ -80,8 +104,8 @@ pub const WIN_H: f32 = 520.0;
 // ---------- 入口 ----------
 
 fn main() {
-    gpui_platform::application().with_assets(Assets).run(move |cx| {
-        gpui_component::init(cx);
+    gpui_kit::application().with_assets(Assets).run(move |cx| {
+        gpui_kit::init(cx);
         cx.set_global(AppSettings::default());
         // 从 settings.json 加载持久化设置（主题、语言等）
         {
@@ -137,43 +161,16 @@ fn main() {
                 .expect("Failed to open window");
 
             // ── 系统托盘 ─────────────────────────────────────────────────
-            // 构建右键菜单
-            let tray_menu = TrayMenu::new();
-            let toggle_item = MenuItem::new("显示 / 隐藏", true, None);
-            let quit_item   = MenuItem::new("退出", true, None);
-            tray_menu.append(&toggle_item).unwrap();
-            tray_menu.append(&PredefinedMenuItem::separator()).unwrap();
-            tray_menu.append(&quit_item).unwrap();
-
-            // 生成一个 16×16 的蓝色圆形图标
-            let mut icon_rgba = vec![0u8; 16 * 16 * 4];
-            for y in 0..16i32 {
-                for x in 0..16i32 {
-                    let i = ((y * 16 + x) * 4) as usize;
-                    let dx = x - 7;
-                    let dy = y - 7;
-                    if dx * dx + dy * dy <= 36 {
-                        icon_rgba[i]     = 0;
-                        icon_rgba[i + 1] = 120;
-                        icon_rgba[i + 2] = 215;
-                        icon_rgba[i + 3] = 255;
-                    }
+            // 必须在主线程（也就是拥有消息循环的线程）创建：托盘窗口靠该线程的
+            // 消息循环接收交互，而 gpui 的 spawn 任务正是跑在主线程上。
+            let tray = match crate::tray::TrayIcon::new("rastflow", tray_icon_size()) {
+                Ok(tray) => Some(tray),
+                Err(err) => {
+                    // 托盘不可用时仍可靠全局快捷键工作，所以只告警、不退出
+                    eprintln!("[rastflow] 系统托盘不可用：{err}");
+                    None
                 }
-            }
-            let tray_icon_img = tray_icon::Icon::from_rgba(icon_rgba, 16, 16)
-                .expect("Failed to create tray icon");
-
-            // 创建托盘图标（必须在主线程创建，spawn 任务运行在主线程上）
-            let _tray = TrayIconBuilder::new()
-                .with_menu(Box::new(tray_menu))
-                .with_menu_on_left_click(false)   // 左键不弹菜单，仅右键弹菜单
-                .with_tooltip("rastflow")
-                .with_icon(tray_icon_img)
-                .build()
-                .expect("Failed to build tray icon");
-
-            let toggle_id = toggle_item.id().clone();
-            let quit_id   = quit_item.id().clone();
+            };
 
             // ── 全局快捷键 ────────────────────────────────────────────────
             // GlobalHotKeyManager 必须在拥有 Win32 消息循环的线程上创建。
@@ -201,6 +198,14 @@ fn main() {
 
             // 获取后台执行器，用于定时等待
             let bg = cx.update(|cx| cx.background_executor().clone());
+
+            // ── 静默启动 Everything（若未运行）─────────────────────────
+            // 在后台线程检测 Everything 进程，未运行则在安装位置找到
+            // Everything.exe 并以 -startup 静默启动，不阻塞窗口创建。
+            bg.spawn(async {
+                layout::everything::ensure_running();
+            })
+            .detach();
 
             // ── 托盘事件轮询循环 ─────────────────────────────────────────
             loop {
@@ -257,37 +262,20 @@ fn main() {
                     }
                 }
 
-                // 处理托盘图标左键单击 → 居中并显示窗口
-                while let Ok(event) = TrayIconEvent::receiver().try_recv() {
-                    if let TrayIconEvent::Click {
-                        button: TrayMouseButton::Left, ..
-                    } = event
-                    {
-                        cx.update(|cx| {
-                            window_handle
-                                .update(cx, |_, window, cx| {
-                                    // SW_SHOW 让隐藏窗口可见，再居中，再聚焦
-                                    show_window(window);
-                                    center_window(window, cx);
-                                    window.activate_window();
-                                })
-                                .ok();
-                        });
-                    }
-                }
+                // 处理托盘交互（左键单击、右键菜单项）
+                if let Some(tray) = &tray {
+                    while let Some(event) = tray.try_recv() {
+                        if event == TrayEvent::Quit {
+                            cx.update(|cx| cx.quit());
+                            return;
+                        }
 
-                // 处理右键菜单事件
-                while let Ok(event) = MenuEvent::receiver().try_recv() {
-                    if event.id == quit_id {
-                        // 退出应用
-                        cx.update(|cx| cx.quit());
-                        return;
-                    } else if event.id == toggle_id {
-                        // 显示 / 隐藏切换
+                        // 左键单击总是唤出；菜单项则是显示/隐藏切换
+                        let toggle = event == TrayEvent::ToggleWindow;
                         cx.update(|cx| {
                             window_handle
                                 .update(cx, |_, window, cx| {
-                                    if window.is_window_active() {
+                                    if toggle && window.is_window_active() {
                                         hide_window(window);
                                     } else {
                                         // SW_SHOW 让隐藏窗口可见，再居中，再聚焦

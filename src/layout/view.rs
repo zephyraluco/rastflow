@@ -1,15 +1,24 @@
 /// 启动器主视图：渲染搜索栏、应用列表与 Everything 文件搜索面板
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
-use gpui_component::{
+use gpui_kit::component::{
     button::{Button, ButtonVariants},
     input::{Escape, Input, InputEvent, InputState, MoveDown, MoveUp},
     list::{List, ListDelegate, ListItem, ListState},
     *,
 };
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const EVERYTHING_SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
+
+/// 每批从后台取回的图标数量。
+///
+/// 分批是为了让首屏（十几行）先拿到图标，其余在后台陆续补齐；
+/// 一次性把所有条目的图标都提完再回填的话，列表要等很久才能显示图标。
+const ICON_PREFETCH_BATCH: usize = 32;
 
 use crate::locale::t;
 use crate::settings::{AppSettings, SettingsView};
@@ -20,6 +29,7 @@ use super::everything::{
     EverythingResult, EverythingStatus, open_everything_gui, open_result,
     search as search_everything_index,
 };
+use crate::bindings::EVERYTHING_ERROR_IPC;
 
 actions!(launcher, [ToggleEverythingMode]);
 
@@ -175,6 +185,8 @@ pub struct LauncherView {
     everything_searching: bool,
     /// Everything 搜索错误
     everything_error: Option<String>,
+    /// 是否已有一个图标预取任务在跑（避免重复开链）
+    icon_prefetch_running: Arc<AtomicBool>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -221,9 +233,11 @@ impl LauncherView {
                             state.set_selected_index(new_ix, window, cx);
                             state.scroll_to_selected_item(window, cx);
                         });
+                        // 过滤后可能出现尚未提取过图标的条目
+                        this.prefetch_icons(cx);
                     }
                 }
-                InputEvent::PressEnter { secondary } => {
+                InputEvent::PressEnter { secondary, .. } => {
                     if this.everything_mode {
                         this.open_selected_everything(window, cx);
                     } else {
@@ -265,6 +279,8 @@ impl LauncherView {
                         list.set_selected_index(new_ix, window, cx);
                         list.scroll_to_selected_item(window, cx);
                     });
+                    // 重载后可能多了新条目（例如新安装的程序）
+                    this.prefetch_icons(cx);
                 }
             } else {
                 hide_window(window);
@@ -295,10 +311,79 @@ impl LauncherView {
             everything_search_generation: 0,
             everything_searching: false,
             everything_error: None,
+            icon_prefetch_running: Arc::new(AtomicBool::new(false)),
             _subscriptions: vec![input_sub, bounds_sub, activation_sub, settings_sub],
         };
         input_state.update(cx, |input, cx| input.focus(window, cx));
+        view.prefetch_icons(cx);
         view
+    }
+
+    /// 向列表代理讨下一批待提取图标的启动目标。
+    fn take_icon_requests(&self, cx: &mut App) -> Vec<String> {
+        self.list_state.update(cx, |state, _| {
+            state.delegate_mut().take_icon_requests(ICON_PREFETCH_BATCH)
+        })
+    }
+
+    /// 后台预取应用图标。
+    ///
+    /// 列表是虚拟列表（`render_item` 每帧都会对可见行调用），所以渲染路径上只查内存缓存。
+    /// 每轮取一小批交给后台线程提取（Shell / GDI 调用），回填后通知列表重绘，
+    /// 再继续下一批，直到没有新目标为止。
+    ///
+    /// `icon_prefetch_running` 只是省掉重复开链，不承担正确性：目标是否已请求由
+    /// [`IconCache::request`] 去重，重复调用最多是多开一个立刻结束的任务。
+    /// 过滤后新增的条目也会再次触发这里，所以图标是「先到先显示、其陆续补齐」。
+    fn prefetch_icons(&self, cx: &mut App) {
+        if self.icon_prefetch_running.load(Ordering::Relaxed) {
+            return;
+        }
+        let first = self.take_icon_requests(cx);
+        if first.is_empty() {
+            return;
+        }
+        self.icon_prefetch_running.store(true, Ordering::Relaxed);
+
+        // 用弱引用：任务可能比视图活得久（例如窗口关闭后），
+        // 直接持强引用会阻止实体销毁，而 `update` 在这里不会 panic。
+        let list_state = self.list_state.downgrade();
+        let running = self.icon_prefetch_running.clone();
+        cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+            let mut batch = first;
+            loop {
+                let loaded = cx
+                    .background_executor()
+                    .spawn(async move {
+                        batch
+                            .into_iter()
+                            .map(|target| {
+                                let icon = crate::app_icon::load(Path::new(&target));
+                                (target, icon)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .await;
+
+                let next = cx.update(|app| {
+                    list_state.update(app, |state, cx| {
+                        let delegate = state.delegate_mut();
+                        delegate.insert_icons(loaded);
+                        let next = delegate.take_icon_requests(ICON_PREFETCH_BATCH);
+                        cx.notify();
+                        next
+                    })
+                });
+
+                match next {
+                    Ok(next) if !next.is_empty() => batch = next,
+                    // 取完或实体已释放
+                    _ => break,
+                }
+            }
+            running.store(false, Ordering::Relaxed);
+        })
+        .detach();
     }
 
     /// 在后台线程中检测 Everything，完成后更新状态并通知重绘
@@ -398,8 +483,11 @@ impl LauncherView {
                                 state.delegate_mut().clear();
                                 cx.notify();
                             });
-                            this.everything_error =
-                                Some(format!("Everything_QueryW failed: {}", err.code));
+                            this.everything_error = Some(if err.code == EVERYTHING_ERROR_IPC {
+                                "无法连接 Everything，请确认已安装并运行 Everything".into()
+                            } else {
+                                format!("Everything_QueryW failed: {}", err.code)
+                            });
                         }
                     }
                     cx.notify();

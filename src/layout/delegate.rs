@@ -1,11 +1,12 @@
-/// 启动器列表代理：数据过滤、选中状态、启动逻辑
+//! 启动器列表代理：数据过滤、选中状态、启动逻辑
 
 use gpui::*;
-use gpui_component::{
+use gpui_kit::component::{
     list::{ListDelegate, ListItem, ListState},
     *,
 };
 use std::process::Command;
+use std::sync::Arc;
 
 use crate::config::{
     entry_identity, load_or_discover_entries, save_entries,
@@ -13,6 +14,8 @@ use crate::config::{
 };
 use crate::locale::t;
 use crate::utils::hide_window;
+
+use super::icon_cache::IconCache;
 
 // ---------- 平台启动 ----------
 
@@ -47,6 +50,8 @@ pub struct LauncherDelegate {
     pub(super) all_entries: Vec<AppEntry>,
     pub(super) filtered: Vec<AppEntry>,
     pub(super) selected_index: Option<IndexPath>,
+    /// 图标缓存与后台请求排队（详见 [`super::icon_cache`]）
+    icons: IconCache,
 }
 
 impl LauncherDelegate {
@@ -57,7 +62,41 @@ impl LauncherDelegate {
             all_entries,
             filtered,
             selected_index: Some(IndexPath::default()),
+            icons: IconCache::default(),
         }
+    }
+
+    /// 查缓存取图标。
+    ///
+    /// 渲染路径上只能做内存查表：虚拟列表的 `render_item` 每帧都会对可见行
+    /// 调用，而真正取图标要调 Shell / GDI。提取由 [`LauncherView::prefetch_icons`]
+    /// 在后台完成，结果经 [`Self::insert_icons`] 回填。
+    pub fn icon(&self, launch_target: Option<&str>) -> Option<Arc<RenderImage>> {
+        self.icons.get(launch_target)
+    }
+
+    /// 按列表显示顺序挑出下一批待提取图标的启动目标。
+    ///
+    /// 没有启动目标（例如内置示例条目）的会被跳过；已缓存或已在请求中的也会跳过。
+    pub fn take_icon_requests(&mut self, limit: usize) -> Vec<String> {
+        let mut requests = Vec::new();
+        for entry in &self.filtered {
+            if requests.len() >= limit {
+                break;
+            }
+            let Some(target) = entry.launch_target.as_deref() else {
+                continue;
+            };
+            if self.icons.request(target) {
+                requests.push(target.to_string());
+            }
+        }
+        requests
+    }
+
+    /// 回填后台提取好的图标（`None` 表示取不到，同样会被缓存）。
+    pub fn insert_icons(&mut self, loaded: Vec<(String, Option<Arc<RenderImage>>)>) {
+        self.icons.insert(loaded);
     }
 
     pub fn reload(&mut self, query: &str) {
@@ -148,24 +187,46 @@ impl ListDelegate for LauncherDelegate {
         _window: &mut Window,
         cx: &mut Context<ListState<Self>>,
     ) -> Option<Self::Item> {
-        let entry = self.filtered.get(ix.row)?;
+        let (name, category, launch_target) = {
+            let entry = self.filtered.get(ix.row)?;
+            (
+                entry.name.clone(),
+                entry.category.clone(),
+                entry.launch_target.clone(),
+            )
+        };
         let selected = Some(ix) == self.selected_index;
 
-        let first_char = entry
-            .name
-            .chars()
-            .next()
-            .map(|c| c.to_ascii_uppercase())
-            .unwrap_or('A')
-            .to_string();
+        let icon = self.icon(launch_target.as_deref());
 
-        let name = entry.name.clone();
-        let category = entry.category.clone();
-
-        let icon_bg = cx.theme().accent;
-        let icon_fg = cx.theme().accent_foreground;
         let muted_fg = cx.theme().muted_foreground;
         let muted_bg = cx.theme().muted;
+
+        // 有图标就显示图标，否则回退到首字母色块
+        let leading = match icon {
+            Some(icon) => img(icon).w_7().h_7().flex_shrink_0().into_any_element(),
+            None => {
+                let first_char = name
+                    .chars()
+                    .next()
+                    .map(|c| c.to_ascii_uppercase())
+                    .unwrap_or('A')
+                    .to_string();
+                div()
+                    .w_7()
+                    .h_7()
+                    .rounded_md()
+                    .bg(cx.theme().accent)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(cx.theme().accent_foreground)
+                    .font_bold()
+                    .text_sm()
+                    .child(first_char)
+                    .into_any_element()
+            }
+        };
 
         Some(
             ListItem::new(ix.row)
@@ -176,20 +237,7 @@ impl ListDelegate for LauncherDelegate {
                         .items_center()
                         .px_3()
                         .py_1()
-                        .child(
-                            div()
-                                .w_7()
-                                .h_7()
-                                .rounded_md()
-                                .bg(icon_bg)
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .text_color(icon_fg)
-                                .font_bold()
-                                .text_sm()
-                                .child(first_char),
-                        )
+                        .child(leading)
                         .child(
                             div()
                                 .flex_1()
@@ -229,16 +277,16 @@ impl ListDelegate for LauncherDelegate {
         window: &mut Window,
         cx: &mut Context<ListState<Self>>,
     ) {
-        if let Some(ix) = self.selected_index {
-            if let Some(entry) = self.filtered.get(ix.row) {
-                let launched = entry.clone();
-                if let Err(err) = launch_entry(&launched) {
-                    eprintln!("启动失败 [{}]: {err}", entry.name);
-                } else {
-                    self.mark_launched(&launched);
-                    cx.notify();
-                    hide_window(window);
-                }
+        if let Some(ix) = self.selected_index
+            && let Some(entry) = self.filtered.get(ix.row)
+        {
+            let launched = entry.clone();
+            if let Err(err) = launch_entry(&launched) {
+                eprintln!("启动失败 [{}]: {err}", entry.name);
+            } else {
+                self.mark_launched(&launched);
+                cx.notify();
+                hide_window(window);
             }
         }
     }

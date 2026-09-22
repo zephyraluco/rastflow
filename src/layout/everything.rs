@@ -159,6 +159,73 @@ pub fn detect() -> EverythingStatus {
     }
 }
 
+/// 检测 Everything 搜索客户端是否正在运行。
+///
+/// 通过查找 Everything 客户端窗口（类名 "EVERYTHING"）判断，这正是
+/// Everything SDK 建立 IPC 的方式：仅当客户端窗口存在于当前会话时
+/// SDK 查询才能成功。仅运行 Everything 服务（Session 0 中的进程）
+/// 而没有客户端窗口时返回 false。
+#[cfg(windows)]
+pub fn is_running() -> bool {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+
+    unsafe {
+        let class_name: Vec<u16> = "EVERYTHING\0".encode_utf16().collect();
+        FindWindowW(PCWSTR(class_name.as_ptr()), None)
+            .map_or(false, |hwnd| !hwnd.0.is_null())
+    }
+}
+
+/// 非 Windows 平台视为未运行。
+#[cfg(not(windows))]
+pub fn is_running() -> bool {
+    false
+}
+
+/// 静默启动 Everything.exe（`-startup` 参数，不显示主窗口、最小化到托盘）。
+#[cfg(windows)]
+pub fn start_everything_silent(exe_path: &PathBuf) -> bool {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    std::process::Command::new(exe_path)
+        .arg("-startup")
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .is_ok()
+}
+
+/// 非 Windows 平台视为启动失败。
+#[cfg(not(windows))]
+pub fn start_everything_silent(_exe_path: &PathBuf) -> bool {
+    false
+}
+
+/// 确保 Everything 搜索客户端正在运行：若未运行，则在常见安装位置找到
+/// Everything.exe 并静默启动，并等待其 IPC 窗口就绪。
+/// 返回 SDK 查询是否已可用。
+pub fn ensure_running() -> bool {
+    if is_running() {
+        return true;
+    }
+    let Some(exe_path) = find_everything_exe() else {
+        return false;
+    };
+    if !start_everything_silent(&exe_path) {
+        return false;
+    }
+    // 等待客户端窗口出现（最多约 5 秒）
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if is_running() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    is_running()
+}
+
 /// 检查当前用户 Everything 索引数据库是否存在。
 fn everything_db_exists() -> bool {
     std::env::var_os("LOCALAPPDATA")
@@ -208,7 +275,21 @@ pub fn open_result(_result: &EverythingResult) -> std::io::Result<()> {
 }
 
 /// 按 Everything SDK 示例方式搜索，并请求列表展示需要的字段。
+///
+/// 若查询因 IPC 失败（Everything 客户端未运行），会自动静默启动
+/// 客户端并重试一次。
 pub fn search(query: &str) -> Result<Vec<EverythingResult>, EverythingSearchError> {
+    match search_once(query) {
+        Err(err) if err.code == EVERYTHING_ERROR_IPC => {
+            // 客户端未运行：静默启动并等待就绪后重试
+            ensure_running();
+            search_once(query)
+        }
+        result => result,
+    }
+}
+
+fn search_once(query: &str) -> Result<Vec<EverythingResult>, EverythingSearchError> {
     let query = wide(query);
 
     unsafe {

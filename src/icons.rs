@@ -1,6 +1,6 @@
 use gpui::{AnyElement, App, IntoElement, RenderOnce, Window, SharedString};
-use gpui_component::{Icon, IconNamed};
-use gpui_component::icon_named;
+use gpui_kit::component::{Icon, IconNamed};
+use gpui_kit::component::icon_named;
 
 // 调用宏扫描你自己的 Crate 目录下的自定义图标
 icon_named!(IconName, "./assets/icons");
