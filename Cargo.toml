@@ -38,6 +38,9 @@ outDir = "dist"
 # 安装器图标与快捷方式图标。exe 自身的图标由 build.rs 通过 winresource 嵌入。
 icons = ["assets/app-icon.ico"]
 
+# Everything64.dll
+resources = ["Everything-SDK/dll/Everything64.dll"]
+
 [package.metadata.packager.nsis]
 # 安装器窗口与「添加或删除程序」里显示的图标
 installerIcon = "assets/app-icon.ico"
