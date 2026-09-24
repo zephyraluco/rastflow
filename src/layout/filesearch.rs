@@ -16,7 +16,7 @@
 //!
 //! - **引导线程**（[`start`]）：打开索引库 → 有索引就绪，没有则建索引 → 启监控；
 //! - **监控泵线程**：把 USN 事件喂给 [`Engine::apply_event`]，落到索引里。
-//!   整个进程只允许有一条（[`ensure_monitor`] 幂等），重建索引也不会换掉它；
+//!   整个进程只允许有一条（[`ensure_monitor`] 幂等：还在跑就原样复用）；
 //! - 搜索跑在调用方给的线程上（gpui 的 background executor），所以可以阻塞等待。
 
 use std::path::PathBuf;
@@ -289,42 +289,6 @@ pub fn relaunch_as_admin() -> bool {
     }
 }
 
-/// 请求重建索引（丢开旧记录重扫）。已有任务在跑时直接忽略。
-///
-/// 会把状态**同步**置为 [`SearchStatus::Indexing`]，这样调用方紧接着去轮询状态时
-/// 一定能看到「正在建」，不会有「还没开始就以为已经结束」的竞态。
-pub fn rebuild_index() {
-    let Some(inner) = STATE.get() else {
-        return;
-    };
-    if inner.building.swap(true, Ordering::SeqCst) {
-        return; // 已经在建了
-    }
-    inner.set_status(SearchStatus::Indexing {
-        disk: None,
-        written: 0,
-    });
-
-    let task = Arc::clone(inner);
-    let spawned = std::thread::Builder::new()
-        .name("rastflow-index-rebuild".to_string())
-        .spawn(move || {
-            let result = build_index(&task);
-            task.building.store(false, Ordering::SeqCst);
-            if let Err(err) = result {
-                eprintln!("[rastflow] 重建索引失败：{err}");
-                task.set_status(SearchStatus::Unavailable {
-                    reason: err.to_string(),
-                    needs_admin: is_access_denied(&err),
-                });
-            }
-        })
-        .is_ok();
-    if !spawned {
-        inner.building.store(false, Ordering::SeqCst);
-    }
-}
-
 // ---------- 搜索 ----------
 
 /// 按关键字搜索。
@@ -554,11 +518,11 @@ fn build_index(inner: &Arc<Inner>) -> crate::search::Result<()> {
 
 /// 保证增量监控在跑（幂等），返回监控当前是否可用。
 ///
-/// 已经在跑就原样留着：重建索引只是重扫 MFT，不动 USN 位点，而这条泵一直跟着日志走。
-/// 换一条新的反而会把重建期间积在通道里的事件丢掉，还要重建一次各盘的卷句柄。
+/// 已经在跑就原样留着：这条泵一直跟着 USN 日志走，换一条新的反而会把期间积在
+/// 通道里的事件丢掉，还要重新打开一次各盘的卷句柄。
 ///
 /// 非管理员直接返回 `false`：读 USN 日志要 `GENERIC_WRITE`（见 [`crate::search::win::volume`]），
-/// 起了也只会白失败一次。权限判断只留在这里一处，两个调用点（引导与重建）写法一致。
+/// 起了也只会白失败一次。权限判断只留在这里一处。
 fn ensure_monitor(inner: &Arc<Inner>, engine: &Arc<Engine>) -> bool {
     if !is_admin() {
         return false;
@@ -898,7 +862,7 @@ mod tests {
     #[test]
     fn live_pump_is_reused() {
         // 还在跑的泵代表「监控正在工作」：必须原样留着让调用方复用，
-        // 换一条新的会把重建索引期间积在通道里的事件丢掉。
+        // 换一条新的会把期间积在通道里的事件丢掉。
         let mut slot: Option<JoinHandle<()>> = Some(std::thread::spawn(|| {
             std::thread::sleep(Duration::from_millis(300));
         }));
@@ -911,7 +875,7 @@ mod tests {
 
     #[test]
     fn finished_pump_is_reaped() {
-        // 泵是在「各盘监控线程全挂」时退出的，之后重建索引必须能起一条新的，
+        // 泵是在「各盘监控线程全挂」时退出的，之后必须能起一条新的，
         // 所以已结束的句柄要被清掉（否则会一直被当成「在跑」）。
         let mut slot: Option<JoinHandle<()>> = Some(std::thread::spawn(|| {}));
         std::thread::sleep(Duration::from_millis(200));

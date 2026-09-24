@@ -393,7 +393,7 @@ impl LauncherView {
 
     /// 轮询索引状态，直到稳定（就绪或不可用）。
     ///
-    /// 建索引可能要几十秒，期间靠这个循环刷新进度；重建索引时也要重新订阅一次。
+    /// 建索引可能要几十秒，期间靠这个循环刷新进度；每次重新开始建索引都要订阅一次。
     fn watch_file_search(&mut self, cx: &mut Context<Self>) {
         let entity = cx.entity().downgrade();
         cx.spawn(async move |_this, cx: &mut gpui::AsyncApp| {
@@ -906,24 +906,6 @@ impl LauncherView {
                 .flex_1()
                 .p_2()
                 .gap_1()
-                // 索引可能因为长时间没运行而落后（启动前的改动、监控被停），
-                // 给一个手动重扫的入口
-                .child(
-                    h_flex()
-                        .w_full()
-                        .px_1()
-                        .justify_end()
-                        .child(
-                            Button::new("rebuild-index-btn")
-                                .ghost()
-                                .label("重建索引")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    super::filesearch::rebuild_index();
-                                    // 重建会重新进入 Indexing，得重新订阅状态才能刷回来
-                                    this.watch_file_search(cx);
-                                })),
-                        ),
-                )
                 .when(self.file_searching && self.file_results.is_empty(), |this| {
                     this.child(
                         div()
