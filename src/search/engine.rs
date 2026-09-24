@@ -1366,15 +1366,20 @@ mod tests {
         // 可选的增量监控验证：启动监控，让用户手动建/删文件。
         // 这里直接打印事件内容，便于人工核对「新建/改名/删除」分别对应什么。
         if std::env::var("RASTFLOW_CORE_E2E_MONITOR").is_ok() {
+            use std::sync::mpsc::RecvTimeoutError;
+
             let monitor = engine.start_monitor().expect("启动监控失败");
             println!("监控已启动，10 秒内随意新建/删除文件…");
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             while std::time::Instant::now() < deadline {
-                let Some(event) = monitor.recv_timeout(Duration::from_millis(500)) else {
-                    continue;
-                };
-                println!("  事件 {event:?}");
-                let _ = engine.apply_event(&event);
+                match monitor.recv_timeout(Duration::from_millis(500)) {
+                    Ok(event) => {
+                        println!("  事件 {event:?}");
+                        let _ = engine.apply_event(&event);
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
             }
             monitor.join();
             println!("监控已停止");

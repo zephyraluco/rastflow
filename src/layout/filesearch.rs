@@ -15,12 +15,15 @@
 //! # 线程模型
 //!
 //! - **引导线程**（[`start`]）：打开索引库 → 有索引就绪，没有则建索引 → 启监控；
-//! - **监控泵线程**：把 USN 事件喂给 [`Engine::apply_event`]，落到索引里；
+//! - **监控泵线程**：把 USN 事件喂给 [`Engine::apply_event`]，落到索引里。
+//!   整个进程只允许有一条（[`ensure_monitor`] 幂等），重建索引也不会换掉它；
 //! - 搜索跑在调用方给的线程上（gpui 的 background executor），所以可以阻塞等待。
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::CloseHandle;
@@ -48,6 +51,9 @@ const RESULT_LIMIT: usize = 200;
 /// 索引本身就在内存里（搜索走的就是它），快照只是「下次启动不用重扫 MFT」，
 /// 所以频繁写盘没有意义，反而会和用户的磁盘 IO 抢带宽。
 const SNAPSHOT_IDLE: Duration = Duration::from_secs(60);
+
+/// 泵线程单次等事件的时长：超时说明这段时间没有变更，顺便看看该不该落快照。
+const PUMP_TICK: Duration = Duration::from_millis(500);
 
 // ---------- 对外类型 ----------
 
@@ -128,8 +134,9 @@ struct Inner {
     status: Mutex<SearchStatus>,
     /// 上一次搜索的取消句柄：新的搜索到来时先把旧的取消掉
     last_cancel: Mutex<Option<Arc<AtomicBool>>>,
-    /// 让监控泵线程退出
-    pump_stop: Arc<AtomicBool>,
+    /// 正在运行的监控泵线程。它退出时会把各盘的监控线程一并收掉，
+    /// 所以「句柄已结束」等于「监控已经没了」（见 [`ensure_monitor`]）
+    pump: Mutex<Option<JoinHandle<()>>>,
     /// 防止重复触发建索引
     building: AtomicBool,
 }
@@ -147,6 +154,18 @@ impl Inner {
             .status
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = status;
+    }
+
+    /// 增量监控已停止（监控线程全部退出）：把「监控中」降级。
+    /// 不覆盖「正在建索引」「不可用」这些状态。
+    fn mark_monitoring_stopped(&self) {
+        let mut status = self
+            .status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let SearchStatus::Ready { monitoring } = &mut *status {
+            *monitoring = false;
+        }
     }
 }
 
@@ -167,7 +186,7 @@ pub fn start() {
             engine: OnceLock::new(),
             status: Mutex::new(SearchStatus::Uninitialized),
             last_cancel: Mutex::new(None),
-            pump_stop: Arc::new(AtomicBool::new(false)),
+            pump: Mutex::new(None),
             building: AtomicBool::new(false),
         });
 
@@ -484,8 +503,7 @@ fn bootstrap_engine(inner: &Arc<Inner>) -> crate::search::Result<()> {
             });
         }
         StartupAction::Search => {
-            // 监控需要管理员，失败就降级为「无实时增量」
-            let monitoring = start_monitor(inner, &engine);
+            let monitoring = ensure_monitor(inner, &engine);
             inner.set_status(SearchStatus::Ready { monitoring });
         }
         StartupAction::NeedAdmin => {
@@ -529,24 +547,45 @@ fn build_index(inner: &Arc<Inner>) -> crate::search::Result<()> {
         report.elapsed_ms
     );
 
-    let monitoring = start_monitor(inner, &engine);
+    let monitoring = ensure_monitor(inner, &engine);
     inner.set_status(SearchStatus::Ready { monitoring });
     Ok(())
 }
 
-/// 启动监控并开一条泵线程把事件落进索引。返回监控是否可用。
-fn start_monitor(inner: &Arc<Inner>, engine: &Arc<Engine>) -> bool {
+/// 保证增量监控在跑（幂等），返回监控当前是否可用。
+///
+/// 已经在跑就原样留着：重建索引只是重扫 MFT，不动 USN 位点，而这条泵一直跟着日志走。
+/// 换一条新的反而会把重建期间积在通道里的事件丢掉，还要重建一次各盘的卷句柄。
+///
+/// 非管理员直接返回 `false`：读 USN 日志要 `GENERIC_WRITE`（见 [`crate::search::win::volume`]），
+/// 起了也只会白失败一次。权限判断只留在这里一处，两个调用点（引导与重建）写法一致。
+fn ensure_monitor(inner: &Arc<Inner>, engine: &Arc<Engine>) -> bool {
+    if !is_admin() {
+        return false;
+    }
+
+    // 「查活 → 起新的 → 记下来」整段都在锁里：两条建索引路径可能同时走到这里，
+    // 不锁就会各起一条。泵线程自己不碰这把锁（它只用索引与 `status`），
+    // 所以下面 join 已结束的线程不会死锁。
+    let mut slot = inner
+        .pump
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if pump_is_live(&mut slot) {
+        return true;
+    }
+
     let monitor = match engine.start_monitor() {
         Ok(monitor) => monitor,
         Err(err) => {
-            // 非管理员会很常见：读 USN 日志也要 GENERIC_WRITE
             eprintln!("[rastflow] 文件监控未启动（搜索结果可能滞后）：{err}");
             return false;
         }
     };
 
     let pump_engine = Arc::clone(engine);
-    let stop = Arc::clone(&inner.pump_stop);
+    let pump_inner = Arc::clone(inner);
     let spawned = std::thread::Builder::new()
         .name("rastflow-index-pump".to_string())
         .spawn(move || {
@@ -555,20 +594,29 @@ fn start_monitor(inner: &Arc<Inner>, engine: &Arc<Engine>) -> bool {
             // 「最后一次变更」的时刻；为 None 表示没有待落盘的改动
             let mut dirty_since: Option<Instant> = None;
 
-            while !stop.load(Ordering::Relaxed) {
-                let Some(event) = monitor.recv_timeout(Duration::from_millis(500)) else {
-                    // 空闲下来一段时间了，把内存索引落一份快照
-                    if snapshot_due(dirty_since, Instant::now()) {
-                        save_snapshot(&pump_engine);
-                        dirty_since = None;
+            // 唯一的出口是「各盘监控线程都没了」：那时通道断开，不会再有事件到来
+            loop {
+                match monitor.recv_timeout(PUMP_TICK) {
+                    Ok(event) => {
+                        // 单条事件失败不值得中断整条泵：索引会在下次重建时自愈
+                        match pump_engine.apply_event(&event) {
+                            Ok(true) => dirty_since = Some(Instant::now()),
+                            Ok(false) => {}
+                            Err(err) => eprintln!("[rastflow] 应用文件变更失败：{err}"),
+                        }
                     }
-                    continue;
-                };
-                // 单条事件失败不值得中断整条泵：索引会在下次重建时自愈
-                match pump_engine.apply_event(&event) {
-                    Ok(true) => dirty_since = Some(Instant::now()),
-                    Ok(false) => {}
-                    Err(err) => eprintln!("[rastflow] 应用文件变更失败：{err}"),
+                    Err(RecvTimeoutError::Timeout) => {
+                        // 空闲下来一段时间了，把内存索引落一份快照
+                        if snapshot_due(dirty_since, Instant::now()) {
+                            save_snapshot(&pump_engine);
+                            dirty_since = None;
+                        }
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        eprintln!("[rastflow] 文件监控已全部停止，索引不再跟随磁盘变化");
+                        pump_inner.mark_monitoring_stopped();
+                        break;
+                    }
                 }
             }
 
@@ -577,10 +625,33 @@ fn start_monitor(inner: &Arc<Inner>, engine: &Arc<Engine>) -> bool {
                 save_snapshot(&pump_engine);
             }
             monitor.join();
-        })
-        .is_ok();
+        });
 
-    spawned
+    match spawned {
+        Ok(join) => {
+            *slot = Some(join);
+            true
+        }
+        Err(err) => {
+            // 闭包连同捕获的 `monitor` 一起被丢弃 → `MonitorHandle::drop` 会停掉各盘监控线程
+            eprintln!("[rastflow] 监控泵线程创建失败：{err}");
+            false
+        }
+    }
+}
+
+/// 槽位里是否已经有一条活着的监控泵。
+///
+/// 活着就原样留着，调用方据此**复用**而不是再起一条；已经结束的（各盘监控线程全挂
+/// 之后就是这个状态）顺手 `join` 回收并清空槽位，让调用方起一条新的。
+fn pump_is_live(slot: &mut Option<JoinHandle<()>>) -> bool {
+    if slot.as_ref().is_some_and(|pump| !pump.is_finished()) {
+        return true;
+    }
+    if let Some(finished) = slot.take() {
+        let _ = finished.join();
+    }
+    false
 }
 
 /// 是不是到落盘的时候了
@@ -815,6 +886,38 @@ mod tests {
             written: 1
         }
         .needs_admin());
+    }
+
+    #[test]
+    fn empty_pump_slot_reports_not_live() {
+        let mut slot: Option<JoinHandle<()>> = None;
+        assert!(!pump_is_live(&mut slot), "还没有泵时应当报告为不存在");
+        assert!(slot.is_none());
+    }
+
+    #[test]
+    fn live_pump_is_reused() {
+        // 还在跑的泵代表「监控正在工作」：必须原样留着让调用方复用，
+        // 换一条新的会把重建索引期间积在通道里的事件丢掉。
+        let mut slot: Option<JoinHandle<()>> = Some(std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(300));
+        }));
+        assert!(pump_is_live(&mut slot), "还在跑的泵应当报告为存活");
+        assert!(slot.is_some(), "存活时不能把句柄挪走");
+
+        let handle = slot.take().expect("句柄应当还在");
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn finished_pump_is_reaped() {
+        // 泵是在「各盘监控线程全挂」时退出的，之后重建索引必须能起一条新的，
+        // 所以已结束的句柄要被清掉（否则会一直被当成「在跑」）。
+        let mut slot: Option<JoinHandle<()>> = Some(std::thread::spawn(|| {}));
+        std::thread::sleep(Duration::from_millis(200));
+
+        assert!(!pump_is_live(&mut slot), "已结束的泵应当让位");
+        assert!(slot.is_none(), "已结束的句柄应当被清空");
     }
 
     #[test]

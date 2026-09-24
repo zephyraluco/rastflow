@@ -11,7 +11,7 @@
 //! 停止用 `CancelSynchronousIo` 打断阻塞中的读取（[`super::win::cancel_synchronous_io`]）。
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -116,9 +116,16 @@ impl MonitorHandle {
         })
     }
 
-    /// 带超时取一条事件
-    pub fn recv_timeout(&self, timeout: Duration) -> Option<MonitorEvent> {
-        self.events.recv_timeout(timeout).ok()
+    /// 带超时取一条事件。
+    ///
+    /// ⚠️ `Err(Disconnected)` 表示所有盘的监控线程都已退出，不会再有事件到来。
+    /// 这时它会**不等待**地反复返回 `Disconnected`，轮询方必须据此停下，
+    /// 否则就是把 500 ms 的等待退化成空转。
+    pub fn recv_timeout(
+        &self,
+        timeout: Duration,
+    ) -> std::result::Result<MonitorEvent, RecvTimeoutError> {
+        self.events.recv_timeout(timeout)
     }
 
     /// 请求停止：置标志，并取消阻塞中的同步 IO。
