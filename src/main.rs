@@ -8,7 +8,9 @@ mod utils;
 mod icons;
 mod app_icon;
 mod search;
+mod single_instance;
 mod tray;
+mod update;
 
 use gpui::*;
 use gpui_kit::component::*;
@@ -104,6 +106,20 @@ pub const WIN_H: f32 = 520.0;
 // ---------- 入口 ----------
 
 fn main() {
+    // ── 单实例守卫 ─────────────────────────────────────────────────────
+    // 必须在接触 GPUI **之前**判定：只要走到 application().run(...)，
+    // 托盘图标与全局快捷键就已经开始注册，此时再退出会看到图标闪一下又消失。
+    if single_instance::acquire() == single_instance::Guard::AlreadyRunning {
+        if !tray::activate_existing() {
+            eprintln!("[rastflow] 已有实例在运行，但没能唤出它的窗口（对方托盘可能创建失败）");
+        }
+        return;
+    }
+
+    // 必须在 gpui 启动**之前**做：往下会起线程，而设置环境变量要求此时只有主线程。
+    // 详见 update::apply_system_proxy 的说明（reqwest 不读 Windows 系统代理）。
+    update::apply_system_proxy();
+
     gpui_kit::application().with_assets(Assets).run(move |cx| {
         gpui_kit::init(cx);
         cx.set_global(AppSettings::default());
@@ -113,11 +129,15 @@ fn main() {
             let s = cx.global_mut::<AppSettings>();
             if !persisted.theme.is_empty() { s.theme = persisted.theme.into(); }
             if !persisted.language.is_empty() { s.language = persisted.language.into(); }
+            s.auto_check_update = persisted.auto_check_update;
         }
         // 设置变更时自动写入 settings.json
         cx.observe_global::<AppSettings>(|cx| {
             settings::save_settings(cx.global::<AppSettings>());
         }).detach();
+        // 初始化升级状态，并起一个延迟检查的线程。这里不区分「用户是否开了自动检查」——
+        // 那个偏好存在 AppSettings 里，只有下面的主循环读得到。
+        update::init();
         // 启动时从注册表读取实际自启状态并同步到设置，确保开关显示正确
         cx.global_mut::<AppSettings>().auto_launch = auto_launch_is_enabled();
         // 启动时应用已保存的主题设置
@@ -217,7 +237,11 @@ fn main() {
                     auto_launch_set(new_auto_launch);
                     current_auto_launch = new_auto_launch;
                 }
-
+                // 周期性检查更新。is_due 内部已避开「首次检查」——
+                // 那次由 update::init 的延迟线程负责，两边不会撞车。
+                if cx.update(|cx| cx.global::<AppSettings>().auto_check_update) && update::is_due() {
+                    update::check();
+                }
                 // 检测快捷键设置是否发生变化，若变则重新注册
                 let new_hotkey_str: String = cx
                     .update(|cx| cx.global::<AppSettings>().hotkey.to_string());
@@ -271,7 +295,8 @@ fn main() {
                             return;
                         }
 
-                        // 左键单击总是唤出；菜单项则是显示/隐藏切换
+                        // 左键单击与「另一个实例请求激活」都总是唤出；
+                        // 只有菜单项才是显示/隐藏切换
                         let toggle = event == TrayEvent::ToggleWindow;
                         cx.update(|cx| {
                             window_handle

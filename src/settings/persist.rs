@@ -9,6 +9,7 @@ use super::global::AppSettings;
 pub struct PersistedSettings {
     pub theme: String,
     pub language: String,
+    pub auto_check_update: bool,
 }
 
 impl Default for PersistedSettings {
@@ -17,6 +18,7 @@ impl Default for PersistedSettings {
         Self {
             theme: d.theme.to_string(),
             language: d.language.to_string(),
+            auto_check_update: d.auto_check_update,
         }
     }
 }
@@ -38,6 +40,7 @@ pub fn save_settings(s: &AppSettings) {
     let p = PersistedSettings {
         theme: s.theme.to_string(),
         language: s.language.to_string(),
+        auto_check_update: s.auto_check_update,
     };
     if let Ok(data) = serde_json::to_string_pretty(&p) {
         let _ = std::fs::write(settings_path(), data);

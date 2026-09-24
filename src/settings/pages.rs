@@ -2,10 +2,11 @@
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
-use gpui_kit::component::{button::Button, setting::*, *};
+use gpui_kit::component::{button::{Button, ButtonVariants}, setting::*, *};
 
 use crate::config::{load_entries_from_file, upsert_custom_entry};
 use crate::icons::IconName;
+use crate::update::{self, UpdateStatus};
 
 use super::global::AppSettings;
 
@@ -296,5 +297,178 @@ pub fn build_settings_pages(lang: &str) -> Vec<SettingPage> {
                         )
                 })),
             ),
+        SettingPage::new(zh_en(lang, "关于", "About"))
+            .icon(Icon::new(IconName::Info))
+            .group(
+                SettingGroup::new()
+                    .title(zh_en(lang, "版本与更新", "Version & Updates"))
+                    .item(
+                        SettingItem::new(
+                            zh_en(lang, "当前版本", "Current Version"),
+                            SettingField::render(|_, _, _| {
+                                div()
+                                    .text_sm()
+                                    .child(update::current_version())
+                                    .into_any_element()
+                            }),
+                        ),
+                    )
+                    .item(
+                        SettingItem::new(
+                            zh_en(lang, "自动检查更新", "Check Automatically"),
+                            SettingField::switch(
+                                |cx: &App| cx.global::<AppSettings>().auto_check_update,
+                                |val: bool, cx: &mut App| {
+                                    cx.global_mut::<AppSettings>().auto_check_update = val;
+                                    // 刚打开开关就顺手查一次：否则用户要等到下一个检查周期
+                                    // （24 小时）才能看到结果，会以为开关没生效。
+                                    // 已在忙时 check() 自己会忽略。
+                                    if val {
+                                        update::check();
+                                    }
+                                },
+                            )
+                            .default_value(default.auto_check_update),
+                        )
+                        .description(zh_en(
+                            lang,
+                            "启动后自动检查是否有新版本，发现后可在下方一键升级",
+                            "Check for new versions on startup; upgrade below with one click",
+                        )),
+                    )
+                    // 状态行 + 两个按钮属于「宽内容」，放进右侧那一列会被挤得换行。
+                    // 跟「自定义程序」页一样改用整行的 SettingItem::render。
+                    .item(SettingItem::render(move |_, _, cx| {
+                        render_update_field(lang, cx)
+                    })),
+            ),
     ]
+}
+
+// ---------- 关于页：更新状态与操作 ----------
+
+/// 渲染「更新」这一项的内容：状态行 + 变更摘要 + 两个按钮。
+///
+/// 每次都重新读 [`update::status`]，状态变化靠 `SettingsView` 的轮询触发重渲染。
+fn render_update_field(lang: &'static str, cx: &App) -> AnyElement {
+    let status = update::status();
+    let fg = cx.theme().foreground;
+    let muted = cx.theme().muted_foreground;
+
+    // 每个阶段都要让用户看得出「现在到底在干什么」，尤其是失败时
+    let (icon, text) = match &status {
+        UpdateStatus::Idle => (None, zh_en(lang, "尚未检查", "Not checked yet").to_string()),
+        UpdateStatus::Checking => (
+            Some(IconName::LoaderCircle),
+            zh_en(lang, "正在检查…", "Checking…").to_string(),
+        ),
+        UpdateStatus::UpToDate { version } => (
+            Some(IconName::CircleCheck),
+            format!("{}（{version}）", zh_en(lang, "已是最新版本", "Up to date")),
+        ),
+        UpdateStatus::Available { version, .. } => (
+            Some(IconName::ArrowDown),
+            format!(
+                "{}：{version}",
+                zh_en(lang, "发现新版本", "New version available")
+            ),
+        ),
+        UpdateStatus::Downloading { got, total } => (
+            Some(IconName::LoaderCircle),
+            match total {
+                // total 为 0 表示服务端没给 Content-Length，此时只能报已下载量
+                Some(total) if *total > 0 => format!(
+                    "{}：{} / {}",
+                    zh_en(lang, "正在下载", "Downloading"),
+                    human_size(*got),
+                    human_size(*total)
+                ),
+                _ => format!("{}…", zh_en(lang, "正在下载", "Downloading")),
+            },
+        ),
+        UpdateStatus::Installing { version } => (
+            Some(IconName::LoaderCircle),
+            format!(
+                "{}：{version}（{}）",
+                zh_en(lang, "正在安装", "Installing"),
+                zh_en(lang, "程序会自动重启", "the app will restart automatically")
+            ),
+        ),
+        UpdateStatus::Failed { reason } => (
+            Some(IconName::TriangleAlert),
+            format!("{}：{reason}", zh_en(lang, "检查失败", "Failed")),
+        ),
+    };
+
+    let failed = matches!(status, UpdateStatus::Failed { .. });
+    let notes = match &status {
+        UpdateStatus::Available { notes, .. } if !notes.trim().is_empty() => Some(notes.clone()),
+        _ => None,
+    };
+
+    v_flex()
+        .w_full()
+        .gap_2()
+        .child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .gap_2()
+                .text_sm()
+                .text_color(if failed { muted } else { fg })
+                .when_some(icon, |this, icon| this.child(Icon::new(icon)))
+                .child(text),
+        )
+        .when_some(notes, |this, notes| {
+            this.child(
+                div()
+                    .w_full()
+                    .max_h_32()
+                    .overflow_hidden()
+                    .rounded_md()
+                    .bg(cx.theme().muted)
+                    .p_2()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(notes),
+            )
+        })
+        .child(
+            h_flex()
+                .w_full()
+                .gap_2()
+                .child(
+                    Button::new("update-check-btn")
+                        .ghost()
+                        .child(zh_en(lang, "检查更新", "Check for Updates"))
+                        // 正在检查/下载时禁掉，避免重复触发（update::check 也会拦，
+                        // 但按钮变灰能让用户看出「已经在做了」）
+                        .disabled(status.is_busy())
+                        .on_click(|_, _, _| update::check()),
+                )
+                .when(status.can_install(), |this| {
+                    this.child(
+                        Button::new("update-install-btn")
+                            .child(zh_en(lang, "立即升级", "Update Now"))
+                            .on_click(|_, _, _| update::install()),
+                    )
+                }),
+        )
+        .into_any_element()
+}
+
+/// 把字节数转成人类可读的形式（仅用于下载进度）。
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }

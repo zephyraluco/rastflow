@@ -35,6 +35,8 @@ pub enum TrayEvent {
     ToggleWindow,
     /// 菜单：「退出」
     Quit,
+    /// 另一个实例请求把窗口唤出来（见 [`activate_existing`]）
+    Activate,
 }
 
 #[cfg(windows)]
@@ -52,12 +54,12 @@ mod imp {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyIcon,
-        DestroyWindow, GetCursorPos, GetWindowLongPtrW, HICON, HMENU, IMAGE_FLAGS, IMAGE_ICON,
-        LoadImageW, MF_SEPARATOR, MF_STRING, PostMessageW, RegisterClassW, RegisterWindowMessageW,
-        SetForegroundWindow, SetWindowLongPtrW, TrackPopupMenu, CREATESTRUCTW, GWLP_USERDATA,
-        TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_DESTROY,
-        WM_LBUTTONUP, WM_NCCREATE, WM_NULL, WM_RBUTTONUP, WNDCLASSW, WS_EX_NOACTIVATE,
-        WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+        DestroyWindow, FindWindowW, GetCursorPos, GetWindowLongPtrW, HICON, HMENU, IMAGE_FLAGS,
+        IMAGE_ICON, LoadImageW, MF_SEPARATOR, MF_STRING, PostMessageW, RegisterClassW,
+        RegisterWindowMessageW, SetForegroundWindow, SetWindowLongPtrW, TrackPopupMenu,
+        CREATESTRUCTW, GWLP_USERDATA, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD,
+        TPM_RIGHTBUTTON, WM_APP, WM_DESTROY, WM_LBUTTONUP, WM_NCCREATE, WM_NULL, WM_RBUTTONUP,
+        WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
     };
 
     use super::TrayEvent;
@@ -80,7 +82,15 @@ mod imp {
 
     /// 托盘自身窗口的类名。用 `w!` 拿到 `'static` 的宽字符串字面量，
     /// 省掉自己维护缓冲区生命周期的麻烦。
+    ///
+    /// 第二个实例靠这个类名用 `FindWindowW` 找到本窗口（见 [`activate_existing`]）。
     const TRAY_WINDOW_CLASS: PCWSTR = w!("rastflow_tray_window");
+
+    /// 「把窗口唤出来」的消息名。
+    ///
+    /// `RegisterWindowMessageW` 是**系统级**注册，两个进程用同一个字符串就会拿到
+    /// 同一个消息 id，所以不需要额外的进程间通信通道。
+    const ACTIVATE_MESSAGE_NAME: PCWSTR = w!("rastflow_activate");
 
     /// 挂在窗口 `GWLP_USERDATA` 上的上下文。
     struct TrayContext {
@@ -89,6 +99,8 @@ mod imp {
         icon: HICON,
         /// `TaskbarCreated` 消息 id；explorer 重启后用它重新登记图标
         taskbar_created: u32,
+        /// 另一个实例请求激活时投递的消息 id（见 [`ACTIVATE_MESSAGE_NAME`]）
+        activate_message: u32,
         /// 提示文字（宽字符，含结尾 NUL），重新登记时要一并恢复
         tooltip: Vec<u16>,
     }
@@ -225,6 +237,13 @@ mod imp {
             return LRESULT(0);
         }
 
+        // 另一个实例请求把窗口唤出来。这里同样只能塞 channel ——
+        // 窗口过程碰不到 GPUI 的 App/Context。
+        if context.activate_message != 0 && message == context.activate_message {
+            let _ = context.events.send(TrayEvent::Activate);
+            return LRESULT(0);
+        }
+
         match message {
             TRAY_CALLBACK_MESSAGE => {
                 // 这里用的是旧版回调协议（不调 NIM_SETVERSION）：
@@ -302,6 +321,7 @@ mod imp {
                 events: events_tx,
                 icon,
                 taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
+                activate_message: unsafe { RegisterWindowMessageW(ACTIVATE_MESSAGE_NAME) },
                 tooltip: wide_tooltip(tooltip),
             }));
 
@@ -380,6 +400,31 @@ mod imp {
             drop(unsafe { Box::from_raw(self.context) });
         }
     }
+
+    /// 请求**已在运行**的另一个实例把窗口唤出来，返回是否成功投递。
+    ///
+    /// 被重复启动时（见 [`crate::single_instance`]）用它代替「再开一个窗口」：
+    /// 找到对方那个永不显示的托盘窗口，投一条自定义消息过去，对方的窗口过程
+    /// 会把它转成 [`TrayEvent::Activate`]。
+    ///
+    /// 之所以能只靠窗口找到对方，是因为那个窗口的类名是我们自己注册的
+    /// （与 GPUI 的窗口类无关），全系统唯一。
+    ///
+    /// 返回 `false` 的两种情形：对方刚退出（窗口已销毁），或对方的托盘创建失败
+    /// （根本没有这个窗口）。调用方据此决定是「放弃启动」还是「照常启动」。
+    pub fn activate_existing() -> bool {
+        unsafe {
+            let message = RegisterWindowMessageW(ACTIVATE_MESSAGE_NAME);
+            // 注册失败时消息 id 为 0，继续投递等于发一条 WM_NULL，没有意义
+            if message == 0 {
+                return false;
+            }
+            let Ok(hwnd) = FindWindowW(TRAY_WINDOW_CLASS, PCWSTR::null()) else {
+                return false;
+            };
+            PostMessageW(Some(hwnd), message, WPARAM(0), LPARAM(0)).is_ok()
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -402,9 +447,14 @@ mod imp {
             self.events.try_recv().ok()
         }
     }
+
+    /// 非 Windows 平台没有托盘窗口，自然也无法唤出已有实例。
+    pub fn activate_existing() -> bool {
+        false
+    }
 }
 
-pub use imp::TrayIcon;
+pub use imp::{TrayIcon, activate_existing};
 
 #[cfg(all(test, windows))]
 mod tests {

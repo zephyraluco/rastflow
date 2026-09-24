@@ -71,6 +71,7 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 # 唯一还在用 SQLite 的是 applist.db（应用列表），走 sqlx。
 # 用于构造 gpui 的 RenderImage 与图标缩放（版本须与 gpui-pre 一致）
 image = { version = "0.25", default-features = false }
+cargo-packager-updater = "0.2.3"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
@@ -98,3 +99,7 @@ windows = { version = "0.62", features = [
 # 把 assets/app-icon.ico 与版本信息写进 exe 的资源段，
 # 否则打包出来的程序在资源管理器/任务栏里是默认空白图标。
 winresource = "0.1"
+
+[dev-dependencies]
+base64 = "0.22"
+minisign-verify = "0.2.5"
