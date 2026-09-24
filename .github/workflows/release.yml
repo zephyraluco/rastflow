@@ -1,0 +1,96 @@
+# 发布流水线：打 tag 即出安装包，并生成自动升级所需的更新清单。
+#
+# 触发：git tag v0.1.1 && git push origin v0.1.1
+#
+# 需要配置的仓库 secret：
+#   CARGO_PACKAGER_SIGN_PRIVATE_KEY —— `cargo packager signer generate` 产出的私钥文件内容。
+#   没有它这一步会直接失败：不签名的包客户端一律拒绝安装（升级器强制校验签名）。
+#
+# 产物三者缺一不可，客户端靠它们完成自动升级：
+#   rastflow_<版本>_x64-setup.exe       安装包
+#   rastflow_<版本>_x64-setup.exe.sig   对应的 minisign 签名
+#   latest.json                         更新清单。客户端请求的端点固定在
+#                                       releases/latest/download/latest.json，
+#                                       所以清单必须是「最新 Release」的附件。
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+# gh release create 需要写权限
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # tag 必须与 Cargo.toml 的 version 完全一致。
+      # 理由不只是「整洁」：latest.json 里的 version 取自 Cargo.toml、安装包文件名也带它，
+      # 客户端比的是 semver。两者错位会导致「装上了新版却仍提示有更新」，
+      # 而 Cargo.toml 里的 allowDowngrades=false 又会让安装器拒绝装回旧版，
+      # 用户就卡在一个升不上去也退不回来的状态。
+      - name: 校验 tag 与版本号一致
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart('v')
+          $m = Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+          if (-not $m) { throw '在 Cargo.toml 里找不到 version' }
+          $cargoVersion = $m.Matches[0].Groups[1].Value
+          if ($tag -ne $cargoVersion) {
+            throw "tag 是 $tag，但 Cargo.toml 的 version 是 $cargoVersion —— 两者必须一致"
+          }
+          "版本号校验通过：$cargoVersion"
+
+      # 钉在本地验证过的版本上，避免某天上游改动让流水线行为悄悄变化。
+      - name: 安装 cargo-packager
+        run: cargo install cargo-packager --version 0.11.8 --locked
+
+      # 私钥先经 env 传给脚本再落盘，不直接插值进命令行：
+      # secret 里若含引号或换行，插值会被 shell 解释，而这类错误只在发布时才暴露。
+      - name: 写入签名私钥
+        shell: pwsh
+        env:
+          SIGNING_KEY: ${{ secrets.CARGO_PACKAGER_SIGN_PRIVATE_KEY }}
+        run: |
+          if (-not $env:SIGNING_KEY) {
+            throw '仓库 secret CARGO_PACKAGER_SIGN_PRIVATE_KEY 未配置：没有私钥就无法签名，而客户端会拒绝安装未签名的包'
+          }
+          $path = Join-Path $env:RUNNER_TEMP 'rastflow.key'
+          Set-Content -Path $path -Value $env:SIGNING_KEY -NoNewline -Encoding ascii
+          "SIGNING_KEY_PATH=$path" | Add-Content -Path $env:GITHUB_ENV -Encoding utf8
+
+      # --password= 表示空密码：与 `signer generate --ci` 生成的密钥一致。
+      # 若换成带密码的密钥，把密码存进 CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD 并去掉这个参数。
+      # NSIS 工具链由 cargo-packager 自行下载（含 nsis_tauri_utils.dll），无需预装。
+      - name: 打包并签名
+        shell: pwsh
+        run: cargo packager --release --formats nsis -k "$env:SIGNING_KEY_PATH" --password=
+
+      # 生成逻辑放在 scripts/ 里而不是写在这里，是为了本地也能原样跑一遍：
+      # 清单的编码细节（signature 放 .sig 原文、不能有尾换行、不能带 BOM）弄错了
+      # 只会在用户点「升级」时才暴露，值得能随时本地验证。
+      - name: 生成更新清单 latest.json
+        shell: pwsh
+        run: ./scripts/gen-update-manifest.ps1 -Repository $env:GITHUB_REPOSITORY -Tag $env:GITHUB_REF_NAME
+
+      # 放在打包之后是有意的：real_installer_signature_verifies 会用 dist/ 里刚产出的
+      # 安装包验证签名，提前跑它会走「跳过」分支，等于没测。
+      - name: 运行测试
+        run: cargo test --locked
+
+      - name: 创建 Release 并上传产物
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $assets = @(
+            Get-ChildItem dist -File |
+              Where-Object { $_.Name -like '*-setup.exe' -or $_.Name -like '*.exe.sig' -or $_.Name -eq 'latest.json' } |
+              ForEach-Object { $_.FullName }
+          )
+          if ($assets.Count -lt 3) { throw "产物不全，只有 $($assets.Count) 个：$($assets -join ', ')" }
+          gh release create $env:GITHUB_REF_NAME --title "rastflow $env:GITHUB_REF_NAME" --generate-notes @assets
