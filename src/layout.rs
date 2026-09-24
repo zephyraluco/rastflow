@@ -1,5 +1,5 @@
 mod delegate;
-pub mod everything;
+pub mod filesearch;
 mod icon_cache;
 mod view;
 

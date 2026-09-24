@@ -9,22 +9,6 @@ fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is not set"));
 
     embed_windows_resources(&manifest_dir);
-
-    let sdk_dir = manifest_dir.join("Everything-SDK");
-    let lib_dir = sdk_dir.join("lib");
-
-    println!("cargo:rerun-if-changed={}", lib_dir.display());
-    println!("cargo:rustc-link-search=native={}", lib_dir.display());
-
-    let sdk_name = match env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
-        Ok("x86") => "Everything32",
-        Ok("x86_64") => "Everything64",
-        Ok("arm") => "EverythingARM",
-        Ok("aarch64") => "EverythingARM64",
-        Ok(arch) => panic!("unsupported Windows target architecture for Everything SDK: {arch}"),
-        Err(_) => panic!("CARGO_CFG_TARGET_ARCH is not set"),
-    };
-    println!("cargo:rustc-link-lib=static={sdk_name}");
 }
 
 /// 把应用图标与版本信息写进 exe 的资源段。

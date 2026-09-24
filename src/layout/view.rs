@@ -1,4 +1,4 @@
-/// 启动器主视图：渲染搜索栏、应用列表与 Everything 文件搜索面板
+/// 启动器主视图：渲染搜索栏、应用列表与文件搜索面板
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_kit::component::{
@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-const EVERYTHING_SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
+const FILE_SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
 
 /// 每批从后台取回的图标数量。
 ///
@@ -25,20 +25,18 @@ use crate::settings::{AppSettings, SettingsView};
 use crate::utils::{center_window, hide_window};
 
 use super::delegate::LauncherDelegate;
-use super::everything::{
-    EverythingResult, EverythingStatus, open_everything_gui, open_result,
-    search as search_everything_index,
+use super::filesearch::{
+    FileResult, SearchError, SearchStatus, open_result, search as search_file_index,
 };
-use crate::bindings::EVERYTHING_ERROR_IPC;
 
-actions!(launcher, [ToggleEverythingMode]);
+actions!(launcher, [ToggleFileMode]);
 
-struct EverythingDelegate {
-    results: Vec<EverythingResult>,
+struct FileSearchDelegate {
+    results: Vec<FileResult>,
     selected_index: Option<IndexPath>,
 }
 
-impl EverythingDelegate {
+impl FileSearchDelegate {
     fn new() -> Self {
         Self {
             results: Vec::new(),
@@ -46,7 +44,7 @@ impl EverythingDelegate {
         }
     }
 
-    fn set_results(&mut self, results: Vec<EverythingResult>) {
+    fn set_results(&mut self, results: Vec<FileResult>) {
         self.results = results;
         self.selected_index = if self.results.is_empty() {
             None
@@ -61,7 +59,7 @@ impl EverythingDelegate {
     }
 }
 
-impl ListDelegate for EverythingDelegate {
+impl ListDelegate for FileSearchDelegate {
     type Item = ListItem;
 
     fn items_count(&self, _section: usize, _cx: &App) -> usize {
@@ -99,7 +97,7 @@ impl ListDelegate for EverythingDelegate {
                             .text_sm()
                             .text_color(muted_fg)
                             .truncate()
-                            .child(result.path.clone()),
+                            .child(result.dir.clone()),
                     )
                     .child(
                         div()
@@ -168,23 +166,23 @@ impl ListDelegate for EverythingDelegate {
 pub struct LauncherView {
     input_state: Entity<InputState>,
     list_state: Entity<ListState<LauncherDelegate>>,
-    everything_list_state: Entity<ListState<EverythingDelegate>>,
+    file_list_state: Entity<ListState<FileSearchDelegate>>,
     /// 鼠标按下的时刻，用于判断长按拖动
     drag_start: Option<Instant>,
-    /// 是否处于 Everything 搜索模式
-    everything_mode: bool,
-    /// Everything 安装检测状态
-    everything_status: EverythingStatus,
-    /// Everything 搜索结果
-    everything_results: Vec<EverythingResult>,
-    /// Everything 搜索结果中当前选中的索引
-    everything_selected: usize,
-    /// Everything 搜索请求序号，用于丢弃过期后台结果
-    everything_search_generation: u64,
-    /// Everything 是否正在搜索
-    everything_searching: bool,
-    /// Everything 搜索错误
-    everything_error: Option<String>,
+    /// 是否处于文件搜索模式
+    file_mode: bool,
+    /// 文件索引状态
+    file_status: SearchStatus,
+    /// 文件搜索结果
+    file_results: Vec<FileResult>,
+    /// 文件搜索结果中当前选中的索引
+    file_selected: usize,
+    /// 文件搜索请求序号，用于丢弃过期后台结果
+    file_search_generation: u64,
+    /// 文件搜索是否进行中
+    file_searching: bool,
+    /// 文件搜索错误
+    file_error: Option<String>,
     /// 是否已有一个图标预取任务在跑（避免重复开链）
     icon_prefetch_running: Arc<AtomicBool>,
     _subscriptions: Vec<Subscription>,
@@ -192,10 +190,10 @@ pub struct LauncherView {
 
 impl LauncherView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        // 注册 Tab 键：在 Launcher 上下文中切换 Everything 搜索模式
+        // 注册 Tab 键：在 Launcher 上下文中切换文件搜索模式
         cx.bind_keys([KeyBinding::new(
             "tab",
-            ToggleEverythingMode,
+            ToggleFileMode,
             Some("Launcher"),
         )]);
 
@@ -211,8 +209,8 @@ impl LauncherView {
             state
         });
 
-        let everything_list_state = cx.new(|cx| {
-            let delegate = EverythingDelegate::new();
+        let file_list_state = cx.new(|cx| {
+            let delegate = FileSearchDelegate::new();
             ListState::new(delegate, window, cx)
         });
 
@@ -221,10 +219,10 @@ impl LauncherView {
             let list_state = list_state.clone();
             move |this, _, ev: &InputEvent, window, cx| match ev {
                 InputEvent::Change => {
-                    if this.everything_mode {
+                    if this.file_mode {
                         let value = input_state.read(cx).value().to_string();
-                        this.everything_selected = 0;
-                        this.search_everything(value, cx);
+                        this.file_selected = 0;
+                        this.search_files(value, cx);
                     } else {
                         let value = input_state.read(cx).value().to_string();
                         list_state.update(cx, |state, cx| {
@@ -238,8 +236,8 @@ impl LauncherView {
                     }
                 }
                 InputEvent::PressEnter { secondary, .. } => {
-                    if this.everything_mode {
-                        this.open_selected_everything(window, cx);
+                    if this.file_mode {
+                        this.open_selected_file(window, cx);
                     } else {
                         let secondary = *secondary;
                         list_state.update(cx, |state, cx| {
@@ -266,7 +264,7 @@ impl LauncherView {
         let activation_sub = cx.observe_window_activation(window, |this, window, cx| {
             if window.is_window_active() {
                 center_window(window, cx);
-                if this.everything_mode {
+                if this.file_mode {
                     cx.notify();
                 } else {
                     this.input_state.update(cx, |input, cx| {
@@ -302,15 +300,15 @@ impl LauncherView {
         let view = Self {
             input_state: input_state.clone(),
             list_state,
-            everything_list_state,
+            file_list_state,
             drag_start: None,
-            everything_mode: false,
-            everything_status: EverythingStatus::Unknown,
-            everything_results: Vec::new(),
-            everything_selected: 0,
-            everything_search_generation: 0,
-            everything_searching: false,
-            everything_error: None,
+            file_mode: false,
+            file_status: SearchStatus::Uninitialized,
+            file_results: Vec::new(),
+            file_selected: 0,
+            file_search_generation: 0,
+            file_searching: false,
+            file_error: None,
             icon_prefetch_running: Arc::new(AtomicBool::new(false)),
             _subscriptions: vec![input_sub, bounds_sub, activation_sub, settings_sub],
         };
@@ -386,70 +384,90 @@ impl LauncherView {
         .detach();
     }
 
-    /// 在后台线程中检测 Everything，完成后更新状态并通知重绘
-    fn detect_everything(&mut self, cx: &mut Context<Self>) {
-        self.everything_status = EverythingStatus::Unknown;
+    /// 启动文件搜索并跟踪索引状态。
+    fn detect_file_search(&mut self, cx: &mut Context<Self>) {
+        self.file_status = SearchStatus::Uninitialized;
+        super::filesearch::start();
+        self.watch_file_search(cx);
+    }
+
+    /// 轮询索引状态，直到稳定（就绪或不可用）。
+    ///
+    /// 建索引可能要几十秒，期间靠这个循环刷新进度；重建索引时也要重新订阅一次。
+    fn watch_file_search(&mut self, cx: &mut Context<Self>) {
         let entity = cx.entity().downgrade();
         cx.spawn(async move |_this, cx: &mut gpui::AsyncApp| {
-            let status = cx
-                .background_executor()
-                .spawn(async { super::everything::detect() })
-                .await;
-            let _ = cx.update(|app| {
-                let _ = entity.update(app, |this, cx| {
-                    this.everything_status = status;
-                    if matches!(this.everything_status, EverythingStatus::Indexed { .. }) {
-                        let query = this.input_state.read(cx).value().to_string();
-                        this.search_everything(query, cx);
-                    }
-                    cx.notify();
+            loop {
+                let status = super::filesearch::status();
+                let settled = matches!(
+                    status,
+                    SearchStatus::Ready { .. } | SearchStatus::Unavailable { .. }
+                );
+                let _ = cx.update(|app| {
+                    let _ = entity.update(app, |this, cx| {
+                        let first_ready = !matches!(this.file_status, SearchStatus::Ready { .. })
+                            && matches!(status, SearchStatus::Ready { .. });
+                        this.file_status = status.clone();
+                        if first_ready {
+                            // 索引就绪后把当前输入立即搜一遍
+                            let query = this.input_state.read(cx).value().to_string();
+                            this.search_files(query, cx);
+                        }
+                        cx.notify();
+                    });
                 });
-            });
+                if settled {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(400))
+                    .await;
+            }
         })
         .detach();
     }
 
-    fn search_everything(&mut self, query: String, cx: &mut Context<Self>) {
-        if !matches!(self.everything_status, EverythingStatus::Indexed { .. }) {
-            self.everything_results.clear();
-            self.everything_list_state.update(cx, |state, cx| {
+    fn search_files(&mut self, query: String, cx: &mut Context<Self>) {
+        if !matches!(self.file_status, SearchStatus::Ready { .. }) {
+            self.file_results.clear();
+            self.file_list_state.update(cx, |state, cx| {
                 state.delegate_mut().clear();
                 cx.notify();
             });
-            self.everything_error = None;
-            self.everything_searching = false;
+            self.file_error = None;
+            self.file_searching = false;
             cx.notify();
             return;
         }
 
         if query.trim().is_empty() {
-            self.everything_search_generation = self.everything_search_generation.wrapping_add(1);
-            self.everything_results.clear();
-            self.everything_list_state.update(cx, |state, cx| {
+            self.file_search_generation = self.file_search_generation.wrapping_add(1);
+            self.file_results.clear();
+            self.file_list_state.update(cx, |state, cx| {
                 state.delegate_mut().clear();
                 cx.notify();
             });
-            self.everything_selected = 0;
-            self.everything_error = None;
-            self.everything_searching = false;
+            self.file_selected = 0;
+            self.file_error = None;
+            self.file_searching = false;
             cx.notify();
             return;
         }
 
-        self.everything_search_generation = self.everything_search_generation.wrapping_add(1);
-        let generation = self.everything_search_generation;
-        self.everything_searching = true;
-        self.everything_error = None;
+        self.file_search_generation = self.file_search_generation.wrapping_add(1);
+        let generation = self.file_search_generation;
+        self.file_searching = true;
+        self.file_error = None;
 
         let entity = cx.entity().downgrade();
         cx.spawn(async move |_this, cx: &mut gpui::AsyncApp| {
             cx.background_executor()
-                .timer(EVERYTHING_SEARCH_DEBOUNCE)
+                .timer(FILE_SEARCH_DEBOUNCE)
                 .await;
             let should_search = cx
                 .update(|app| {
                     entity
-                        .read_with(app, |this, _| this.everything_search_generation == generation)
+                        .read_with(app, |this, _| this.file_search_generation == generation)
                         .unwrap_or(false)
                 });
             if !should_search {
@@ -458,35 +476,34 @@ impl LauncherView {
 
             let result = cx
                 .background_executor()
-                .spawn(async move { search_everything_index(&query) })
+                .spawn(async move { search_file_index(&query) })
                 .await;
             let _ = cx.update(|app| {
                 let _ = entity.update(app, |this, cx| {
-                    if this.everything_search_generation != generation {
+                    if this.file_search_generation != generation {
                         return;
                     }
 
-                    this.everything_searching = false;
-                    this.everything_selected = 0;
+                    this.file_searching = false;
+                    this.file_selected = 0;
                     match result {
                         Ok(results) => {
-                            this.everything_results = results.clone();
-                            this.everything_list_state.update(cx, |state, cx| {
+                            this.file_results = results.clone();
+                            this.file_list_state.update(cx, |state, cx| {
                                 state.delegate_mut().set_results(results);
                                 cx.notify();
                             });
-                            this.everything_error = None;
+                            this.file_error = None;
                         }
                         Err(err) => {
-                            this.everything_results.clear();
-                            this.everything_list_state.update(cx, |state, cx| {
+                            this.file_results.clear();
+                            this.file_list_state.update(cx, |state, cx| {
                                 state.delegate_mut().clear();
                                 cx.notify();
                             });
-                            this.everything_error = Some(if err.code == EVERYTHING_ERROR_IPC {
-                                "无法连接 Everything，请确认已安装并运行 Everything".into()
-                            } else {
-                                format!("Everything_QueryW failed: {}", err.code)
+                            this.file_error = Some(match &err {
+                                SearchError::Unavailable(reason) => reason.clone(),
+                                other => other.message(),
                             });
                         }
                     }
@@ -499,8 +516,8 @@ impl LauncherView {
         cx.notify();
     }
 
-    fn open_selected_everything(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(result) = self.everything_results.get(self.everything_selected) {
+    fn open_selected_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(result) = self.file_results.get(self.file_selected) {
             let _ = open_result(result);
             hide_window(window);
             cx.notify();
@@ -514,13 +531,13 @@ impl Render for LauncherView {
             .size_full()
             .bg(cx.theme().background)
             .key_context("Launcher")
-            // Tab：切换 Everything 搜索模式
-            .capture_action(cx.listener(|this, _: &ToggleEverythingMode, window, cx| {
-                this.everything_mode = !this.everything_mode;
-                if this.everything_mode {
-                    this.everything_results.clear();
-                    this.everything_selected = 0;
-                    this.everything_list_state.update(cx, |state, cx| {
+            // Tab：切换文件搜索模式
+            .capture_action(cx.listener(|this, _: &ToggleFileMode, window, cx| {
+                this.file_mode = !this.file_mode;
+                if this.file_mode {
+                    this.file_results.clear();
+                    this.file_selected = 0;
+                    this.file_list_state.update(cx, |state, cx| {
                         state.delegate_mut().clear();
                         cx.notify();
                     });
@@ -528,11 +545,11 @@ impl Render for LauncherView {
                         input.set_value("", window, cx);
                         input.set_placeholder("搜索文件...", window, cx);
                     });
-                    // 后台检测 Everything 安装状态
-                    this.detect_everything(cx);
+                    // 后台启动文件索引（必要时会先建一遍）
+                    this.detect_file_search(cx);
                 } else {
-                    this.everything_results.clear();
-                    this.everything_list_state.update(cx, |state, cx| {
+                    this.file_results.clear();
+                    this.file_list_state.update(cx, |state, cx| {
                         state.delegate_mut().clear();
                         cx.notify();
                     });
@@ -550,12 +567,12 @@ impl Render for LauncherView {
                 cx.stop_propagation();
                 cx.notify();
             }))
-            // Esc：Everything 模式下退出，普通模式下隐藏窗口
+            // Esc：文件搜索模式下退出，普通模式下隐藏窗口
             .capture_action(cx.listener(|this, _: &Escape, window, cx| {
-                if this.everything_mode {
-                    this.everything_mode = false;
-                    this.everything_results.clear();
-                    this.everything_list_state.update(cx, |state, cx| {
+                if this.file_mode {
+                    this.file_mode = false;
+                    this.file_results.clear();
+                    this.file_list_state.update(cx, |state, cx| {
                         state.delegate_mut().clear();
                         cx.notify();
                     });
@@ -583,18 +600,18 @@ impl Render for LauncherView {
                 }
                 cx.stop_propagation();
             }))
-            // 上下键：启动器模式切换选项，Everything 模式切换搜索结果
+            // 上下键：启动器模式切换选项，文件搜索模式切换搜索结果
             .capture_action(cx.listener(|this, _: &MoveDown, window, cx| {
-                if this.everything_mode {
-                    if !this.everything_results.is_empty() {
-                        this.everything_selected =
-                            (this.everything_selected + 1).min(this.everything_results.len() - 1);
+                if this.file_mode {
+                    if !this.file_results.is_empty() {
+                        this.file_selected =
+                            (this.file_selected + 1).min(this.file_results.len() - 1);
                         let ix = Some(IndexPath {
                             section: 0,
-                            row: this.everything_selected,
+                            row: this.file_selected,
                             column: 0,
                         });
-                        this.everything_list_state.update(cx, |list, cx| {
+                        this.file_list_state.update(cx, |list, cx| {
                             list.set_selected_index(ix, window, cx);
                             list.scroll_to_selected_item(window, cx);
                         });
@@ -610,15 +627,15 @@ impl Render for LauncherView {
                 cx.stop_propagation();
             }))
             .capture_action(cx.listener(|this, _: &MoveUp, window, cx| {
-                if this.everything_mode {
-                    if this.everything_selected > 0 {
-                        this.everything_selected -= 1;
+                if this.file_mode {
+                    if this.file_selected > 0 {
+                        this.file_selected -= 1;
                         let ix = Some(IndexPath {
                             section: 0,
-                            row: this.everything_selected,
+                            row: this.file_selected,
                             column: 0,
                         });
-                        this.everything_list_state.update(cx, |list, cx| {
+                        this.file_list_state.update(cx, |list, cx| {
                             list.set_selected_index(ix, window, cx);
                             list.scroll_to_selected_item(window, cx);
                         });
@@ -672,10 +689,10 @@ impl Render for LauncherView {
                             .child(
                                 div()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(if self.everything_mode { "📁" } else { "🔍" }),
+                                    .child(if self.file_mode { "📁" } else { "🔍" }),
                             )
                             .child(Input::new(&self.input_state).appearance(false).flex_1())
-                            .when(!self.everything_mode, |this| {
+                            .when(!self.file_mode, |this| {
                                 this.child(
                                     h_flex()
                                         .gap_1()
@@ -698,7 +715,7 @@ impl Render for LauncherView {
                                         ),
                                 )
                             })
-                            .when(self.everything_mode, |this| {
+                            .when(self.file_mode, |this| {
                                 this.child(
                                     div()
                                         .px_2()
@@ -707,14 +724,14 @@ impl Render for LauncherView {
                                         .bg(cx.theme().accent)
                                         .text_xs()
                                         .text_color(cx.theme().accent_foreground)
-                                        .child("Everything"),
+                                        .child("本地索引"),
                                 )
                             }),
                     ),
             )
             // 内容区
-            .child(if self.everything_mode {
-                self.render_everything_content(cx).into_any_element()
+            .child(if self.file_mode {
+                self.render_file_search_content(cx).into_any_element()
             } else {
                 List::new(&self.list_state).flex_1().into_any_element()
             })
@@ -762,18 +779,18 @@ impl Render for LauncherView {
     }
 }
 
-// ---------- Everything 内容面板 ----------
+// ---------- 文件搜索内容面板 ----------
 
 impl LauncherView {
-    fn render_everything_content(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_file_search_content(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let muted_fg = cx.theme().muted_foreground;
         let fg = cx.theme().foreground;
         let border = cx.theme().border;
         let muted_bg = cx.theme().muted;
 
-        match &self.everything_status {
-            // 正在检测
-            EverythingStatus::Unknown => v_flex()
+        match &self.file_status {
+            // 还没开始初始化 / 正在等索引就绪
+            SearchStatus::Uninitialized => v_flex()
                 .flex_1()
                 .items_center()
                 .justify_center()
@@ -782,18 +799,18 @@ impl LauncherView {
                     div()
                         .text_sm()
                         .text_color(muted_fg)
-                        .child("正在检测 Everything..."),
+                        .child("正在初始化文件索引..."),
                 )
                 .into_any_element(),
 
-            // 未安装
-            EverythingStatus::NotInstalled => v_flex()
+            // 正在建索引：显示进度。首次启动会走这里，可能要几十秒。
+            SearchStatus::Indexing { disk, written } => v_flex()
                 .flex_1()
                 .items_center()
                 .justify_center()
-                .gap_4()
+                .gap_3()
                 .p_6()
-                .child(div().text_2xl().child("📁"))
+                .child(div().text_2xl().child("🗂"))
                 .child(
                     v_flex()
                         .items_center()
@@ -803,93 +820,121 @@ impl LauncherView {
                                 .text_sm()
                                 .font_semibold()
                                 .text_color(fg)
-                                .child("未检测到 Everything"),
+                                .child("正在建立文件索引"),
+                        )
+                        .child(
+                            div().text_xs().text_color(muted_fg).child(match disk {
+                                Some(disk) => format!("正在扫描 {disk}: 盘，已索引 {written} 个文件"),
+                                None => "准备中...".to_string(),
+                            }),
                         )
                         .child(
                             div()
                                 .text_xs()
                                 .text_color(muted_fg)
-                                .child("需要安装 Everything 才能使用文件搜索功能"),
-                        ),
-                )
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .child(Button::new("install-btn").child("前往下载").on_click(
-                            |_, _, _cx| {
-                                // 打开 Everything 官网下载页
-                                let _ = std::process::Command::new("cmd")
-                                    .args([
-                                        "/C",
-                                        "start",
-                                        "",
-                                        "https://www.voidtools.com/downloads/",
-                                    ])
-                                    .spawn();
-                            },
-                        ))
-                        .child(
-                            Button::new("redetect-btn")
-                                .ghost()
-                                .child("重新检测")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.detect_everything(cx);
-                                })),
+                                .child("索引只需建立一次，之后启动即可直接搜索"),
                         ),
                 )
                 .into_any_element(),
 
-            // 已安装 Everything，但当前用户还没有索引数据库
-            EverythingStatus::NotIndexed { exe_path } => {
-                let query = self.input_state.read(cx).value().to_string();
-                let exe2 = exe_path.clone();
-                let has_query = !query.trim().is_empty();
+            // 不可用：需要管理员权限，或没有可索引的盘
+            SearchStatus::Unavailable { reason, .. } => {
+                let needs_admin = self.file_status.needs_admin();
                 v_flex()
                     .flex_1()
-                    .p_4()
-                    .gap_3()
+                    .items_center()
+                    .justify_center()
+                    .gap_4()
+                    .p_6()
+                    .child(div().text_2xl().child("⚠"))
                     .child(
-                        div()
-                            .px_3()
-                            .py_2()
-                            .rounded_lg()
-                            .bg(muted_bg)
-                            .border_1()
-                            .border_color(border)
-                            .text_xs()
-                            .text_color(muted_fg)
-                            .child("Everything 未检索。请先打开 Everything 完成索引后再使用搜索。"),
+                        v_flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_semibold()
+                                    .text_color(fg)
+                                    .child("文件索引不可用"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted_fg)
+                                    .child(reason.clone()),
+                            )
+                            .when(needs_admin, |this| {
+                                this.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(muted_fg)
+                                        .child("读取 NTFS 主文件表需要管理员权限"),
+                                )
+                            }),
                     )
-                    .child(h_flex().gap_2().when(has_query, |this| {
-                        let q = query.clone();
-                        this.child(
-                            Button::new("search-everything-btn")
-                                .ghost()
-                                .child(format!("搜索 \"{}\"", query))
-                                .on_click(move |_, _, _cx| {
-                                    open_everything_gui(&exe2, &q);
-                                }),
-                        )
-                    }))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .when(needs_admin, |this| {
+                                this.child(
+                                    Button::new("elevate-btn")
+                                        .child("以管理员身份重启")
+                                        .on_click(|_, _, cx| {
+                                            // 拉起提权副本后退出当前实例，
+                                            // 否则两个实例会抢同一个托盘图标
+                                            if super::filesearch::relaunch_as_admin() {
+                                                cx.quit();
+                                            }
+                                        }),
+                                )
+                            })
+                            .child(
+                                Button::new("retry-btn")
+                                    .ghost()
+                                    .child("重试")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.detect_file_search(cx);
+                                    })),
+                            ),
+                    )
                     .into_any_element()
             }
 
-            // 已安装 Everything 且已有数据库，显示 SDK 查询结果
-            EverythingStatus::Indexed { .. } => v_flex()
+            // 索引可用：显示查询结果
+            SearchStatus::Ready { .. } => v_flex()
                 .flex_1()
                 .p_2()
                 .gap_1()
-                .when(self.everything_searching && self.everything_results.is_empty(), |this| {
+                // 索引可能因为长时间没运行而落后（启动前的改动、监控被停），
+                // 给一个手动重扫的入口
+                .child(
+                    h_flex()
+                        .w_full()
+                        .px_1()
+                        .justify_end()
+                        .child(
+                            Button::new("rebuild-index-btn")
+                                .ghost()
+                                .label("重建索引")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    super::filesearch::rebuild_index();
+                                    // 重建会重新进入 Indexing，得重新订阅状态才能刷回来
+                                    this.watch_file_search(cx);
+                                })),
+                        ),
+                )
+                .when(self.file_searching && self.file_results.is_empty(), |this| {
                     this.child(
                         div()
                             .px_2()
                             .py_1()
                             .text_xs()
                             .text_color(muted_fg)
-                            .child("正在搜索 Everything 索引..."),
+                            .child("正在搜索本地索引..."),
                     )
                 })
-                .when_some(self.everything_error.as_ref(), |this, error| {
+                .when_some(self.file_error.as_ref(), |this, error| {
                     this.child(
                         div()
                             .px_2()
@@ -904,9 +949,9 @@ impl LauncherView {
                     )
                 })
                 .when(
-                    !self.everything_searching
-                        && self.everything_error.is_none()
-                        && self.everything_results.is_empty(),
+                    !self.file_searching
+                        && self.file_error.is_none()
+                        && self.file_results.is_empty(),
                     |this| {
                         this.child(
                             div()
@@ -918,7 +963,7 @@ impl LauncherView {
                         )
                     },
                 )
-                .when(!self.everything_results.is_empty(), |this| {
+                .when(!self.file_results.is_empty(), |this| {
                     this.child(
                         h_flex()
                             .w_full()
@@ -936,8 +981,8 @@ impl LauncherView {
                             .child(div().w(px(128.)).child("修改时间")),
                     )
                 })
-                .when(!self.everything_results.is_empty(), |this| {
-                    this.child(List::new(&self.everything_list_state).flex_1())
+                .when(!self.file_results.is_empty(), |this| {
+                    this.child(List::new(&self.file_list_state).flex_1())
                 })
                 .into_any_element(),
         }

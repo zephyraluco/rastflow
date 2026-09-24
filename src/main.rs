@@ -1,13 +1,13 @@
 #![windows_subsystem = "windows"]
 
 mod config;
-mod bindings;
 mod settings;
 mod layout;
 mod locale;
 mod utils;
 mod icons;
 mod app_icon;
+mod search;
 mod tray;
 
 use gpui::*;
@@ -199,11 +199,12 @@ fn main() {
             // 获取后台执行器，用于定时等待
             let bg = cx.update(|cx| cx.background_executor().clone());
 
-            // ── 静默启动 Everything（若未运行）─────────────────────────
-            // 在后台线程检测 Everything 进程，未运行则在安装位置找到
-            // Everything.exe 并以 -startup 静默启动，不阻塞窗口创建。
+            // ── 启动自研文件索引（若尚未建立则后台建立）─────────────
+            // 索引由 crate::search 维护：枚举 NTFS 主文件表建立全量索引，
+            // 再用 USN 日志维护增量。首次建立需要管理员权限，耗时可能较长，
+            // 所以放到后台线程，不阻塞窗口创建。
             bg.spawn(async {
-                layout::everything::ensure_running();
+                layout::filesearch::start();
             })
             .detach();
 

@@ -22,7 +22,7 @@ productName = "rastflow"
 # 反向域名，安装信息、开始菜单快捷方式与卸载注册表项都用它。
 # 注意 publisher 默认取这里的第二段（zephyraluco）。
 identifier = "com.zephyraluco.rastflow"
-longDescription = "rastflow 是一个常驻托盘的 Windows 快速启动器：全局快捷键唤出，搜索并快速启动本机程序，并可切换到 Everything 模式按文件名搜索全盘文件。"
+longDescription = "rastflow 是一个常驻托盘的 Windows 快速启动器：全局快捷键唤出，搜索并快速启动本机程序，并可切换到文件搜索模式按文件名搜索全盘文件（索引由程序自己维护）。"
 category = "Utility"
 licenseFile = "LICENSE"
 
@@ -37,9 +37,6 @@ outDir = "dist"
 
 # 安装器图标与快捷方式图标。exe 自身的图标由 build.rs 通过 winresource 嵌入。
 icons = ["assets/app-icon.ico"]
-
-# Everything64.dll
-resources = ["Everything-SDK/dll/Everything64.dll"]
 
 [package.metadata.packager.nsis]
 # 安装器窗口与「添加或删除程序」里显示的图标
@@ -69,6 +66,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+# 注意：这里**没有** rusqlite。自研搜索核心的索引是常驻内存的（src/search/index.rs），
+# 磁盘上只有一个自定义二进制快照，所以索引层不再需要 SQLite。
+# 唯一还在用 SQLite 的是 applist.db（应用列表），走 sqlx。
 # 用于构造 gpui 的 RenderImage 与图标缩放（版本须与 gpui-pre 一致）
 image = { version = "0.25", default-features = false }
 
@@ -76,8 +76,16 @@ image = { version = "0.25", default-features = false }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    # CreateFileW 参数里的 SECURITY_ATTRIBUTES（传 None 也需要类型可见）
+    "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_LibraryLoader",
+    # DeviceIoControl / CancelSynchronousIo
+    "Win32_System_IO",
+    # FSCTL_* 常量与 MFT_ENUM_DATA_V0 / USN_RECORD_V2 等 USN 结构体
+    "Win32_System_Ioctl",
+    # OpenThread（用于中断阻塞在 USN 读取上的线程）
+    "Win32_System_Threading",
     "Win32_UI_Controls",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",
