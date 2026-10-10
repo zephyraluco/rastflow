@@ -1,23 +1,12 @@
-//! 文件搜索集成模块
-//!
-//! 直接用 [`crate::search`] 的自研索引：索引由 `FSCTL_ENUM_USN_DATA` 枚举 MFT 建立，
-//! 增量由 USN 日志阻塞读取维护，索引常驻内存，磁盘上只留一份快照。
-//!
-//! # 一个固有代价：需要管理员
+//! 文件搜索集成：把 [`crate::search`] 的自研索引接到界面上。
 //!
 //! `CreateFileW(r"\\.\C:")` 请求了 `GENERIC_WRITE`，所以**建索引与实时监控需要管理员**。
-//! 非管理员运行时仍然可以**搜索已有索引**，只是不能在本机首次建索引、也拿不到实时增量。
-//! 这个代价由 [`startup_action`] 显式建模：它把「有没有索引 / 是不是管理员」直接映射成
-//! 该做什么，不靠静默降级。
+//! 非管理员仍可搜索已有索引，只是不能首次建库、也拿不到实时增量。这个代价由
+//! [`startup_action`] 显式建模（把「有没有索引 / 是不是管理员」映射成该做什么），
+//! 不靠静默降级。
 //!
-//! 首次可用要等建索引跑完（几十秒）；索引里只存路径，体积与修改时间展示时按需 `stat`。
-//!
-//! # 线程模型
-//!
-//! - **引导线程**（[`start`]）：打开索引库 → 有索引就绪，没有则建索引 → 启监控；
-//! - **监控泵线程**：把 USN 事件喂给 [`Engine::apply_event`]，落到索引里。
-//!   整个进程只允许有一条（[`ensure_monitor`] 幂等：还在跑就原样复用）；
-//! - 搜索跑在调用方给的线程上（gpui 的 background executor），所以可以阻塞等待。
+//! 线程模型见 `docs/architecture.md` §5：引导线程建库、监控泵线程落增量、
+//! 搜索跑在调用方给的线程上（gpui 的 background executor）。
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -60,25 +49,19 @@ const PUMP_TICK: Duration = Duration::from_millis(500);
 /// 文件搜索的可用状态
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SearchStatus {
-    /// 还没开始初始化
     Uninitialized,
-    /// 正在建索引
     Indexing {
-        /// 当前正在处理的盘
         disk: Option<char>,
-        /// 已写入的记录数
         written: u64,
     },
-    /// 可以搜索
     Ready {
-        /// 增量监控是否已启动。非管理员运行时通常为 `false`
-        /// （读 USN 日志也需要管理员），此时结果可能不包含刚刚新建的文件。
+        /// 增量监控是否已启动。非管理员运行时通常为 `false`，
+        /// 此时结果可能不包含刚新建的文件。
         monitoring: bool,
     },
-    /// 不可用
     Unavailable {
         reason: String,
-        /// 是否属于「需要管理员权限」这一类
+        /// 属于「需要管理员权限」这一类，界面据此决定要不要给提权按钮
         needs_admin: bool,
     },
 }
@@ -90,27 +73,20 @@ impl SearchStatus {
     }
 }
 
-/// 一条搜索结果
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileResult {
-    /// 文件或目录名
     pub name: String,
-    /// 所在目录
     pub dir: String,
-    /// 完整路径
     pub path: PathBuf,
-    /// 体积（目录为 `-`）
+    /// 体积；目录没有有意义的大小，显示为 `-`
     pub size: String,
-    /// 修改时间
     pub modified: String,
 }
 
-/// 搜索失败原因
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SearchError {
     /// 还没初始化完（或没有可用索引）
     NotReady,
-    /// 状态不可用
     Unavailable(String),
     /// 查询为空或过长
     InvalidQuery,
@@ -210,7 +186,6 @@ pub fn start() {
     let _ = inner; // 状态由 status() 读取
 }
 
-/// 当前状态
 pub fn status() -> SearchStatus {
     match STATE.get() {
         Some(inner) => inner.status(),
@@ -518,11 +493,10 @@ fn build_index(inner: &Arc<Inner>) -> crate::search::Result<()> {
 
 /// 保证增量监控在跑（幂等），返回监控当前是否可用。
 ///
-/// 已经在跑就原样留着：这条泵一直跟着 USN 日志走，换一条新的反而会把期间积在
-/// 通道里的事件丢掉，还要重新打开一次各盘的卷句柄。
+/// 已在跑就原样留着：这条泵跟着 USN 日志走，换一条会把期间积在通道里的事件丢掉，
+/// 还要重新打开各盘的卷句柄。
 ///
-/// 非管理员直接返回 `false`：读 USN 日志要 `GENERIC_WRITE`（见 [`crate::search::win::volume`]），
-/// 起了也只会白失败一次。权限判断只留在这里一处。
+/// 非管理员直接返回 `false`：读 USN 日志要 `GENERIC_WRITE`，起了也只会白失败一次。
 fn ensure_monitor(inner: &Arc<Inner>, engine: &Arc<Engine>) -> bool {
     if !is_admin() {
         return false;

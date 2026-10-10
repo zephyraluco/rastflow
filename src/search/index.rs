@@ -1,19 +1,9 @@
 //! 常驻内存的文件索引：数据结构、快照编解码，以及从 MFT 建它。
 //!
-//! ```text
-//! names   : Vec<u8>    名称池，所有名字的 UTF-8 字节首尾相接
-//! entries : Vec<Entry> 定长 24 字节的记录数组，全部盘混在一个数组里
-//! tables  : 盘 → (MFT 记录号 → 槽位)
-//! ```
+//! 条目只存自己的名字与父目录的 MFT 记录号，完整路径由 [`FileIndex::path_into`]
+//! 沿途拼出。布局、快照格式与上限保护见 `docs/search-engine.md` §3、§4。
 //!
-//! 每个条目只存自己的名字与父目录的 MFT 记录号，完整路径由 [`FileIndex::path_into`]
-//! 沿途拼出。快照是单文件，`save` 时顺带压实（丢掉已删槽位、重排名称池）。
-//!
-//! | 部分 | 需要管理员？ |
-//! | --- | --- |
-//! | [`FileIndex`] 与它的操作 | 不需要 |
-//! | 快照（[`FileIndex::save`] / [`FileIndex::load`]） | 不需要 |
-//! | [`rebuild_all`] / [`rebuild_disk`] | **需要** —— 要读 `\\.\X:` 枚举 MFT |
+//! 只有 [`rebuild_all`] / [`rebuild_disk`] 需要管理员（要读 `\\.\X:` 枚举 MFT）。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -93,13 +83,11 @@ impl Entry {
         !self.is_dead()
     }
 
-    /// 这条记录属于哪个盘
     pub fn disk(&self) -> char {
         disk_letter((self.flags >> DISK_SHIFT) & DISK_MASK)
     }
 }
 
-/// 一个盘的查找表
 struct DiskTable {
     /// 下标是 MFT 记录号，值是 `entries` 里的槽位；[`NO_SLOT`] 表示没有
     slots: Vec<u32>,
@@ -112,7 +100,6 @@ struct DiskTable {
 pub struct JournalMark {
     /// 已经处理到的 USN（不含）
     pub last_usn: i64,
-    /// 当时的 USN 日志 id
     pub journal_id: u64,
 }
 
@@ -130,13 +117,11 @@ impl PathScratch {
     }
 }
 
-/// 常驻内存的文件索引
 pub struct FileIndex {
     names: Vec<u8>,
     entries: Vec<Entry>,
-    /// 可复用的槽位（已删除条目的位置）
+    /// 已删除条目的位置，供复用
     free: Vec<u32>,
-    /// 存活条目数
     live: u32,
     tables: HashMap<char, DiskTable>,
 }
@@ -166,7 +151,6 @@ impl FileIndex {
     pub fn disks(&self) -> impl Iterator<Item = char> + '_ {
         self.tables.keys().copied()
     }
-
     // ── 名字池 ─────────────────────────────────────────────────────────
 
     fn name_range(&self, entry: &Entry) -> Option<(usize, usize)> {
@@ -250,7 +234,6 @@ impl FileIndex {
         table.slots[index] = slot;
     }
 
-    /// 按 MFT 记录号取槽位
     fn slot_of(&self, disk: char, mft: u32) -> Option<u32> {
         let table = self.tables.get(&disk.to_ascii_uppercase())?;
         let slot = *table.slots.get(mft as usize)?;
@@ -280,7 +263,6 @@ impl FileIndex {
         }
     }
 
-    /// 盘根槽位
     pub fn root_slot(&self, disk: char) -> Option<u32> {
         let table = self.tables.get(&disk.to_ascii_uppercase())?;
         (table.root != NO_SLOT).then_some(table.root)
@@ -327,12 +309,8 @@ impl FileIndex {
 
     /// 插入一条记录，返回槽位。
     ///
-    /// - `parent_frn` 是父目录的 FRN；
-    /// - `is_dir` 只用来定优先级（目录恒为 [`DIR_PRIORITY`]）；
-    /// - 同名同 FRN 重复插入是幂等的（就地更新）；
-    /// - 名字为空返回 `None`。
-    ///
-    /// 父目录不在索引里**不影响插入** —— 是否可用于拼路径由 `path_into` 决定。
+    /// 同名同 FRN 重复插入是幂等的（就地更新）；名字为空返回 `None`。
+    /// 父目录不在索引里**不影响插入** —— 能不能拼出路径由 `path_into` 决定。
     pub fn insert(
         &mut self,
         disk: char,
@@ -387,7 +365,6 @@ impl FileIndex {
         }
     }
 
-    /// 删除一条记录（按 FRN 定位）
     pub fn remove(&mut self, disk: char, frn: u64) -> bool {
         let Some(slot) = self.lookup(disk, frn) else {
             return false;
@@ -480,6 +457,7 @@ impl FileIndex {
     // ── 批量维护 ───────────────────────────────────────────────────────
 
     /// 遍历所有存活条目：`(槽位, 条目)`
+    /// 遍历所有存活条目：`(槽位, 条目)`
     pub fn iter_live(&self) -> impl Iterator<Item = (u32, &Entry)> {
         self.entries
             .iter()
@@ -539,7 +517,6 @@ impl FileIndex {
         out
     }
 
-    /// 槽位是否存活、且确实属于指定盘
     fn is_live_of(&self, slot: u32, disk: char) -> bool {
         self.entries
             .get(slot as usize)
@@ -1074,14 +1051,10 @@ fn insert_mft_record(
         .is_some()
 }
 
-/// 重建一个盘的索引。
+/// 重建一个盘的索引：打开卷并校验 NTFS → 取/建 USN 日志拿到 `NextUsn` →
+/// 一趟 `FSCTL_ENUM_USN_DATA` 灌进内存索引 → 再走一趟按忽略规则清理并收孤儿。
 ///
-/// 1. 打开卷（`\\.\X:`）并校验是 NTFS；
-/// 2. 取/建 USN 日志，拿到 `NextUsn`；
-/// 3. 一趟 `FSCTL_ENUM_USN_DATA` 把整个 MFT 读出来灌进内存索引；
-/// 4. 再走一趟，把命中忽略规则的条目标掉，最后收一次孤儿。
-///
-/// 第 4 步不能并到第 3 步里：忽略规则是路径级的，而路径解析要求祖先已经在索引里。
+/// 清理不能并进枚举那一趟：忽略规则是路径级的，而路径解析要求祖先已在索引里。
 pub fn rebuild_disk(
     disk: char,
     index: &mut FileIndex,

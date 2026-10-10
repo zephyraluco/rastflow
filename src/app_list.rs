@@ -129,10 +129,8 @@ pub fn db_path() -> PathBuf {
     crate::utils::app_data_dir().join("applist.db")
 }
 
-/// 用户自定义程序的类别名。
-///
-/// [`upsert_custom_entry`] 用它标记亲手添加的条目；设置页据此把它们从
-/// 系统发现的条目里筛出来。两边引用同一个常量，改文案时不会漏改一处。
+/// 用户自定义程序的类别名，由 [`upsert_custom_entry`] 打上；设置页据此把它们
+/// 从系统发现的条目里筛出来。两边引用同一个常量，改文案时不会漏改一处。
 pub const CUSTOM_APP_CATEGORY: &str = "自定义程序";
 
 // ---------- 回退数据（仅 debug 构建）----------
@@ -193,8 +191,8 @@ fn load_all_from_db() -> Vec<AppEntry> {
     }
 }
 
-/// 全量写回条目。写失败只记日志、不 panic：列表本身已经在内存里可用，
-/// 下次启动会再写一遍；数据库被另一个实例占用时尤其容易失败。
+/// 全量写回条目。写失败只记日志、不 panic：列表已在内存里可用，下次启动会再写一遗；
+/// 数据库被另一个实例占用时尤其容易失败。
 pub fn save_entries(entries: &[AppEntry]) {
     let guard = match db().lock() {
         Ok(g) => g,
@@ -305,17 +303,14 @@ pub fn upsert_custom_entry(
 // ---------- 系统程序发现 ----------
 
 /// 扫描系统里可启动的程序：开始菜单的快捷方式 + `shell:AppsFolder` 里的应用。
-///
-/// 结果会缓存几秒（见 [`discovery_cache`]），窗口反复唤出时不会每次都重扫。
+/// 结果缓存几秒（见 [`discovery_cache`]），窗口反复唤出时不会每次都重扫。
 #[cfg(windows)]
 pub fn discover_windows_apps() -> Vec<AppEntry> {
     discovery_cache::get()
 }
 
-/// 发现结果的进程内缓存。
-///
-/// 枚举开始菜单与 `shell:AppsFolder` 要走文件系统和 COM，实测几十到几百毫秒，
-/// 而列表在窗口每次获得焦点时都会重新取一遍，必须挡住这种重复开销。
+/// 发现结果的进程内缓存。枚举开始菜单与 `shell:AppsFolder` 要走文件系统和 COM，
+/// 实测几十到几百毫秒，而列表在窗口每次获得焦点时都会重新取一遍，必须挡住。
 #[cfg(windows)]
 pub mod discovery_cache {
     use super::AppEntry;
@@ -433,11 +428,11 @@ fn scan_windows_apps() -> Vec<AppEntry> {
     out
 }
 
-/// 枚举 `shell:AppsFolder` 里的应用。
+/// 枚举 `shell:AppsFolder` 里的打包应用。
 ///
 /// 这类应用在开始菜单目录里没有 `.lnk`，只能通过 Shell 命名空间拿到：显示名取
 /// `SIGDN_NORMALDISPLAY`（已本地化，如「计算器」），启动目标存成
-/// `shell:AppsFolder\<AppID>`，由启动逻辑交给 `explorer.exe` 解析。
+/// `shell:AppsFolder\<AppID>`，交给 `explorer.exe` 解析。
 #[cfg(windows)]
 fn discover_apps_folder() -> Vec<AppEntry> {
     use windows::Win32::System::Com::{CoInitializeEx, IBindCtx, COINIT_APARTMENTTHREADED};
@@ -550,12 +545,8 @@ fn entry_key(entry: &AppEntry) -> String {
     }
 }
 
-/// 用最新一次系统扫描的结果刷新列表：
-///
-/// - 新装/新发现的程序补进来；
-/// - 已卸载的（扫描结果里没有的「系统程序」）被摘掉；
-/// - 已存在的条目沿用原来的 `launch_count`；
-/// - 用户自定义的条目（其它类别）原样保留。
+/// 用最新一次系统扫描的结果刷新列表：新条目补进来、已卸载的「系统程序」摘掉、
+/// 已有条目沿用 `launch_count`、用户自定义条目（其它类别）原样保留。
 #[cfg(windows)]
 fn merge_discovered(stored: Vec<AppEntry>, discovered: Vec<AppEntry>) -> Vec<AppEntry> {
     use std::collections::{HashMap, HashSet};

@@ -1,39 +1,28 @@
-//! 系统托盘图标与右键菜单
+//! 系统托盘图标与右键菜单：`Shell_NotifyIconW` + `TrackPopupMenu` 直连 Win32
+//! （不引入 `tray-icon`，它的依赖树还连带 `muda` 与 `dpi`）。托盘图标取自 exe 资源段，
+//! 与 exe、安装器同源。
 //!
-//! 直接用 Win32 实现（`Shell_NotifyIconW` + `TrackPopupMenu`），替代原先的
-//! `tray-icon` crate。这样做换来两件事：
+//! 四处平台约束，改这里之前先读：
 //!
-//! 1. 少一棵依赖树（`tray-icon` 还连带 `muda` 菜单库、`dpi`）；
-//! 2. 托盘图标直接取自**我们自己 exe 里已嵌入的图标资源** —— 那正是
-//!    `build.rs` 为了 exe 自身图标而写进去的那份，于是三处图标（exe、
-//!    安装器、托盘）只有一个来源，且由 Windows 从多尺寸 ICO 里挑最合适的一档
-//!    （24px 这种非标准尺寸由系统缩放，比我们自己的盒式滤波更清楚）。
-//!
-//! 实现要点（都是踩过坑才会注意到的地方）：
-//!
-//! - **必须有窗口**：`Shell_NotifyIcon` 靠向某个窗口投递自定义消息来通知交互，
-//!   所以要先建一个从不显示的顶层窗口，并用 `GWLP_USERDATA` 挂上上下文。
-//! - **不要抢消息循环**：窗口建在 GPUI 的主线程上，由 GPUI 自己的
-//!   `GetMessage/DispatchMessage` 循环把消息派发过来。因此 `WM_DESTROY` 里
-//!   **绝对不能** `PostQuitMessage`，否则会把 GPUI 的循环一起结束掉。
-//! - **Explorer 重启**：任务栏重建后会广播 `TaskbarCreated`，收到它必须重新
-//!   登记图标，否则图标永久消失。
+//! - **必须有窗口**：`Shell_NotifyIcon` 靠向窗口投递自定义消息通知交互，所以要先建一个
+//!   从不显示的顶层窗口，并用 `GWLP_USERDATA` 挂上上下文。
+//! - **不要抢消息循环**：窗口建在 GPUI 主线程上，由 GPUI 自己的
+//!   `GetMessage/DispatchMessage` 循环派发。`WM_DESTROY` 里**绝对不能**
+//!   `PostQuitMessage`，否则会把 GPUI 的循环一起结束掉。
+//! - **Explorer 重启**：任务栏重建后会广播 `TaskbarCreated`，必须重新登记图标，
+//!   否则图标永久消失。
 //! - **弹出菜单要先设前台窗口**：`TrackPopupMenu` 之前 `SetForegroundWindow`、
-//!   之后 `PostMessageW(WM_NULL)`，否则点击菜单外面时菜单不会消失
-//!   （微软文档对通知区域菜单专门说明的做法）。
+//!   之后 `PostMessageW(WM_NULL)`，否则点击菜单外面时菜单不会消失。
 //!
 //! 交互结果通过 channel 交给主循环处理，而不是在窗口过程里直接操作窗口 ——
 //! 窗口过程里拿不到 GPUI 的 `App`/`Context`。
 
-
 /// 托盘交互产生的事件，由主循环消费。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayEvent {
-    /// 左键单击图标
     LeftClick,
     /// 菜单：「显示 / 隐藏」
     ToggleWindow,
-    /// 菜单：「退出」
     Quit,
 }
 

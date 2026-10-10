@@ -1,14 +1,11 @@
-//! 实时增量监控：每个盘一个常驻线程，阻塞读 USN 日志，产出结构化的变更事件。
+//! 实时增量监控：每个盘一条常驻线程，阻塞读 USN 日志，产出结构化的变更事件。
 //!
-//! 线程阻塞在 `FSCTL_READ_USN_JOURNAL` 上（`BytesToWaitFor = 1`），有新记录才返回。
-//! 从 `NextUsn`（当前末尾）开始读，不回溯历史。
+//! 事件带 `(FRN, 父 FRN, 名字, 是否目录)` 而不带路径（索引按 FRN 组织，用不着拼路径）；
+//! 从 `NextUsn`（当前末尾）起读，不回溯历史。过滤规则与事件形态见
+//! `docs/search-engine.md` §6。
 //!
-//! 事件过滤：`FILE_CREATE|FILE_DELETE` 同时出现则跳过；删除要求 `FILE_DELETE|CLOSE`
-//! 同时成立；重命名只采用「新名」那条记录。
-//!
-//! 事件带 `(FRN, 父 FRN, 名字, 是不是目录)`，不带路径。回收站过滤在 [`super::engine`]。
-//!
-//! 停止用 `CancelSynchronousIo` 打断阻塞中的读取（[`super::win::cancel_synchronous_io`]）。
+//! 停止靠 `CancelSynchronousIo` 打断阻塞中的读取（[`super::win::cancel_synchronous_io`]），
+//! 而不是置标志位等它超时返回。
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -24,15 +21,10 @@ use super::win::usn::{
 use super::win::volume::Volume;
 use super::Result;
 
-/// 监控线程抛出的事件
-///
-/// 事件内容是**结构化的**，不是完整路径：内存索引按 FRN 组织，
-/// 有这几个字段就能直接落进索引，不需要先拼路径（见模块文档）。
+/// 监控线程抛出的事件。内容结构化（见模块文档），落到索引上是幂等 upsert。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MonitorEvent {
-    /// 新增，或重命名/移动之后的**新样子**。
-    ///
-    /// 落到索引上是幂等 upsert：同一个 FRN 再收到一次就只是刷新名字与父目录。
+    /// 新增，或重命名/移动之后的**新样子**
     Added {
         disk: char,
         /// 文件引用号 `(序列号 << 48) | 记录号`
@@ -41,7 +33,6 @@ pub enum MonitorEvent {
         parent: u64,
         /// 文件名（不含路径）
         name: String,
-        /// 是不是目录
         is_dir: bool,
     },
     /// 已删除（或已移出本盘）
@@ -52,7 +43,6 @@ pub enum MonitorEvent {
     DiskStopped(char),
 }
 
-/// 监控配置
 #[derive(Debug, Clone)]
 pub struct MonitorConfig {
     pub disks: Vec<char>,

@@ -1,11 +1,7 @@
 //! Win32 薄封装层，**`unsafe` 只允许出现在这里**。
 //!
-//! | 子模块 | 职责 |
-//! | --- | --- |
-//! | [`volume`] | 卷句柄 `\\.\X:` 与 USN / MFT 的 IOCTL |
-//! | [`usn`] | USN 记录格式与 FRN 编码（纯字节解析，不调 API） |
-//! | [`disk`] | 本地固定盘 / NTFS 判断 |
-//! | [`known_folder`] | `SHGetKnownFolderPath`：开始菜单、桌面 |
+//! `volume` 管卷句柄与 USN / MFT 的 IOCTL，`usn` 解析 USN 记录与 FRN（纯字节，不调 API），
+//! `disk` 判断盘类型，`known_folder` 取已知文件夹。
 //!
 //! 本文件放宽字符串转换、线程 id、取消同步 IO。
 

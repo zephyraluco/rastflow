@@ -1,6 +1,4 @@
 //! `SHGetKnownFolderPath` 封装：按 GUID 取系统的已知目录。
-//!
-//! 预扫四个：当前用户开始菜单、所有用户开始菜单、当前用户桌面、公共桌面。
 
 use std::path::PathBuf;
 
@@ -22,22 +20,18 @@ pub fn known_folder(id: &GUID) -> Option<PathBuf> {
     }
 }
 
-/// 当前用户开始菜单
 pub fn start_menu() -> Option<PathBuf> {
     known_folder(&FOLDERID_StartMenu)
 }
 
-/// 所有用户（公共）开始菜单
 pub fn common_start_menu() -> Option<PathBuf> {
     known_folder(&FOLDERID_CommonStartMenu)
 }
 
-/// 当前用户桌面
 pub fn desktop() -> Option<PathBuf> {
     known_folder(&FOLDERID_Desktop)
 }
 
-/// 公共桌面
 pub fn public_desktop() -> Option<PathBuf> {
     known_folder(&FOLDERID_PublicDesktop)
 }

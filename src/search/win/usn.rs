@@ -1,25 +1,8 @@
 //! USN 记录格式、FRN 编码与 MFT 记录号。
 //!
-//! 偏移量对照 `ntfs.h` 的 `USN_RECORD_V2`：
-//!
-//! ```c
-//! typedef struct {
-//!     DWORD         RecordLength;              //  0
-//!     WORD          MajorVersion;              //  4
-//!     WORD          MinorVersion;              //  6
-//!     DWORDLONG     FileReferenceNumber;       //  8
-//!     DWORDLONG     ParentFileReferenceNumber; // 16
-//!     USN           Usn;                       // 24  (LONGLONG)
-//!     LARGE_INTEGER TimeStamp;                 // 32
-//!     DWORD         Reason;                    // 40
-//!     DWORD         SourceInfo;                // 44
-//!     DWORD         SecurityId;                // 48
-//!     DWORD         FileAttributes;            // 52
-//!     WORD          FileNameLength;            // 56  (字节数)
-//!     WORD          FileNameOffset;            // 58  (相对记录起始的字节偏移)
-//!     WCHAR         FileName[1];               // 60
-//! } USN_RECORD_V2;
-//! ```
+//! 字段偏移由 `ntfs.h` 的 `USN_RECORD_V2` 固定，不能自行排布：记录头 60 字节，
+//! 文件名紧跟其后（`FileNameOffset` 给出相对记录起始的字节位置）。各偏移的含义
+//! 见 [`UsnRecord::parse`] 里的变量名。
 
 /// 记录头长度（到 `FileName` 为止）
 pub const RECORD_HEADER_LEN: usize = 60;

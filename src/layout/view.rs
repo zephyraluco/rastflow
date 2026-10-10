@@ -14,10 +14,8 @@ use std::time::{Duration, Instant};
 
 const FILE_SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
 
-/// 每批从后台取回的图标数量。
-///
-/// 分批是为了让首屏（十几行）先拿到图标，其余在后台陆续补齐；
-/// 一次性把所有条目的图标都提完再回填的话，列表要等很久才能显示图标。
+/// 每批从后台取回的图标数量。分批是为了让首屏先拿到图标、其余陆续补齐；
+/// 一次全提完再回填的话，列表要等很久才能显示图标。
 const ICON_PREFETCH_BATCH: usize = 32;
 
 use crate::components::{
@@ -131,19 +129,13 @@ pub struct LauncherView {
     file_list_state: Entity<ListState<FileSearchDelegate>>,
     /// 鼠标按下的时刻，用于判断长按拖动
     drag_start: Option<Instant>,
-    /// 是否处于文件搜索模式
     file_mode: bool,
-    /// 文件索引状态
     file_status: SearchStatus,
-    /// 文件搜索结果
     file_results: Vec<FileResult>,
-    /// 文件搜索结果中当前选中的索引
     file_selected: usize,
-    /// 文件搜索请求序号，用于丢弃过期后台结果
+    /// 请求序号，用于丢弃过期的后台结果
     file_search_generation: u64,
-    /// 文件搜索是否进行中
     file_searching: bool,
-    /// 文件搜索错误
     file_error: Option<String>,
     /// 是否已有一个图标预取任务在跑（避免重复开链）
     icon_prefetch_running: Arc<AtomicBool>,
@@ -317,13 +309,11 @@ impl LauncherView {
 
     /// 后台预取应用图标。
     ///
-    /// 列表是虚拟列表（`render_item` 每帧都会对可见行调用），所以渲染路径上只查内存缓存。
-    /// 每轮取一小批交给后台线程提取（Shell / GDI 调用），回填后通知列表重绘，
-    /// 再继续下一批，直到没有新目标为止。
+    /// 每轮取一小批交给后台线程（Shell / GDI 调用），回填后通知列表重绘，再取下一批，
+    /// 所以图标是「先到先显示、其余陆续补齐」。
     ///
-    /// `icon_prefetch_running` 只是省掉重复开链，不承担正确性：目标是否已请求由
+    /// `icon_prefetch_running` 只省重复开链，不承担正确性：目标是否已请求由
     /// [`IconCache::request`] 去重，重复调用最多是多开一个立刻结束的任务。
-    /// 过滤后新增的条目也会再次触发这里，所以图标是「先到先显示、其陆续补齐」。
     fn prefetch_icons(&self, cx: &mut App) {
         if self.icon_prefetch_running.load(Ordering::Relaxed) {
             return;

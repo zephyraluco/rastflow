@@ -1,27 +1,10 @@
 //! 搜索调度与索引生命周期。
 //!
-//! # 一次搜索
+//! 搜索分两阶段（优先目录预扫 → 顺序扫内存索引），结果按后缀优先级分档发布；
+//! 生命周期是 open → catch_up → start_monitor → 定期 save_snapshot。
+//! 细节见 `docs/search-engine.md` §7、§8。
 //!
-//! 1. **优先目录预扫**：桌面 / 开始菜单 / 用户指定的「优先文件夹」直接遍历文件系统。
-//! 2. **扫内存索引**：顺序扫一遍，只比文件名 —— 见 [`FileIndex`] 与
-//!    [`super::matcher::SearchQuery::matches_name`]。
-//! 3. **按优先级档发布**：程序类（`exe`/`lnk`）先出，然后是脚本、普通文件，最后是目录。
-//!    分档在一次扫描里完成，每档都会被扫到，所以优先级只影响先后。
-//!
-//! 命中时顺手校验文件是否存在，不存在就从索引里摘掉（索引可能过期）。
-//! ⚠️ 摘除必须等**读锁释放之后**再拿写锁 —— `RwLock` 不可重入。
-//!
-//! # 索引生命周期
-//!
-//! ```text
-//! Engine::open      读单文件快照（有就用，没有就空着）
-//!     ↓
-//! Engine::catch_up  从快照里记的 USN 位点重放日志
-//!     ↓             （位点被日志覆盖掉了 → NeedsRebuild，退回全量重扫）
-//! Engine::start_monitor  实时增量
-//!     ↓
-//! Engine::save_snapshot  定期落盘（顺便压实名称池、收掉孤儿）
-//! ```
+//! ⚠️ 懒删除必须等**读锁释放之后**再拿写锁 —— `RwLock` 不可重入。
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -46,22 +29,17 @@ use super::win::usn::is_root;
 use super::win::volume::Volume;
 use super::{DEFAULT_MAX_RESULTS, MAX_SEARCH_TEXT_LEN, Result};
 
-/// 打开引擎所需的配置
 #[derive(Clone, Debug)]
 pub struct CoreConfig {
-    /// 快照存放目录
     pub data_dir: PathBuf,
-    /// 要索引的盘；留空表示自动探测所有「本地固定盘 + NTFS」
+    /// 留空表示自动探测所有「本地固定盘 + NTFS」
     pub disks: Vec<char>,
     /// 忽略的目录（整棵子树）
     pub ignore_paths: Vec<String>,
-    /// 单次搜索最多返回多少条
     pub max_results: usize,
     /// 除开始菜单/桌面之外，额外优先预扫的目录
     pub priority_folders: Vec<PathBuf>,
-    /// 预扫时递归的最大深度
     pub scan_depth: usize,
-    /// 是否预扫开始菜单/桌面
     pub scan_shortcuts: bool,
 }
 
@@ -104,7 +82,6 @@ pub struct Engine {
     priorities: RwLock<PriorityTable>,
     /// 每个盘已经处理到的 USN 位点（随快照落盘）
     marks: Mutex<HashMap<char, JournalMark>>,
-    /// 单文件快照的路径
     snapshot: PathBuf,
     /// 预编译的忽略规则
     ignore: IgnoreRules,
@@ -170,7 +147,6 @@ impl Engine {
         &self.disks
     }
 
-    /// 是否已经有索引
     pub fn is_indexed(&self) -> bool {
         !read(&self.index).is_empty()
     }
@@ -417,12 +393,8 @@ impl Engine {
             };
 
             if needs_dir {
-                // 含路径关键字的查询：必须拼出完整路径才能判。
-                //
-                // 这类查询很少见，代价可以接受 —— 实测 120 万条扫一遍：
-                // 纯文件名关键字约 25ms，带路径关键字约 **400ms**（慢 16 倍，
-                // 因为每条候选都要走一遍祖先链）。所以别拿它去扫整个索引，
-                // 但也不必为它换写法：用户很少在启动器里敲反斜杠。
+                // 路径关键字要拼出完整路径才能判，实测比纯文件名关键字慢 16 倍
+                // （120 万条：25ms → 400ms），所以别拿它扫整个索引。
                 let Some(parent) = index.parent_of(entry) else {
                     continue;
                 };

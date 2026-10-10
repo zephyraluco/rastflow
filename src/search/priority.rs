@@ -4,13 +4,11 @@
 
 use std::collections::HashMap;
 
-/// 目录的固定优先级
 pub const DIR_PRIORITY: i32 = -1;
 
-/// 其余文件在没有匹配到后缀规则时使用的优先级
+/// 没有匹配到后缀规则时使用的优先级
 pub const DEFAULT_PRIORITY: i32 = 0;
 
-/// 后缀 → 优先级
 #[derive(Debug, Clone, Default)]
 pub struct PriorityTable {
     map: HashMap<String, i32>,
@@ -47,7 +45,6 @@ impl PriorityTable {
         }
     }
 
-    /// 某个后缀的优先级
     pub fn of_suffix(&self, suffix: &str) -> i32 {
         if suffix.is_empty() {
             return DEFAULT_PRIORITY;

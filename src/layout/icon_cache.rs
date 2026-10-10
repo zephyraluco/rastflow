@@ -1,10 +1,9 @@
-/// 应用图标缓存与后台请求排队
-///
-/// 取图标要调 Shell / GDI，是阻塞且有副作用的操作，必须放在后台线程里做；
-/// 而列表是虚拟列表，`render_item` 每帧都会对可见行调用，渲染路径上只能查内存。
-///
-/// 这个模块只负责「谁已经取过、谁正在取、下一批该取谁」这三件事，
-/// 不自己起线程，也不碰 GPU —— 让调用方决定何时在后台执行。
+//! 应用图标缓存与后台请求排队。
+//!
+//! 取图标要调 Shell / GDI，阻塞且有副作用，必须放后台线程；而列表是虚拟列表，
+//! `render_item` 每帧都会对可见行调用，渲染路径上只能查内存。
+//!
+//! 本模块只回答「谁已经取过、谁正在取、下一批该取谁」，不自己起线程。
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -12,23 +11,18 @@ use gpui::RenderImage;
 
 #[derive(Default)]
 pub struct IconCache {
-    /// 已取完的图标，key 为启动目标路径。
-    /// 取不到时存 `None`：失败也是结论，不能反复重试。
+    /// key 为启动目标路径。取不到时存 `None`：失败也是结论，不能反复重试。
     icons: HashMap<String, Option<Arc<RenderImage>>>,
-    /// 已交给后台、还没回填的目标，避免同一批里重复请求。
+    /// 已交给后台、还没回填的目标
     pending: HashSet<String>,
 }
 
 impl IconCache {
-    /// 查缓存。没有启动目标（例如内置示例条目）或尚未取到都返回 `None`。
     pub fn get(&self, target: Option<&str>) -> Option<Arc<RenderImage>> {
         self.icons.get(target?).cloned().flatten()
     }
 
-    /// 申请提取一个图标。
-    ///
-    /// 返回 `true` 表示这是一个新请求，调用方应把它交给后台线程；
-    /// 已经缓存过或已经在请求中的返回 `false`。
+    /// 返回 `true` 表示这是新请求，调用方应交给后台线程。
     pub fn request(&mut self, target: &str) -> bool {
         if self.icons.contains_key(target) {
             return false;

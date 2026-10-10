@@ -47,8 +47,7 @@ use utils::{auto_launch_is_enabled, auto_launch_set, center_window, hide_window,
 
 // ---------- 快捷键解析 ----------
 
-/// 将 "alt+space"、"ctrl+shift+space" 等字符串解析为 HotKey。
-/// 若字符串无法识别主键则返回 None。
+/// 解析 `"alt+space"` 这类字符串；认不出主键返回 `None`。
 fn parse_hotkey(s: &str) -> Option<HotKey> {
     let mut mods = Modifiers::empty();
     let mut code: Option<Code> = None;
@@ -73,14 +72,10 @@ fn parse_hotkey(s: &str) -> Option<HotKey> {
 
 /// 系统托盘图标应使用的边长（像素）。
 ///
-/// 取 `SM_CXSMICON`，也就是通知区域当前用的小图标尺寸：96 DPI 下是 16，
-/// 150% 缩放是 24，200% 是 32。写死 16 的话，高分屏上图标会被系统硬放大而发糊。
+/// 取 `SM_CXSMICON`（通知区域当前的小图标尺寸）：96 DPI 是 16，150% 是 24，
+/// 200% 是 32。写死 16 会让高分屏上的图标被系统硬放大而发糊。
 ///
-/// 两点说明：
-/// - 未设置 DPI 上下文时 `GetSystemMetrics` 返回的是**系统** DPI 下的取值
-///   （PerMonitorV2 进程亦然）。托盘通常就在主显示器上，够用。
-/// - 只在启动时算一次，所以之后改变缩放或把任务栏拖到别的显示器，
-///   托盘图标不会重建 —— 要做的话得在 `WM_DPICHANGED` 时重新 `set_icon`。
+/// 只在启动时算一次，之后改变缩放或把任务栏拖到别的显示器不会重建图标。
 fn tray_icon_size() -> u32 {
     #[cfg(windows)]
     {

@@ -1,20 +1,13 @@
-//! 查询解析与匹配规则。
+//! 查询解析与匹配规则：按 `;` 拆成多个关键字，**全部命中**才算匹配（AND），
+//! 大小写不敏感。含 `\` 或 `/` 的关键字按「路径关键字」去比完整路径，其余只比文件名。
 //!
-//! 查询按 `;` 拆成多个关键字，**全部命中**才算匹配（AND）。含 `\` 或 `/` 的关键字
-//! 按「路径关键字」处理，去比完整路径；其余只比文件名。大小写不敏感。
-//!
-//! | 查询形态 | 入口 |
-//! | --- | --- |
-//! | 纯文件名关键字 | [`SearchQuery::matches_name`]（只比字节，不分配） |
-//! | 含路径分隔符的关键字 | [`SearchQuery::matches_parts`]（需要完整路径） |
-//!
-//! 用哪个由 [`SearchQuery::needs_dir_for_match`] 判定。
+//! 用哪条路径由 [`SearchQuery::needs_dir_for_match`] 判定：`matches_name` 只比字节、
+//! 不分配；`matches_parts` 需要先拼出完整路径，慢得多（见 `docs/search-engine.md` §7.4）。
 
 use std::fmt;
 
 use super::pathutil::{self, contains_ascii_ignore_case};
 
-/// 一次搜索的全部条件
 #[derive(Clone)]
 pub struct SearchQuery {
     /// 用户输入的原始串（只用来做长度上限检查）

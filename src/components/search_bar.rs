@@ -12,13 +12,10 @@ use crate::icons::IconName;
 
 use super::keystroke;
 
-/// 启动器顶部的搜索栏。
+/// 启动器顶部的搜索栏：模式图标 + 输入框 + 右侧模式提示。
 ///
-/// 左侧图标提示当前模式（应用搜索 / 文件搜索），中间是输入框，右侧按模式给出
-/// 「Tab 切到文件搜索」的提示或「本地索引」标记。窗口拖动由外层容器负责，
-/// 因为那是窗口行为而不是搜索栏的职责。
-///
-/// 右侧文案的默认值是中文，调用方应当用 [`SearchBar::labels`] 注入当前语言。
+/// 窗口拖动由外层容器负责 —— 那是窗口行为，不是搜索栏的职责。
+/// 右侧文案默认中文，调用方应当用 [`SearchBar::labels`] 注入当前语言。
 #[derive(IntoElement)]
 pub struct SearchBar {
     input: Entity<InputState>,
@@ -28,8 +25,7 @@ pub struct SearchBar {
 }
 
 impl SearchBar {
-    /// `input` 被克隆成 [`Entity`] 句柄（引用计数 +1，不是深拷贝），
-    /// 与 gpui-kit 的 `Input::new(&state)` 用法一致。
+    /// `input` 克隆的是 [`Entity`] 句柄（引用计数 +1，不是深拷贝）。
     pub fn new(input: &Entity<InputState>, file_mode: bool) -> Self {
         Self {
             input: input.clone(),

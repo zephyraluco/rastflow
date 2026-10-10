@@ -51,14 +51,10 @@ fn letter_tile(name: &str, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-/// 应用条目的行内容：图标 + 名称 + 类别标签。
+/// 应用条目的行内容。名称占剩余宽度并截断，类别为空时不渲染标签。
 ///
-/// 名称占据剩余宽度并截断；类别为空时不渲染标签，避免出现空胶囊。
-///
-/// 类别标签是自绘而非 `Tag`：`Tag` 要么带边框（`border_1`）、要么在
-/// `xsmall` 下用 `rems(0.625)` 算出小数像素字号 —— 中文在这个尺寸会发虚。
-/// 设计要的是 12px、无边框、`muted` 底的一枚淡胶囊，`Tag` 无法直接给出，
-/// 所以这里用 `div` 自绘。
+/// 类别胶囊自绘而非用 `Tag`：`Tag` 带边框，且 `xsmall` 用 `rems()` 会算出
+/// 小数像素字号，中文在这个尺寸会发虚。设计要的是 12px、无边框、`muted` 底。
 pub fn app_row(
     icon: Option<Arc<RenderImage>>,
     name: &SharedString,

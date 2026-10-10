@@ -1,34 +1,24 @@
-/// 应用图标提取
-///
-/// 从启动目标（`.exe` / `.lnk` / `.url` 等）取出 Windows 系统图标，
-/// 转成 gpui 可直接渲染的位图，让列表里每个应用都显示自己的真实图标。
-/// 取不到图标时返回 `None`，由调用方回退到首字母色块。
-///
-/// 像素格式方面，gpui 的约定是 `RenderImage` 的数据为 **BGRA** 字节
-/// （gpui 自己解码图片时也会把 RGBA 逐像素交换成 BGRA 再交给渲染器）。
-/// Windows 用 `GetDIBits` 读 32bpp 位图得到的正好就是 BGRA，因此无需再转换。
-///
-/// 应用**自身**的图标不走这里：它由 `build.rs` 嵌进 exe 的资源段，
-/// 托盘需要时直接用 `LoadImageW` 从资源里取（见 `crate::tray`）。
+//! 应用图标提取：从启动目标（`.exe` / `.lnk` / `.url` 等）取出 Windows 系统图标，
+//! 转成 gpui 可渲染的位图。取不到返回 `None`，由调用方回退首字母色块。
+//!
+//! gpui 的 `RenderImage` 要求 **BGRA** 字节，而 `GetDIBits` 读 32bpp 位图得到的
+//! 正好也是 BGRA，所以无需再转换。
+//!
+//! 应用**自身**的图标不走这里：它由 `build.rs` 嵌进 exe 资源段，托盘直接用
+//! `LoadImageW` 取（见 `crate::tray`）。
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use gpui::RenderImage;
 
-/// 缩放后图标的最大边长（像素）。
-///
-/// 列表里的图标显示为 28px，64px 足以顶住 2x 缩放；再大只是白白占用
-/// 纹理图集（系统图像列表给出的 jumbo 图标是 256×256）。
+/// 缩放后图标的最大边长（像素）。列表显示 28px，64 足够顶住 2x 缩放；
+/// 系统 jumbo 图标是 256×256，再大只是白占纹理图集。
 const MAX_ICON_EDGE: u32 = 64;
 
-/// 把 shell 图标查询串行化的进程级锁。
-///
-/// shell 的图标接口并发调用会直接失败：实测多线程同时查询时
-/// `SHGetFileInfoW` 返回 0，`SHGetImageList` 报 `E_OUTOFMEMORY`；
-/// 串行调用则全部成功。所以不论调用方怎样使用线程池，这里都排好队。
+/// 把 shell 图标查询串行化。实测并发调用会直接失败（`SHGetFileInfoW` 返回 0、
+/// `SHGetImageList` 报 `E_OUTOFMEMORY`），串行则全部成功。
 static EXTRACT_LOCK: Mutex<()> = Mutex::new(());
 
-/// 读取指定启动目标的图标。失败（路径不存在、不是可执行文件等）返回 `None`。
 pub fn load(target: &Path) -> Option<Arc<RenderImage>> {
     let (width, height, bgra) = {
         let _guard = EXTRACT_LOCK
@@ -108,16 +98,14 @@ fn downscale(image: image::RgbaImage) -> image::RgbaImage {
 
 /// 盒式滤波重采样到精确尺寸。
 ///
-/// 用盒式滤波（每个目标像素取源区域的平均值）而不是 `imageops::resize`：
-/// 系统给的 jumbo 图标是 256×256，Lanczos 在 debug 构建下单个图标要几十毫秒，
-/// 足以卡住列表首帧。盒式滤波只扫一遍源像素。
+/// 不用 `imageops::resize`：jumbo 图标是 256×256，Lanczos 在 debug 构建下单个图标
+/// 要几十毫秒，足以卡住列表首帧。盒式滤波只扫一遍源像素。
 ///
-/// 两点实现要点：
-/// - 按**预乘 alpha** 求平均。若直接平均通道值，透明区域的黑像素会掺进
-///   半透明边缘，让图标边缘发灰发暗。
-/// - **不关心通道含义**，原样保留通道顺序（BGRA 进就 BGRA 出，RGBA 进就 RGBA 出）。
+/// - 按**预乘 alpha** 求平均。直接平均通道值会让透明区域的黑像素掺进半透明边缘，
+///   图标边缘发灰发暗。
+/// - **不关心通道含义**，原样保留通道顺序（BGRA 进就 BGRA 出）。
 ///
-/// 用于缩小；放大时退化成最近邻（各目标像素只取到一个源像素）。
+/// 用于缩小；放大时退化成最近邻。
 fn resample_box(
     source_image: &image::RgbaImage,
     target_width: u32,
@@ -280,12 +268,9 @@ mod imp {
 
     /// `SHGetFileInfo` / `SHGetImageList` 要求 COM 已初始化。
     ///
-    /// 必须是**每线程**一次：图标在后台线程池上提取，池里每个线程各有自己的
-    /// COM 单元，进程级 OnceLock 只能保证第一个线程初始化过。
-    ///
-    /// 用 STA（`COINIT_APARTMENTTHREADED`）与资源管理器保持一致，这样依赖
-    /// 单元线程模型的第三方图标处理程序也能正常工作。线程池线程不会跑消息
-    /// 循环，所以调用必须串行（见 [`super::EXTRACT_LOCK`]）。
+    /// 必须是**每线程**一次：图标在后台线程池上提取，池里每个线程各有自己的 COM 单元，
+    /// 进程级 OnceLock 只能保证第一个线程初始化过。用 STA 与资源管理器保持一致。
+    /// 线程池线程不跑消息循环，所以调用必须串行（见 [`super::EXTRACT_LOCK`]）。
     fn ensure_com_initialized() {
         thread_local! {
             static COM: std::cell::OnceCell<()> = const { std::cell::OnceCell::new() };

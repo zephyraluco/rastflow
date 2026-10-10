@@ -67,14 +67,9 @@ pub fn show_window(window: &mut Window) {
 
 // ---------- 窗口居中 ----------
 
-/// 将窗口移动到上次记录的屏幕中央（多屏）。
+/// 将窗口移动到上次记录的屏幕中央（多屏）；未记录过就居中到主显示器。
 ///
-/// - 若已记录过屏幕（`LastDisplay` 全局），则居中到该屏幕的可见区域（排除任务栏）。
-/// - 若尚未记录，则居中到主显示器。
-///
-/// **实现说明**：gpui 没有提供创建后移动窗口位置的 API，
-/// 因此在 Windows 上通过 `HasWindowHandle` 拿到 HWND，
-/// 再调用 Win32 `SetWindowPos` 完成移动。
+/// gpui 没有创建后移动窗口位置的 API，所以在 Windows 上取 HWND 后调 `SetWindowPos`。
 pub fn center_window(window: &mut Window, cx: &impl Deref<Target = App>) {
     let cx: &App = cx;
 

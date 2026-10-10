@@ -76,18 +76,12 @@ impl LauncherDelegate {
         }
     }
 
-    /// 查缓存取图标。
-    ///
-    /// 渲染路径上只能做内存查表：虚拟列表的 `render_item` 每帧都会对可见行
-    /// 调用，而真正取图标要调 Shell / GDI。提取由 [`LauncherView::prefetch_icons`]
-    /// 在后台完成，结果经 [`Self::insert_icons`] 回填。
+    /// 查图标缓存。渲染路径上只能内存查表，真正的提取在后台（见 [`super::icon_cache`]）。
     pub fn icon(&self, launch_target: Option<&str>) -> Option<Arc<RenderImage>> {
         self.icons.get(launch_target)
     }
 
-    /// 按列表显示顺序挑出下一批待提取图标的启动目标。
-    ///
-    /// 没有启动目标（例如内置示例条目）的会被跳过；已缓存或已在请求中的也会跳过。
+    /// 按列表顺序挑出下一批待提取图标的启动目标；无启动目标或已请求过的跳过。
     pub fn take_icon_requests(&mut self, limit: usize) -> Vec<String> {
         let mut requests = Vec::new();
         for entry in &self.filtered {
