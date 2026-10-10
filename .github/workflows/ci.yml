@@ -1,0 +1,55 @@
+# 持续集成：构建、Lint、测试
+#
+# 只在 windows-latest 上跑：本应用是 Windows 专有的（#![windows_subsystem]、
+# Win32 直接调用、NSIS 打包），gpui 在 Linux 上还要额外准备 X11/Wayland 开发库。
+#
+# 仓库尚未整体跑过 rustfmt，也还有既有 clippy 告警，故 fmt 与 `-D warnings`
+# 都不作门禁，等这两项干净了再升级成阻断式检查。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支连续推送时，取消上一轮还没跑完的构建
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # 测试失败时打出 backtrace，否则只能看到一个断言位置
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: Build / clippy / test
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # 缓存 registry 与 target：依赖树很大（gpui / wgpu / windows），冷编译最耗时
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: check
+
+      # 先单独构建一次，编译失败即时报错，不必等 clippy 分析
+      - name: cargo build
+        run: cargo build --locked
+
+      # 只跑不拦：告警清理干净后补上 `-- -D warnings` 即可升级成门禁
+      - name: cargo clippy
+        run: cargo clippy --locked --all-targets --all-features
+
+      # #[ignore] 的用例依赖真实系统状态（开始菜单、已装程序、管理员权限、
+      # 百万级文件），CI 里跑不了，保持忽略
+      - name: cargo test
+        run: cargo test --locked
