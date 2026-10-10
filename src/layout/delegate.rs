@@ -8,8 +8,8 @@ use gpui_kit::component::{
 use std::process::Command;
 use std::sync::Arc;
 
-use crate::config::{
-    entry_identity, load_or_discover_entries, save_entries,
+use crate::app_list::{
+    load_or_discover_entries, save_entries,
     sort_entries_by_launch, AppEntry,
 };
 use crate::locale::t;
@@ -24,15 +24,24 @@ pub(super) fn launch_entry(entry: &AppEntry) -> std::io::Result<()> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-    let mut cmd = Command::new("cmd");
-    cmd.args(["/C", "start", ""]);
+    let target = entry
+        .launch_target
+        .clone()
+        .unwrap_or_else(|| entry.name.to_string());
 
-    if let Some(target) = &entry.launch_target {
-        cmd.arg(target);
-    } else {
-        cmd.arg(entry.name.to_string());
+    // UWP / Store 应用没有可直接执行的文件（目标是 `shell:AppsFolder\<AppID>`），
+    // 交给 explorer 去解析 shell 命名空间；`cmd /C start` 认不出这种目标。
+    if target.starts_with("shell:") {
+        return Command::new("explorer.exe")
+            .arg(&target)
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map(|_| ());
     }
 
+    let mut cmd = Command::new("cmd");
+    cmd.args(["/C", "start", ""]);
+    cmd.arg(&target);
     cmd.creation_flags(CREATE_NO_WINDOW).spawn().map(|_| ())
 }
 
@@ -126,12 +135,12 @@ impl LauncherDelegate {
     }
 
     pub(super) fn mark_launched(&mut self, launched: &AppEntry) {
-        let launched_key = entry_identity(launched);
+        let launched_id = &launched.id;
 
         if let Some(item) = self
             .all_entries
             .iter_mut()
-            .find(|e| entry_identity(e) == launched_key)
+            .find(|e| e.id == *launched_id)
         {
             item.launch_count += 1;
         }
@@ -139,7 +148,7 @@ impl LauncherDelegate {
         if let Some(item) = self
             .filtered
             .iter_mut()
-            .find(|e| entry_identity(e) == launched_key)
+            .find(|e| e.id == *launched_id)
         {
             item.launch_count += 1;
         }

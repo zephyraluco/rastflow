@@ -4,7 +4,7 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_kit::component::{button::Button, setting::*, *};
 
-use crate::config::{load_entries_from_file, upsert_custom_entry};
+use crate::app_list::{load_entries_from_db, upsert_custom_entry};
 use crate::icons::IconName;
 
 use super::global::AppSettings;
@@ -186,7 +186,7 @@ pub fn build_settings_pages(lang: &str) -> Vec<SettingPage> {
             .group(
                 SettingGroup::new().item(SettingItem::render(|_opts, _win, cx| {
                     let _v = cx.global::<AppSettings>().custom_programs_version;
-                    let entries: Vec<(String, String)> = load_entries_from_file()
+                        let entries: Vec<(String, String)> = load_entries_from_db()
                         .into_iter()
                         .filter(|e| e.category.as_ref() == "自定义程序")
                         .map(|e| (e.name.to_string(), e.launch_target.unwrap_or_default()))

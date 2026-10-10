@@ -186,6 +186,8 @@ pub struct LauncherView {
     /// 是否已有一个图标预取任务在跑（避免重复开链）
     icon_prefetch_running: Arc<AtomicBool>,
     _subscriptions: Vec<Subscription>,
+    /// watcher 轮询任务（detach 后独立运行，不随订阅管理）
+    _watcher_task: Option<Task<()>>,
 }
 
 impl LauncherView {
@@ -297,6 +299,32 @@ impl LauncherView {
             }
         });
 
+        // 启动开始菜单 watcher：新装/卸载程序时自动刷新列表
+        let watcher_dirty = crate::app_list::watcher::start();
+        let watcher_task = if let Some(dirty) = watcher_dirty {
+            let list_state = list_state.clone();
+            Some(cx.spawn_in(window, async move |_, cx| {
+                loop {
+                    // 每 500ms 检查一次 watcher 标记
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(500))
+                        .await;
+                    if dirty.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                        // 使发现缓存失效，下次 reload 时重新扫描
+                        crate::app_list::discovery_cache::invalidate();
+                        let _ = cx.update(|_, cx| {
+                            list_state.update(cx, |list, cx| {
+                                list.delegate_mut().reload("");
+                                cx.notify();
+                            });
+                        });
+                    }
+                }
+            }))
+        } else {
+            None
+        };
+
         let view = Self {
             input_state: input_state.clone(),
             list_state,
@@ -311,6 +339,7 @@ impl LauncherView {
             file_error: None,
             icon_prefetch_running: Arc::new(AtomicBool::new(false)),
             _subscriptions: vec![input_sub, bounds_sub, activation_sub, settings_sub],
+            _watcher_task: watcher_task,
         };
         input_state.update(cx, |input, cx| input.focus(window, cx));
         view.prefetch_icons(cx);

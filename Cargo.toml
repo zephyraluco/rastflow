@@ -64,11 +64,11 @@ rust-embed = { version = "8", features = ["interpolate-folder-path"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
-tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
-# 注意：这里**没有** rusqlite。自研搜索核心的索引是常驻内存的（src/search/index.rs），
-# 磁盘上只有一个自定义二进制快照，所以索引层不再需要 SQLite。
-# 唯一还在用 SQLite 的是 applist.db（应用列表），走 sqlx。
+rusqlite = { version = "0.40", features = ["bundled"] }
+notify = "8"
+# 注意：这里**没有** sqlx / tokio。应用列表数据（applist.db）用 rusqlite 同步读写，
+# 不需要异步 runtime；自研搜索核心的索引是常驻内存的（src/search/index.rs），
+# 磁盘上只有一个自定义二进制快照，所以索引层也不需要 SQLite。
 # 用于构造 gpui 的 RenderImage 与图标缩放（版本须与 gpui-pre 一致）
 image = { version = "0.25", default-features = false }
 
