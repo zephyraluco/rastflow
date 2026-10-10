@@ -38,8 +38,58 @@ pub fn load(target: &Path) -> Option<Arc<RenderImage>> {
     };
 
     let image = image::RgbaImage::from_raw(width, height, bgra)?;
+    let image = crop_to_content(image)?;
     let image = downscale(image);
     Some(Arc::new(RenderImage::new(vec![image::Frame::new(image)])))
+}
+
+/// 裁掉图标四周的全透明区域；整张图全透明时返回 `None`（视为没取到图标）。
+///
+/// 有些程序（绿色版、带自更新器的程序）只在 exe 里塞了小尺寸图标，Shell 会把它
+/// 放在 256×256 的 jumbo 画布的一角，其余全透明 —— 直接缩放显示出来就只有
+/// 一个小点。内容基本铺满画布时不动它，免得削掉正常图标自带的留白。
+fn crop_to_content(image: image::RgbaImage) -> Option<image::RgbaImage> {
+    /// alpha 低于这个值的像素算透明
+    const ALPHA_MIN: u8 = 8;
+
+    let (width, height) = (image.width(), image.height());
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let raw = image.as_raw();
+
+    let (mut min_x, mut min_y) = (width, height);
+    let (mut max_x, mut max_y) = (0u32, 0u32);
+    let mut found = false;
+    for y in 0..height {
+        let row = y as usize * width as usize * 4;
+        for x in 0..width {
+            if raw[row + x as usize * 4 + 3] >= ALPHA_MIN {
+                found = true;
+                min_x = min_x.min(x);
+                max_x = max_x.max(x);
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+    if !found {
+        return None;
+    }
+
+    let crop_width = max_x - min_x + 1;
+    let crop_height = max_y - min_y + 1;
+    if crop_width * 2 >= width && crop_height * 2 >= height {
+        return Some(image);
+    }
+
+    let mut cropped = image::RgbaImage::new(crop_width, crop_height);
+    for y in 0..crop_height {
+        for x in 0..crop_width {
+            cropped.put_pixel(x, y, *image.get_pixel(min_x + x, min_y + y));
+        }
+    }
+    Some(cropped)
 }
 
 /// 把过大的图标等比缩到 [`MAX_ICON_EDGE`] 以内。
@@ -151,7 +201,11 @@ mod imp {
     pub(super) fn icon_bgra(target: &Path) -> Option<(u32, u32, Vec<u8>)> {
         ensure_com_initialized();
         let path = wide_path(target);
-
+        // `shell:AppsFolder\...` 这类 shell 命名空间目标不是文件路径，
+        // `SHGetFileInfo` 认不出来，只能请 `IShellItemImageFactory` 出图。
+        if is_shell_namespace(target) {
+            return unsafe { shell_item_image(&path) };
+        }
         // 优先用系统图像列表里的 jumbo 图标（256×256，画质最好）；
         // 特殊条目取不到时退回 Shell 自带的大图标（32×32）。
         let hicon = unsafe { jumbo_icon(&path) }.or_else(|| unsafe { shell_large_icon(&path) })?;
@@ -161,6 +215,67 @@ mod imp {
             let _ = DestroyIcon(hicon);
         }
         pixels
+    }
+
+    /// `shell:AppsFolder\...` 这类目标不是文件路径，要用 shell 接口取图
+    fn is_shell_namespace(target: &Path) -> bool {
+        target
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .starts_with("shell:")
+    }
+
+    /// `GetImage` 返回的位图由调用方负责释放，不能漏 GDI 对象
+    struct OwnedBitmap(HBITMAP);
+
+    impl Drop for OwnedBitmap {
+        fn drop(&mut self) {
+            if !self.0.0.is_null() {
+                unsafe {
+                    let _ = DeleteObject(HGDIOBJ(self.0.0));
+                }
+            }
+        }
+    }
+
+    /// shell 命名空间目标（UWP / Store 应用的 `shell:AppsFolder\<AppID>`）的图标。
+    ///
+    /// 请求 `BIGGERSIZEOK`：图标资源本身够大时让 Shell 直接给原图，
+    /// 比先缩到 64 再放大清晰。
+    unsafe fn shell_item_image(path: &[u16]) -> Option<(u32, u32, Vec<u8>)> {
+        use windows::Win32::Foundation::SIZE;
+        use windows::Win32::System::Com::IBindCtx;
+        use windows::Win32::UI::Shell::{
+            IShellItem, IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_BIGGERSIZEOK,
+            SIIGBF_RESIZETOFIT,
+        };
+        use windows::core::Interface as _;
+
+        let item = unsafe {
+            SHCreateItemFromParsingName::<_, _, IShellItem>(
+                PCWSTR(path.as_ptr()),
+                None::<&IBindCtx>,
+            )
+        }
+        .ok()?;
+        // shell item 自身就实现了 `IShellItemImageFactory`，直接 QI 即可；
+        // 文档里的 `BindToHandler(BHID_ImageFactory, ...)` 反而会得到
+        // `MK_E_NOOBJECT`（这个 BHID 没在 windows crate 里生成，值对不上）。
+        let factory: IShellItemImageFactory = item.cast().ok()?;
+
+        let size = SIZE {
+            cx: super::MAX_ICON_EDGE as i32,
+            cy: super::MAX_ICON_EDGE as i32,
+        };
+        let bitmap = unsafe {
+            factory.GetImage(size, SIIGBF_RESIZETOFIT | SIIGBF_BIGGERSIZEOK)
+        }
+        .ok()?;
+        let owned = OwnedBitmap(bitmap);
+
+        let (width, height) = unsafe { bitmap_size(owned.0) }?;
+        let pixels = unsafe { dib_bits(owned.0, width, height) }?;
+        Some((width, height, pixels))
     }
 
     /// `SHGetFileInfo` / `SHGetImageList` 要求 COM 已初始化。
@@ -351,6 +466,79 @@ mod imp {
 
     pub(super) fn icon_bgra(_target: &Path) -> Option<(u32, u32, Vec<u8>)> {
         None
+    }
+}
+
+#[cfg(test)]
+mod crop_tests {
+    use super::*;
+
+    /// 造一张 `width`×`height` 的图，`content` 指定不透明矩形（其余全透明）。
+    fn image_with(width: u32, height: u32, content: (u32, u32, u32, u32)) -> image::RgbaImage {
+        let mut buffer = vec![0u8; (width * height * 4) as usize];
+        let (x0, y0, x1, y1) = content;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let offset = ((y * width + x) * 4) as usize;
+                buffer[offset..offset + 4].copy_from_slice(&[255, 0, 0, 255]);
+            }
+        }
+        image::RgbaImage::from_raw(width, height, buffer).expect("缓冲区尺寸应匹配")
+    }
+
+    /// 某些 exe 只有小尺寸图标，Shell 会把它放进 256 画布的一角。
+    #[test]
+    fn crops_icon_living_in_a_corner() {
+        let image = image_with(256, 256, (0, 0, 48, 48));
+        let cropped = crop_to_content(image).expect("有内容就不该返回 None");
+        assert_eq!((cropped.width(), cropped.height()), (48, 48));
+    }
+
+    /// 正常图标自带的留白不该被削掉。
+    #[test]
+    fn keeps_icon_that_fills_the_canvas() {
+        let image = image_with(64, 64, (4, 4, 60, 60));
+        let cropped = crop_to_content(image).expect("应保留图标");
+        assert_eq!((cropped.width(), cropped.height()), (64, 64));
+    }
+
+    /// 整张全透明等于没取到图标，交给调用方回退首字母色块。
+    #[test]
+    fn fully_transparent_is_treated_as_missing() {
+        let image = image_with(64, 64, (0, 0, 0, 0));
+        assert!(crop_to_content(image).is_none());
+    }
+}
+
+#[cfg(all(test, windows))]
+mod icon_probe {
+    use std::path::Path;
+
+    /// 手工检查若干目标的图标提取结果：
+    /// `cargo test icon_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore = "依赖本机安装的程序"]
+    fn probe() {
+        for target in [
+            r"shell:AppsFolder\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App",
+            r"shell:AppsFolder\Microsoft.WindowsNotepad_8wekyb3d8bbwe!App",
+            r"C:\Windows\System32\notepad.exe",
+            r"C:\Windows\explorer.exe",
+        ] {
+            let path = Path::new(target);
+            match super::imp::icon_bgra(path) {
+                Some((width, height, pixels)) => {
+                    let chunks = pixels.as_chunks::<4>().0;
+                    let opaque = chunks.iter().filter(|pixel| pixel[3] > 8).count();
+                    let raw = image::RgbaImage::from_raw(width, height, pixels).expect("尺寸应匹配");
+                    let cropped = super::crop_to_content(raw).map(|img| (img.width(), img.height()));
+                    println!(
+                        "{target}\n  原图 {width}x{height}，不透明 {opaque}，裁剪后 {cropped:?}"
+                    );
+                }
+                None => println!("{target}\n  -> None"),
+            }
+        }
     }
 }
 
