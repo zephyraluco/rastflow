@@ -1,4 +1,4 @@
-/// 设置窗口视图
+//! 设置窗口视图
 
 use gpui::*;
 use gpui_kit::component::{setting::*, *};

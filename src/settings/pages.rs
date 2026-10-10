@@ -1,10 +1,10 @@
-/// 设置页面构建：各分组配置项 + 文件选择对话框
+//! 设置页面构建：各分组配置项 + 文件选择对话框
 
-use gpui::prelude::FluentBuilder as _;
 use gpui::*;
-use gpui_kit::component::{button::Button, setting::*, *};
+use gpui_kit::component::{setting::*, *};
 
-use crate::app_list::{load_entries_from_db, upsert_custom_entry};
+use crate::app_list::{CUSTOM_APP_CATEGORY, load_entries_from_db, upsert_custom_entry};
+use crate::components::custom_app_list::CustomAppList;
 use crate::icons::IconName;
 
 use super::global::AppSettings;
@@ -186,114 +186,44 @@ pub fn build_settings_pages(lang: &str) -> Vec<SettingPage> {
             .group(
                 SettingGroup::new().item(SettingItem::render(|_opts, _win, cx| {
                     let _v = cx.global::<AppSettings>().custom_programs_version;
-                        let entries: Vec<(String, String)> = load_entries_from_db()
+                    let entries: Vec<(String, String)> = load_entries_from_db()
                         .into_iter()
-                        .filter(|e| e.category.as_ref() == "自定义程序")
+                        .filter(|e| e.category.as_ref() == CUSTOM_APP_CATEGORY)
                         .map(|e| (e.name.to_string(), e.launch_target.unwrap_or_default()))
                         .collect();
 
-                    let fg = cx.theme().foreground;
-                    let muted = cx.theme().muted_foreground;
-                    let border = cx.theme().border;
-                    let strip_a = cx.theme().background;
-                    let strip_b = cx.theme().muted;
-
-                    v_flex()
-                        .w_full()
-                        .gap_2()
-                        .when(entries.is_empty(), |this| {
-                            this.child(
-                                div()
-                                    .w_full()
-                                    .py_8()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_sm()
-                                    .text_color(muted)
-                                    .child(zh_en(lang, "暂未添加自定义程序", "No custom apps added yet")),
-                            )
+                    CustomAppList::new(entries)
+                        .empty_label(zh_en(
+                            lang,
+                            "暂未添加自定义程序",
+                            "No custom apps added yet",
+                        ))
+                        .add_label(zh_en(lang, "添加程序", "Add App"))
+                        .on_add(|_, _, cx| {
+                            // 必须在独立 OS 线程上运行 COM 文件对话框，
+                            // 否则 dialog.Show() 的内部消息泵会在
+                            // App RefCell 已借用时触发 gpui 回调 → panic。
+                            let (tx, rx) = std::sync::mpsc::sync_channel::<Option<String>>(1);
+                            std::thread::spawn(move || {
+                                tx.send(pick_program_file()).ok();
+                            });
+                            cx.spawn(async move |async_cx: &mut gpui::AsyncApp| {
+                                let picked: Option<String> = async_cx
+                                    .background_executor()
+                                    .spawn(async move { rx.recv().ok().flatten() })
+                                    .await;
+                                if let Some(path) = picked {
+                                    async_cx.update(|cx| {
+                                        if let Err(e) = upsert_custom_entry("", "", &path) {
+                                            eprintln!("添加程序失败: {e}");
+                                        }
+                                        cx.global_mut::<AppSettings>()
+                                            .custom_programs_version += 1;
+                                    });
+                                }
+                            })
+                            .detach();
                         })
-                        .when(!entries.is_empty(), |this| {
-                            this.child(
-                                v_flex()
-                                    .w_full()
-                                    .rounded_lg()
-                                    .border_1()
-                                    .border_color(border)
-                                    .overflow_hidden()
-                                    .children(entries.into_iter().enumerate().map(
-                                        |(i, (name, path))| {
-                                            h_flex()
-                                                .w_full()
-                                                .px_3()
-                                                .py_2()
-                                                .gap_3()
-                                                .bg(if i % 2 == 0 { strip_a } else { strip_b })
-                                                .child(
-                                                    div()
-                                                        .flex_1()
-                                                        .text_sm()
-                                                        .font_semibold()
-                                                        .text_color(fg)
-                                                        .overflow_hidden()
-                                                        .child(name),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .flex_shrink_0()
-                                                        .text_xs()
-                                                        .text_color(muted)
-                                                        .max_w_64()
-                                                        .overflow_hidden()
-                                                        .child(path),
-                                                )
-                                        },
-                                    )),
-                            )
-                        })
-                        .child(
-                            div()
-                                .w_full()
-                                .pt_3()
-                                .flex()
-                                .justify_center()
-                                .child(
-                                    Button::new("add-program-btn")
-                                        .child(zh_en(lang, "添加程序", "Add App"))
-                                        .on_click(|_, _, cx| {
-                                            // 必须在独立 OS 线程上运行 COM 文件对话框，
-                                            // 否则 dialog.Show() 的内部消息泵会在
-                                            // App RefCell 已借用时触发 gpui 回调 → panic。
-                                            let (tx, rx) =
-                                                std::sync::mpsc::sync_channel::<Option<String>>(1);
-                                            std::thread::spawn(move || {
-                                                tx.send(pick_program_file()).ok();
-                                            });
-                                            cx.spawn(async move |async_cx: &mut gpui::AsyncApp| {
-                                                let picked: Option<String> = async_cx
-                                                    .background_executor()
-                                                    .spawn(async move {
-                                                        rx.recv().ok().flatten()
-                                                    })
-                                                    .await;
-                                                if let Some(path) = picked {
-                                                    async_cx
-                                                        .update(|cx| {
-                                                            if let Err(e) = upsert_custom_entry(
-                                                                "", "", &path,
-                                                            ) {
-                                                                eprintln!("添加程序失败: {e}");
-                                                            }
-                                                            cx.global_mut::<AppSettings>()
-                                                                .custom_programs_version += 1;
-                                                        });
-                                                }
-                                            })
-                                            .detach();
-                                        }),
-                                ),
-                        )
                 })),
             ),
     ]

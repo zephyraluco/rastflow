@@ -2,8 +2,8 @@
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_kit::component::{
-    button::{Button, ButtonVariants},
-    input::{Escape, Input, InputEvent, InputState, MoveDown, MoveUp},
+    alert::Alert,
+    input::{Escape, InputEvent, InputState, MoveDown, MoveUp},
     list::{List, ListDelegate, ListItem, ListState},
     *,
 };
@@ -20,6 +20,11 @@ const FILE_SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
 /// 一次性把所有条目的图标都提完再回填的话，列表要等很久才能显示图标。
 const ICON_PREFETCH_BATCH: usize = 32;
 
+use crate::components::{
+    file_search::{index_status_panel, no_results, result_header, result_row, searching_row},
+    launcher_footer::LauncherFooter,
+    search_bar::SearchBar,
+};
 use crate::locale::t;
 use crate::settings::{AppSettings, SettingsView};
 use crate::utils::{center_window, hide_window};
@@ -74,48 +79,11 @@ impl ListDelegate for FileSearchDelegate {
     ) -> Option<Self::Item> {
         let result = self.results.get(ix.row)?;
         let selected = Some(ix) == self.selected_index;
-        let muted_fg = cx.theme().muted_foreground;
 
         Some(
-            ListItem::new(ix.row).selected(selected).child(
-                h_flex()
-                    .gap_3()
-                    .items_center()
-                    .px_3()
-                    .py_1()
-                    .child(
-                        div()
-                            .w(px(180.))
-                            .text_sm()
-                            .font_semibold()
-                            .truncate()
-                            .child(result.name.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_sm()
-                            .text_color(muted_fg)
-                            .truncate()
-                            .child(result.dir.clone()),
-                    )
-                    .child(
-                        div()
-                            .w(px(86.))
-                            .text_sm()
-                            .text_color(muted_fg)
-                            .truncate()
-                            .child(result.size.clone()),
-                    )
-                    .child(
-                        div()
-                            .w(px(128.))
-                            .text_sm()
-                            .text_color(muted_fg)
-                            .truncate()
-                            .child(result.modified.clone()),
-                    ),
-            ),
+            ListItem::new(ix.row)
+                .selected(selected)
+                .child(result_row(result, cx)),
         )
     }
 
@@ -151,13 +119,7 @@ impl ListDelegate for FileSearchDelegate {
         _window: &mut Window,
         cx: &mut Context<ListState<Self>>,
     ) -> impl IntoElement {
-        div()
-            .flex()
-            .items_center()
-            .justify_center()
-            .p_8()
-            .text_color(cx.theme().muted_foreground)
-            .child("未找到匹配文件")
+        no_results(cx)
     }
 }
 
@@ -712,50 +674,8 @@ impl Render for LauncherView {
                         }),
                     )
                     .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(
-                                div()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(if self.file_mode { "📁" } else { "🔍" }),
-                            )
-                            .child(Input::new(&self.input_state).appearance(false).flex_1())
-                            .when(!self.file_mode, |this| {
-                                this.child(
-                                    h_flex()
-                                        .gap_1()
-                                        .items_center()
-                                        .flex_shrink_0()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child("文件搜索")
-                                        .child(
-                                            div()
-                                                .px_1()
-                                                .py_px()
-                                                .rounded_sm()
-                                                .border_1()
-                                                .border_color(cx.theme().border)
-                                                .bg(cx.theme().muted)
-                                                .text_xs()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child("Tab"),
-                                        ),
-                                )
-                            })
-                            .when(self.file_mode, |this| {
-                                this.child(
-                                    div()
-                                        .px_2()
-                                        .py_px()
-                                        .rounded_sm()
-                                        .bg(cx.theme().accent)
-                                        .text_xs()
-                                        .text_color(cx.theme().accent_foreground)
-                                        .child("本地索引"),
-                                )
-                            }),
+                        SearchBar::new(&self.input_state, self.file_mode)
+                            .labels(t("filesearch.mode", cx), t("filesearch.index_badge", cx)),
                     ),
             )
             // 内容区
@@ -764,46 +684,35 @@ impl Render for LauncherView {
             } else {
                 List::new(&self.list_state).flex_1().into_any_element()
             })
-            // 底部提示栏
+            // 底部状态栏：快捷键提示 + 设置入口
             .child(
-                h_flex()
-                    .px_4()
-                    .py_1()
-                    .gap_4()
-                    .border_t_1()
-                    .border_color(cx.theme().border)
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .items_center()
-                    .child(t("hint.select", cx))
-                    .child(t("hint.launch", cx))
-                    .child(t("hint.close", cx))
-                    .child(div().flex_1())
-                    .child(
-                        Button::new("settings-btn")
-                            .ghost()
-                            .icon(IconName::Settings)
-                            .on_click(|_ev, _window, cx| {
-                                let _ = cx.open_window(
-                                    WindowOptions {
-                                        window_bounds: Some(WindowBounds::Windowed(Bounds {
-                                            origin: point(px(460.), px(100.)),
-                                            size: size(px(800.), px(600.)),
-                                        })),
-                                        titlebar: Some(TitlebarOptions {
-                                            title: None,
-                                            appears_transparent: true,
-                                            traffic_light_position: Some(point(px(9.), px(9.))),
-                                        }),
-                                        ..Default::default()
-                                    },
-                                    |window, cx| {
-                                        let view = cx.new(|cx| SettingsView::new(window, cx));
-                                        cx.new(|cx| Root::new(view, window, cx))
-                                    },
-                                );
-                            }),
-                    ),
+                LauncherFooter::new()
+                    .common_hints(
+                        t("hint.select", cx),
+                        t("hint.launch", cx),
+                        t("hint.close", cx),
+                    )
+                    .settings_tooltip(t("settings.open", cx))
+                    .on_settings(|_ev, _window, cx| {
+                        let _ = cx.open_window(
+                            WindowOptions {
+                                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                                    origin: point(px(460.), px(100.)),
+                                    size: size(px(800.), px(600.)),
+                                })),
+                                titlebar: Some(TitlebarOptions {
+                                    title: None,
+                                    appears_transparent: true,
+                                    traffic_light_position: Some(point(px(9.), px(9.))),
+                                }),
+                                ..Default::default()
+                            },
+                            |window, cx| {
+                                let view = cx.new(|cx| SettingsView::new(window, cx));
+                                cx.new(|cx| Root::new(view, window, cx))
+                            },
+                        );
+                    }),
             )
     }
 }
@@ -812,190 +721,49 @@ impl Render for LauncherView {
 
 impl LauncherView {
     fn render_file_search_content(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let muted_fg = cx.theme().muted_foreground;
-        let fg = cx.theme().foreground;
-        let border = cx.theme().border;
-        let muted_bg = cx.theme().muted;
-
-        match &self.file_status {
-            // 还没开始初始化 / 正在等索引就绪
-            SearchStatus::Uninitialized => v_flex()
-                .flex_1()
-                .items_center()
-                .justify_center()
-                .gap_2()
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(muted_fg)
-                        .child("正在初始化文件索引..."),
-                )
-                .into_any_element(),
-
-            // 正在建索引：显示进度。首次启动会走这里，可能要几十秒。
-            SearchStatus::Indexing { disk, written } => v_flex()
-                .flex_1()
-                .items_center()
-                .justify_center()
-                .gap_3()
-                .p_6()
-                .child(div().text_2xl().child("🗂"))
-                .child(
-                    v_flex()
-                        .items_center()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_semibold()
-                                .text_color(fg)
-                                .child("正在建立文件索引"),
-                        )
-                        .child(
-                            div().text_xs().text_color(muted_fg).child(match disk {
-                                Some(disk) => format!("正在扫描 {disk}: 盘，已索引 {written} 个文件"),
-                                None => "准备中...".to_string(),
-                            }),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(muted_fg)
-                                .child("索引只需建立一次，之后启动即可直接搜索"),
-                        ),
-                )
-                .into_any_element(),
-
-            // 不可用：需要管理员权限，或没有可索引的盘
-            SearchStatus::Unavailable { reason, .. } => {
-                let needs_admin = self.file_status.needs_admin();
-                v_flex()
-                    .flex_1()
-                    .items_center()
-                    .justify_center()
-                    .gap_4()
-                    .p_6()
-                    .child(div().text_2xl().child("⚠"))
-                    .child(
-                        v_flex()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_semibold()
-                                    .text_color(fg)
-                                    .child("文件索引不可用"),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(muted_fg)
-                                    .child(reason.clone()),
-                            )
-                            .when(needs_admin, |this| {
-                                this.child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(muted_fg)
-                                        .child("读取 NTFS 主文件表需要管理员权限"),
-                                )
-                            }),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .when(needs_admin, |this| {
-                                this.child(
-                                    Button::new("elevate-btn")
-                                        .child("以管理员身份重启")
-                                        .on_click(|_, _, cx| {
-                                            // 拉起提权副本后退出当前实例，
-                                            // 否则两个实例会抢同一个托盘图标
-                                            if super::filesearch::relaunch_as_admin() {
-                                                cx.quit();
-                                            }
-                                        }),
-                                )
-                            })
-                            .child(
-                                Button::new("retry-btn")
-                                    .ghost()
-                                    .child("重试")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.detect_file_search(cx);
-                                    })),
-                            ),
-                    )
-                    .into_any_element()
-            }
-
-            // 索引可用：显示查询结果
-            SearchStatus::Ready { .. } => v_flex()
-                .flex_1()
-                .p_2()
-                .gap_1()
-                .when(self.file_searching && self.file_results.is_empty(), |this| {
-                    this.child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .text_xs()
-                            .text_color(muted_fg)
-                            .child("正在搜索本地索引..."),
-                    )
-                })
-                .when_some(self.file_error.as_ref(), |this, error| {
-                    this.child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .bg(muted_bg)
-                            .border_1()
-                            .border_color(border)
-                            .text_xs()
-                            .text_color(muted_fg)
-                            .child(error.clone()),
-                    )
-                })
-                .when(
-                    !self.file_searching
-                        && self.file_error.is_none()
-                        && self.file_results.is_empty(),
-                    |this| {
-                        this.child(
-                            div()
-                                .px_2()
-                                .py_1()
-                                .text_xs()
-                                .text_color(muted_fg)
-                                .child("未找到匹配文件"),
-                        )
-                    },
-                )
-                .when(!self.file_results.is_empty(), |this| {
-                    this.child(
-                        h_flex()
-                            .w_full()
-                            .px_3()
-                            .py_1()
-                            .gap_3()
-                            .border_b_1()
-                            .border_color(border)
-                            .text_xs()
-                            .font_semibold()
-                            .text_color(muted_fg)
-                            .child(div().w(px(180.)).child("名称"))
-                            .child(div().flex_1().child("路径"))
-                            .child(div().w(px(86.)).child("大小"))
-                            .child(div().w(px(128.)).child("修改时间")),
-                    )
-                })
-                .when(!self.file_results.is_empty(), |this| {
-                    this.child(List::new(&self.file_list_state).flex_1())
-                })
-                .into_any_element(),
+        // 索引未就绪（等待 / 建索引 / 失败）时，整块内容区交给状态面板
+        if let Some(panel) = index_status_panel(
+            &self.file_status,
+            |_ev, _window, cx| {
+                // 拉起提权副本后退出当前实例，
+                // 否则两个实例会抢同一个托盘图标
+                if super::filesearch::relaunch_as_admin() {
+                    cx.quit();
+                }
+            },
+            cx.listener(|this, _ev, _window, cx| this.detect_file_search(cx)),
+            cx,
+        ) {
+            return panel;
         }
+
+        // 索引就绪：搜索进度、错误、空态与结果列表
+        v_flex()
+            .flex_1()
+            .min_w_0()
+            .p_2()
+            .gap_1()
+            .when(self.file_searching && self.file_results.is_empty(), |this| {
+                this.child(searching_row(cx))
+            })
+            .when_some(self.file_error.as_ref(), |this, error| {
+                this.child(Alert::error(
+                    "filesearch-error",
+                    SharedString::from(error.clone()),
+                ))
+            })
+            .when(
+                !self.file_searching
+                    && self.file_error.is_none()
+                    && self.file_results.is_empty(),
+                |this| this.child(no_results(cx)),
+            )
+            .when(!self.file_results.is_empty(), |this| {
+                this.child(result_header(cx))
+            })
+            .when(!self.file_results.is_empty(), |this| {
+                this.child(List::new(&self.file_list_state).flex_1())
+            })
+            .into_any_element()
     }
 }

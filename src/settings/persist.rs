@@ -1,4 +1,4 @@
-/// 设置持久化：读写 settings.json
+//! 设置持久化：读写 settings.json
 
 use serde::{Deserialize, Serialize};
 

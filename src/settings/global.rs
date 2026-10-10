@@ -1,4 +1,4 @@
-/// 全局运行时设置，存储在 GPUI 的 Global 中
+//! 全局运行时设置，存储在 GPUI 的 Global 中
 
 use gpui::*;
 

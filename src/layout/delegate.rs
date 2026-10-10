@@ -12,6 +12,7 @@ use crate::app_list::{
     load_or_discover_entries, save_entries,
     sort_entries_by_launch, AppEntry,
 };
+use crate::components::app_list_item::app_row;
 use crate::locale::t;
 use crate::utils::hide_window;
 
@@ -205,65 +206,12 @@ impl ListDelegate for LauncherDelegate {
             )
         };
         let selected = Some(ix) == self.selected_index;
-
         let icon = self.icon(launch_target.as_deref());
-
-        let muted_fg = cx.theme().muted_foreground;
-        let muted_bg = cx.theme().muted;
-
-        // 有图标就显示图标，否则回退到首字母色块
-        let leading = match icon {
-            Some(icon) => img(icon).w_7().h_7().flex_shrink_0().into_any_element(),
-            None => {
-                let first_char = name
-                    .chars()
-                    .next()
-                    .map(|c| c.to_ascii_uppercase())
-                    .unwrap_or('A')
-                    .to_string();
-                div()
-                    .w_7()
-                    .h_7()
-                    .rounded_md()
-                    .bg(cx.theme().accent)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_color(cx.theme().accent_foreground)
-                    .font_bold()
-                    .text_sm()
-                    .child(first_char)
-                    .into_any_element()
-            }
-        };
 
         Some(
             ListItem::new(ix.row)
                 .selected(selected)
-                .child(
-                    h_flex()
-                        .gap_3()
-                        .items_center()
-                        .px_3()
-                        .py_1()
-                        .child(leading)
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_sm()
-                                .child(name),
-                        )
-                        .child(
-                            div()
-                                .px_2()
-                                .py_1()
-                                .rounded_md()
-                                .bg(muted_bg)
-                                .text_xs()
-                                .text_color(muted_fg)
-                                .child(category),
-                        ),
-                ),
+                .child(app_row(icon, &name, &category, cx)),
         )
     }
 

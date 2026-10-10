@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod app_list;
+mod components;
 mod settings;
 mod layout;
 mod locale;

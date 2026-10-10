@@ -129,6 +129,12 @@ pub fn db_path() -> PathBuf {
     crate::utils::app_data_dir().join("applist.db")
 }
 
+/// 用户自定义程序的类别名。
+///
+/// [`upsert_custom_entry`] 用它标记亲手添加的条目；设置页据此把它们从
+/// 系统发现的条目里筛出来。两边引用同一个常量，改文案时不会漏改一处。
+pub const CUSTOM_APP_CATEGORY: &str = "自定义程序";
+
 // ---------- 回退数据（仅 debug 构建）----------
 
 #[cfg(debug_assertions)]
@@ -265,7 +271,7 @@ pub fn upsert_custom_entry(
     };
 
     let resolved_category = if category.trim().is_empty() {
-        "自定义程序".to_string()
+        CUSTOM_APP_CATEGORY.to_string()
     } else {
         category.trim().to_string()
     };

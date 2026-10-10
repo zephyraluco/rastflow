@@ -12,6 +12,18 @@ pub fn t(key: &str, cx: &App) -> &'static str {
     }
 }
 
+/// 建索引的进度文案：`正在扫描 C: 盘，已索引 1234 个文件`。
+///
+/// 数字与盘符插进句子里，语序随语言变化，所以单独成为一个函数，
+/// 而不是让调用方去拼 [`t`] 返回的片段。
+pub fn scanning_detail(disk: char, written: u64, cx: &App) -> String {
+    let lang = cx.global::<AppSettings>().language.clone();
+    match lang.as_ref() {
+        "en" => format!("Scanning {disk}: · {written} files indexed"),
+        _ => format!("正在扫描 {disk}: 盘，已索引 {written} 个文件"),
+    }
+}
+
 // ---------- 中文 ----------
 
 fn zh(key: &str) -> &'static str {
@@ -19,9 +31,29 @@ fn zh(key: &str) -> &'static str {
         // 启动器主界面
         "search.placeholder" => "搜索应用程序...",
         "search.empty"       => "没有找到匹配的应用程序",
-        "hint.select"        => "↑↓ 选择",
-        "hint.launch"        => "↵ 启动",
-        "hint.close"         => "Esc 关闭",
+        // 键帽由 Kbd 组件渲染，这里只放说明文字
+        "hint.select"        => "选择",
+        "hint.launch"        => "启动",
+        "hint.close"         => "关闭",
+        "settings.open"      => "设置",
+
+        // 文件搜索
+        "filesearch.mode"              => "文件搜索",
+        "filesearch.index_badge"       => "本地索引",
+        "filesearch.init"              => "正在初始化文件索引...",
+        "filesearch.indexing"          => "正在建立文件索引",
+        "filesearch.indexing.preparing" => "准备中...",
+        "filesearch.indexing.hint"     => "索引只需建立一次，之后启动即可直接搜索",
+        "filesearch.unavailable"       => "文件索引不可用",
+        "filesearch.needs_admin"       => "读取 NTFS 主文件表需要管理员权限",
+        "filesearch.elevate"           => "以管理员身份重启",
+        "filesearch.retry"             => "重试",
+        "filesearch.searching"         => "正在搜索本地索引...",
+        "filesearch.no_results"        => "未找到匹配文件",
+        "filesearch.column.name"       => "名称",
+        "filesearch.column.path"       => "路径",
+        "filesearch.column.size"       => "大小",
+        "filesearch.column.modified"   => "修改时间",
 
         // 设置 - 外观
         "page.appearance"            => "外观",
@@ -65,9 +97,29 @@ fn en(key: &str) -> &'static str {
         // Launcher
         "search.placeholder" => "Search apps...",
         "search.empty"       => "No matching apps found",
-        "hint.select"        => "↑↓ Select",
-        "hint.launch"        => "↵ Launch",
-        "hint.close"         => "Esc Close",
+        // Keys are rendered by the Kbd component; only the caption lives here.
+        "hint.select"        => "Select",
+        "hint.launch"        => "Launch",
+        "hint.close"         => "Close",
+        "settings.open"      => "Settings",
+
+        // File search
+        "filesearch.mode"              => "File search",
+        "filesearch.index_badge"       => "Local index",
+        "filesearch.init"              => "Initializing file index...",
+        "filesearch.indexing"          => "Building file index",
+        "filesearch.indexing.preparing" => "Preparing...",
+        "filesearch.indexing.hint"     => "The index is built once; later launches search instantly",
+        "filesearch.unavailable"       => "File index unavailable",
+        "filesearch.needs_admin"       => "Reading the NTFS master file table requires administrator privileges",
+        "filesearch.elevate"           => "Restart as Administrator",
+        "filesearch.retry"             => "Retry",
+        "filesearch.searching"         => "Searching local index...",
+        "filesearch.no_results"        => "No matching files found",
+        "filesearch.column.name"       => "Name",
+        "filesearch.column.path"       => "Path",
+        "filesearch.column.size"       => "Size",
+        "filesearch.column.modified"   => "Modified",
 
         // Settings - Appearance
         "page.appearance"            => "Appearance",
