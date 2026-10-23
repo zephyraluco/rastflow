@@ -7,15 +7,19 @@
 use std::mem::size_of;
 
 use windows::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, HANDLE, WAIT_OBJECT_0};
+use windows::Win32::Security::{
+    GetTokenInformation, IsWellKnownSid, TOKEN_QUERY, TOKEN_USER, TokenUser, WinLocalSystemSid,
+};
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentProcessId, GetProcessId, INFINITE, OpenProcess,
-    PROCESS_ACCESS_RIGHTS, TerminateProcess, WaitForSingleObject,
+    GetCurrentProcess, GetCurrentProcessId, GetExitCodeProcess, GetProcessId, INFINITE,
+    OpenProcess, OpenProcessToken, PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION,
+    TerminateProcess, WaitForSingleObject,
 };
 use windows::Win32::UI::Shell::{
     SEE_MASK_FLAG_NO_UI, SEE_MASK_NOCLOSEPROCESS, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW,
     ShellExecuteExW,
 };
-use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 use windows::core::PCWSTR;
 
 use super::super::{CoreError, Result};
@@ -47,6 +51,18 @@ unsafe impl Sync for ElevatedChild {}
 impl ElevatedChild {
     pub fn pid(&self) -> u32 {
         self.pid
+    }
+
+    /// 等它退出，返回退出码
+    pub fn wait(&self) -> Option<u32> {
+        let waited = unsafe { WaitForSingleObject(self.process, INFINITE) };
+        if waited != WAIT_OBJECT_0 {
+            return None;
+        }
+        let mut code = 0u32;
+        unsafe { GetExitCodeProcess(self.process, &mut code) }
+            .ok()
+            .map(|()| code)
     }
 
     pub fn kill(&self) {
@@ -82,7 +98,7 @@ pub fn spawn_elevated(parameters: &str) -> Result<ElevatedChild> {
         lpVerb: PCWSTR(verb.as_ptr()),
         lpFile: PCWSTR(file.as_ptr()),
         lpParameters: PCWSTR(params.as_ptr()),
-        nShow: SW_SHOWNORMAL.0,
+        nShow: SW_HIDE.0,
         ..Default::default()
     };
 
@@ -111,6 +127,21 @@ pub fn spawn_elevated(parameters: &str) -> Result<ElevatedChild> {
     })
 }
 
+/// 提权执行一次 `current_exe <flag>` 并等它结束，退出码非 0 视为失败。
+///
+/// 服务安装/卸载走这条路径：它必须**同步**完成，否则调用方接着查服务状态会
+/// 得到「还没装上」的错觉。
+pub fn run_elevated_and_wait(flag: &str) -> Result<()> {
+    let child = spawn_elevated(flag)?;
+    match child.wait() {
+        Some(0) => Ok(()),
+        Some(code) => Err(CoreError::Helper(format!(
+            "以管理员身份执行 {flag} 失败（退出码 {code}）"
+        ))),
+        None => Err(CoreError::Helper(format!("等待 {flag} 结束失败"))),
+    }
+}
+
 /// 子进程侧的守卫：父进程退出后立刻自杀。
 ///
 /// 子进程平时阻塞在管道读取或 USN 读取上，**没有**机会发现父进程已经不在了；
@@ -134,4 +165,52 @@ pub fn exit_with_parent(parent_pid: u32) {
                 }
             }
         });
+}
+
+/// 这个进程是不是以 `LocalSystem` 身份运行。
+///
+/// 用来识别「连上的管道对面到底是不是我们装的索引服务」：普通用户（包括管理员
+/// 之外的任何本地账户）都无法拿到 SYSTEM 令牌，所以这一条能挡住「先占坑再冒充」
+/// 的管道劫持。已经是管理员的进程本来就能做任何事，不在威胁模型内。
+pub fn is_system_process(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    unsafe {
+        let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return false;
+        };
+        let mut token = HANDLE::default();
+        let opened = OpenProcessToken(process, TOKEN_QUERY, &mut token).is_ok();
+        let _ = CloseHandle(process);
+        if !opened {
+            return false;
+        }
+
+        // 先问需要多大（TokenUser 的数据长度取决于 SID 长度）
+        let mut needed = 0u32;
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut needed);
+        if needed == 0 {
+            let _ = CloseHandle(token);
+            return false;
+        }
+        let mut buffer = vec![0u8; needed as usize];
+        let ok = GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buffer.as_mut_ptr() as *mut core::ffi::c_void),
+            needed,
+            &mut needed,
+        )
+        .is_ok();
+        let _ = CloseHandle(token);
+        if !ok {
+            return false;
+        }
+
+        // `TokenUser` 返回的是 TOKEN_USER，首字段是 SID_AND_ATTRIBUTES
+        let user = buffer.as_ptr() as *const TOKEN_USER;
+        let sid = (*user).User.Sid;
+        !sid.is_invalid() && IsWellKnownSid(sid, WinLocalSystemSid).as_bool()
+    }
 }

@@ -15,16 +15,22 @@ use super::index::{JournalMark, MftEntry};
 use super::monitor::MonitorEvent;
 use super::win::pipe::{self, PipeHandle};
 use super::win::process::{self, ElevatedChild};
+use super::win::service;
 use super::{CoreError, Result};
 
 /// 命令行开关：以「索引子进程」身份运行（同一个 exe，不需要额外的二进制）
 pub const HELPER_FLAG: &str = "--index-helper";
-
 /// 协议版本。字段一改就要加一，两边不一致时直接失败而不是读出垃圾。
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// 等子进程连上管道的上限。UAC 弹窗要用户点一下，给足时间。
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// 连常驻索引服务的超时。
+///
+/// 服务没在跑时 `CreateFileW` 会直接报「文件不存在」，所以这里主要是给
+/// 「服务刚启动、管道还没建好」留一点窗口，不必像 UAC 那样等一分钟。
+const SERVICE_CONNECT_TIMEOUT: Duration = Duration::from_millis(1500);
 
 // ---------- 消息类型 ----------
 
@@ -537,16 +543,51 @@ const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 
 // ---------- 主进程侧会话 ----------
 
-/// 一次索引子进程会话。`Drop` 会杀掉子进程（不留提权孤儿）。
+/// 一次索引会话。`Drop` 会礼貌地要求对端停下来；如果对端是一次性提权子进程，
+/// 还会兜底杀掉它（不留提权孤儿）。服务是长期存在的，**绝不能**杀。
 pub struct HelperSession {
     reader: PipeReader,
     writer: PipeWriter,
-    child: ElevatedChild,
+    /// 会话的另一端：`Some` = 我们拉起的一次性子进程；`None` = 常驻索引服务
+    child: Option<ElevatedChild>,
+    pid: u32,
 }
 
 impl HelperSession {
-    /// 拉起提权子进程、等服务端连上、完成握手。
+    /// 优先连常驻索引服务（零 UAC）；没有服务时回退到 `runas` 拉起一次性子进程。
     pub fn start(disks: &[char]) -> Result<Self> {
+        match Self::connect_service() {
+            Ok(session) => {
+                eprintln!(
+                    "[rastflow] 已连接索引服务（pid {}），无需要管理员权限",
+                    session.pid
+                );
+                return Ok(session);
+            }
+            Err(err) => {
+                eprintln!("[rastflow] 索引服务不可用（{err}），改用一次性的提权子进程");
+            }
+        }
+        Self::spawn_once(disks)
+    }
+
+    /// 连常驻服务。管道名是固定的，所以必须确认对面真是以 `LocalSystem` 运行的服务。
+    fn connect_service() -> Result<Self> {
+        let handle = PipeHandle::connect(service::PIPE_NAME, SERVICE_CONNECT_TIMEOUT)?;
+        let pid = handle
+            .server_pid()
+            .ok_or_else(|| CoreError::Helper("取不到索引服务的进程 id".to_string()))?;
+        if !process::is_system_process(pid) {
+            // 有人抢先把管道名占了：拒绝，而不是把文件名列表交给一个陌生进程
+            return Err(CoreError::Helper(format!(
+                "索引管道被非系统进程占用（pid {pid}）"
+            )));
+        }
+        Self::handshake(handle, None, pid)
+    }
+
+    /// 拉起一次性的提权子进程（没有安装服务时的兜底路径，会弹一次 UAC）。
+    fn spawn_once(disks: &[char]) -> Result<Self> {
         let name = pipe_name();
         let server = PipeHandle::create_server(&name)?;
 
@@ -567,43 +608,59 @@ impl HelperSession {
             )));
         }
 
-        let reader = PipeReader::new(Arc::clone(&server));
-        let writer = PipeWriter::new(server);
+        eprintln!(
+            "[rastflow] 索引子进程已就绪（pid {}），将索引盘：{}",
+            child.pid(),
+            disks.iter().collect::<String>()
+        );
+        let pid = child.pid();
+        Self::handshake(server, Some(child), pid)
+    }
+
+    fn handshake(
+        handle: Arc<PipeHandle>,
+        child: Option<ElevatedChild>,
+        pid: u32,
+    ) -> Result<Self> {
+        let reader = PipeReader::new(Arc::clone(&handle));
+        let writer = PipeWriter::new(handle);
 
         let version = match reader.recv()? {
             Some(Message::Ready { version }) => version,
             Some(other) => {
                 return Err(CoreError::Helper(format!("握手消息不对：{other:?}")));
             }
-            None => return Err(CoreError::Helper("子进程在握手前就退出了".to_string())),
+            None => return Err(CoreError::Helper("对端在握手前就退出了".to_string())),
         };
         if version != PROTOCOL_VERSION {
             return Err(CoreError::Helper(format!(
-                "协议版本不一致（子进程 {version}，主进程 {PROTOCOL_VERSION}）"
+                "协议版本不一致（对端 {version}，主进程 {PROTOCOL_VERSION}）"
             )));
         }
 
-        eprintln!(
-            "[rastflow] 索引子进程已就绪（pid {}），将索引盘：{}",
-            child.pid(),
-            disks.iter().collect::<String>()
-        );
         Ok(Self {
             reader,
             writer,
             child,
+            pid,
         })
     }
 
+    /// 会话对端的进程 id（服务会话时是服务的 pid）
     pub fn child_pid(&self) -> u32 {
-        self.child.pid()
+        self.pid
+    }
+
+    /// 是不是在跟常驻服务说话
+    pub fn is_service(&self) -> bool {
+        self.child.is_none()
     }
 
     pub fn send(&self, request: &Request) -> Result<()> {
         self.writer.send_request(request)
     }
 
-    /// 收一条消息；`None` 表示子进程已退出
+    /// 收一条消息；`None` 表示对端已退出
     pub fn recv(&self) -> Result<Option<Message>> {
         self.reader.recv()
     }
@@ -611,11 +668,40 @@ impl HelperSession {
 
 impl Drop for HelperSession {
     fn drop(&mut self) {
-        // 先好好说一声，让子进程停掉跟随线程并退出；随后 `ElevatedChild` 的 Drop
-        // 会兜底杀掉它（子进程此刻多半阻塞在 USN 读取上，等不到礼貌退出）
+        // 先好好说一声，让对端停掉跟随线程并结束会话。
+        // 服务会回到 accept 继续等下一个客户端，所以这里不能杀它。
         let _ = self.send(&Request::Stop);
-        std::thread::sleep(Duration::from_millis(50));
+        if self.child.is_some() {
+            // 一次性子进程多半正阻塞在 USN 读取上，等不到礼貌退出；
+            // `ElevatedChild` 的 Drop 会兜底杀掉它
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
+}
+
+// ---------- 服务管理（供设置/状态面板调用） ----------
+
+/// 安装并启动服务。**需要管理员**：调用方应当先提权（见 [`run_service_installer`]）。
+pub fn install_service() -> Result<()> {
+    service::install()
+}
+
+/// 停止并删除服务。**需要管理员**。
+pub fn uninstall_service() -> Result<()> {
+    service::uninstall()
+}
+
+/// 以管理员身份执行一次 `--install-service` / `--uninstall-service`。
+///
+/// 这是**唯一**会弹 UAC 的地方，而且只在用户主动点「安装索引服务」时发生。
+pub fn run_service_installer(install: bool) -> Result<()> {
+    let flag = if install {
+        service::INSTALL_FLAG
+    } else {
+        service::UNINSTALL_FLAG
+    };
+    // 用 WaitForSingleObject 等它跑完，这样返回时状态查询就是准确的
+    process::run_elevated_and_wait(flag)
 }
 
 /// `\\.\pipe\rastflow-index-<pid>-<熵>`
@@ -754,6 +840,44 @@ mod tests {
         assert!(first.starts_with(r"\\.\pipe\rastflow-index-"));
         assert!(first.contains(&process::current_pid().to_string()));
         assert_ne!(first, second, "两次会话不能共用一个管道名");
+    }
+
+    /// 真的装一遍服务、连上它、再卸掉。
+    ///
+    /// ⚠️ 需要**管理员**，而且会**真的修改系统**（注册后立即删除一个 Windows 服务）。
+    /// 手动跑：
+    ///
+    /// ```powershell
+    /// cargo test --bin rastflow service_install -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "需要管理员权限，会真的注册/删除 Windows 服务"]
+    fn service_install_roundtrip() {
+        // 起点必须是「没装」，否则测不出安装本身
+        if service::state().is_running() {
+            eprintln!("索引服务已在运行，先跳过（请先卸载再跑）");
+            return;
+        }
+
+        install_service().expect("安装服务失败（多半不是管理员）");
+        assert!(
+            service::wait_until_running(Duration::from_secs(15)),
+            "服务应当进入 Running"
+        );
+
+        // 服务在跑，主进程连它不需要任何提权
+        let session = HelperSession::start(&[]).expect("应当能连上索引服务");
+        assert!(session.is_service(), "应当走服务而不是一次性子进程");
+        drop(session);
+
+        uninstall_service().expect("卸载服务失败");
+        assert!(
+            matches!(
+                service::state(),
+                crate::search::win::service::ServiceState::NotInstalled
+            ),
+            "卸载后应当查不到服务"
+        );
     }
 
     /// 真的建一对命名管道，把一条大消息（远超单次 `ReadFile` 的返回量）送过去。

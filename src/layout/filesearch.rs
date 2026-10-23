@@ -13,15 +13,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use windows::Win32::UI::Shell::ShellExecuteW;
-use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-use windows::core::PCWSTR;
-
 use crate::search::engine::{CoreConfig, Engine, ScanStats};
-use crate::search::helper::{HelperSession, Message, Request};
+use crate::search::helper::{self, HelperSession, Message, Request};
 use crate::search::index::JournalMark;
 use crate::search::matcher::SearchQuery;
 use crate::search::monitor::MonitorEvent;
+use crate::search::win::service;
 use crate::utils::app_data_dir;
 
 /// 搜索超时：超过就返回已找到的部分（索引大、关键字冷门时可能扫不完）
@@ -36,6 +33,9 @@ const RESULT_LIMIT: usize = 200;
 /// 用计数而不是定时器：泵线程只会在收到消息时醒，没必要为了查表再起一个心跳。
 /// 没来得及落的变更不会丢 —— 下次启动会从更早的位点重放回来。
 const SNAPSHOT_EVERY: u64 = 2000;
+
+/// 装完服务后等它真正进入 `Running` 的上限
+const SERVICE_START_TIMEOUT: Duration = Duration::from_secs(15);
 
 // ---------- 对外类型 ----------
 
@@ -98,14 +98,41 @@ impl SearchError {
 // ---------- 全局状态 ----------
 
 struct Inner {
-    /// 由引导线程填入；填好之前 `search` 只会返回 `NotReady`
-    engine: OnceLock<Arc<Engine>>,
+    /// 由引导线程填入；填好之前 `search` 只会返回 `NotReady`。
+    ///
+    /// 用 `Mutex<Option<..>>` 而不是 `OnceLock`：装完索引服务要能重新引导一次。
+    engine: Mutex<Option<Arc<Engine>>>,
     status: Mutex<SearchStatus>,
     /// 上一次搜索的取消句柄：新的搜索到来时先把旧的取消掉
     last_cancel: Mutex<Option<Arc<AtomicBool>>>,
+    /// 防止并发引导（启动 / 重试 / 装完服务）
+    bootstrapping: AtomicBool,
 }
 
 impl Inner {
+    fn new() -> Self {
+        Self {
+            engine: Mutex::new(None),
+            status: Mutex::new(SearchStatus::Uninitialized),
+            last_cancel: Mutex::new(None),
+            bootstrapping: AtomicBool::new(false),
+        }
+    }
+
+    fn engine(&self) -> Option<Arc<Engine>> {
+        self.engine
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn set_engine(&self, engine: Arc<Engine>) {
+        *self
+            .engine
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(engine);
+    }
+
     fn status(&self) -> SearchStatus {
         self.status
             .lock()
@@ -142,34 +169,47 @@ pub fn index_dir() -> PathBuf {
 
 /// 启动文件搜索（幂等）。
 ///
-/// 第一次调用会开一条引导线程：打开索引 → 拉起提权索引子进程 → 起泵线程。
+/// 第一次调用会开一条引导线程：打开索引 → 连索引服务（没有则拉起一次性子进程）→ 起泵线程。
 /// 之后调用只做状态查询。初始化与建库进度请轮询 [`status`]。
 pub fn start() {
     let inner = STATE.get_or_init(|| {
-        let inner = Arc::new(Inner {
-            engine: OnceLock::new(),
-            status: Mutex::new(SearchStatus::Uninitialized),
-            last_cancel: Mutex::new(None),
-        });
-
-        let bootstrap = Arc::clone(&inner);
-        // 起不来也不影响后续调用：状态会一直是 Uninitialized，搜索会报 NotReady
-        let _ = std::thread::Builder::new()
-            .name("rastflow-index-bootstrap".to_string())
-            .spawn(move || {
-                if let Err(err) = bootstrap_engine(&bootstrap) {
-                    eprintln!("[rastflow] 文件索引初始化失败：{err}");
-                    bootstrap.set_status(SearchStatus::Unavailable {
-                        reason: err.to_string(),
-                        needs_admin: needs_admin_hint(&err),
-                    });
-                }
-            });
-
+        let inner = Arc::new(Inner::new());
+        bootstrap(Arc::clone(&inner));
         inner
     });
 
     let _ = inner; // 状态由 status() 读取
+}
+
+/// 跑一次引导（幂等）。装完索引服务后也走这里。
+fn bootstrap(inner: Arc<Inner>) {
+    if inner.bootstrapping.swap(true, Ordering::SeqCst) {
+        return; // 已经有一条在跑
+    }
+    // 起不来也不影响后续调用：搜索会报 NotReady / Unavailable
+    let worker = Arc::clone(&inner);
+    let spawned = std::thread::Builder::new()
+        .name("rastflow-index-bootstrap".to_string())
+        .spawn(move || {
+            // 重试时先把上一轮的失败态清掉，否则界面会一直停在旧错误上
+            if matches!(
+                worker.status(),
+                SearchStatus::Unavailable { .. } | SearchStatus::Uninitialized
+            ) {
+                worker.set_status(SearchStatus::Uninitialized);
+            }
+            if let Err(err) = bootstrap_engine(&worker) {
+                eprintln!("[rastflow] 文件索引初始化失败：{err}");
+                worker.set_status(SearchStatus::Unavailable {
+                    reason: err.to_string(),
+                    needs_admin: needs_admin_hint(&err),
+                });
+            }
+            worker.bootstrapping.store(false, Ordering::SeqCst);
+        });
+    if spawned.is_err() {
+        inner.bootstrapping.store(false, Ordering::SeqCst);
+    }
 }
 
 pub fn status() -> SearchStatus {
@@ -179,52 +219,40 @@ pub fn status() -> SearchStatus {
     }
 }
 
-/// 以管理员身份重新启动自己。成功返回 `true`，调用方随后应退出当前实例。
+/// 以管理员身份安装**索引服务**，装完自动重新引导。
 ///
-/// 现在索引不再要求主进程提权（子进程自己会提权），这个入口只用于「子进程被系统
-/// 拦住、用户想手动以管理员身份重试」这类罕见情况。
-pub fn relaunch_as_admin() -> bool {
-    let Ok(exe) = std::env::current_exe() else {
-        return false;
+/// 这是整个应用里唯一会弹 UAC 的操作，而且只在用户主动点「安装索引服务」时发生。
+/// 装好之后每次启动都不再提权 —— 这就是 Windows 服务的价值所在。
+///
+/// 本函数立刻返回：提权与等待都在后台线程里做，界面靠轮询 [`status`] 看结果。
+pub fn install_index_service() {
+    let Some(inner) = STATE.get().cloned() else {
+        return;
     };
-    // 把原始参数带上，避免重启后丢掉命令行开关
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let params = if args.is_empty() {
-        None
-    } else {
-        // ShellExecuteW 要的是整条命令行字符串，含空格的参数需要自己加引号
-        Some(
-            args.iter()
-                .map(|arg| {
-                    if arg.contains(' ') {
-                        format!("\"{arg}\"")
-                    } else {
-                        arg.clone()
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(" "),
-        )
-    };
-
-    let operation = wide("runas");
-    let file = wide(&exe.to_string_lossy());
-    let parameters = params.as_ref().map(|value| wide(value));
-
-    unsafe {
-        let result = ShellExecuteW(
-            None,
-            PCWSTR(operation.as_ptr()),
-            PCWSTR(file.as_ptr()),
-            parameters
-                .as_ref()
-                .map(|value| PCWSTR(value.as_ptr()))
-                .unwrap_or(PCWSTR::null()),
-            PCWSTR::null(),
-            SW_SHOWNORMAL,
-        );
-        // 返回值 > 32 才算成功（ShellExecuteW 的历史约定）
-        result.0 as usize > 32
+    // 服务已经在跑（比如上次装过、只是这轮引导失败）：不用再弹 UAC，直接重试
+    if service::state().is_running() {
+        bootstrap(inner);
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("rastflow-service-install".to_string())
+        .spawn(move || {
+            match helper::run_service_installer(true) {
+                // 服务刚注册完可能还在 start-pending：等它真正跑起来再连，
+                // 否则会白走一次「管道不存在」的兜底路径
+                Ok(()) if service::wait_until_running(SERVICE_START_TIMEOUT) => {
+                    eprintln!("[rastflow] 索引服务已安装并启动");
+                    bootstrap(inner);
+                }
+                Ok(()) => eprintln!("[rastflow] 索引服务已安装，但没有在 {SERVICE_START_TIMEOUT:?} 内启动"),
+                Err(err) => {
+                    // 用户点了「否」或提权被策略禁止：状态保持不变，可以再点一次
+                    eprintln!("[rastflow] 安装索引服务失败：{err}");
+                }
+            }
+        });
+    if let Err(err) = spawned {
+        eprintln!("[rastflow] 无法启动安装线程：{err}");
     }
 }
 
@@ -248,11 +276,7 @@ pub fn search(query: &str) -> Result<Vec<FileResult>, SearchError> {
     if query.is_empty() {
         return Err(SearchError::InvalidQuery);
     }
-    let engine = inner
-        .engine
-        .get()
-        .cloned()
-        .ok_or(SearchError::NotReady)?;
+    let engine = inner.engine().ok_or(SearchError::NotReady)?;
 
     // 新搜索到来时取消上一次，避免上一轮的扫描继续白占 CPU
     let session = engine.search(SearchQuery::parse(query));
@@ -352,7 +376,7 @@ fn plan_start(indexed: bool, disks: &[char], marked: &HashSet<char>) -> StartPla
 fn bootstrap_engine(inner: &Arc<Inner>) -> crate::search::Result<()> {
     let engine = Arc::new(Engine::open(CoreConfig::new(index_dir()))?);
     // 引擎先装好：即使最终状态不可用，搜索侧的报错也能更具体
-    let _ = inner.engine.set(Arc::clone(&engine));
+    inner.set_engine(Arc::clone(&engine));
 
     if engine.disks().is_empty() {
         inner.set_status(SearchStatus::Unavailable {
@@ -423,7 +447,12 @@ fn run_pump(inner: Arc<Inner>, engine: Arc<Engine>, session: HelperSession) {
         written: 0,
     });
     eprintln!(
-        "[rastflow] 索引子进程（pid {}）：{:?}",
+        "[rastflow] 索引会话：{}（pid {}）：{:?}",
+        if session.is_service() {
+            "索引服务"
+        } else {
+            "一次性提权子进程"
+        },
         session.child_pid(),
         first
     );
@@ -636,10 +665,6 @@ fn needs_admin_hint(err: &crate::search::CoreError) -> bool {
     }
 }
 
-fn wide(value: &str) -> Vec<u16> {
-    value.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
 // ---------- 展示格式化 ----------
 
 fn format_size(bytes: u64) -> String {
@@ -843,11 +868,5 @@ mod tests {
             written: 1
         }
         .needs_admin());
-    }
-
-    #[test]
-    fn wide_appends_nul_terminator() {
-        let value = wide("ab");
-        assert_eq!(value, vec![97, 98, 0]);
     }
 }

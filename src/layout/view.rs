@@ -714,12 +714,10 @@ impl LauncherView {
         // 索引未就绪（等待 / 建索引 / 失败）时，整块内容区交给状态面板
         if let Some(panel) = index_status_panel(
             &self.file_status,
-            |_ev, _window, cx| {
-                // 拉起提权副本后退出当前实例，
-                // 否则两个实例会抢同一个托盘图标
-                if super::filesearch::relaunch_as_admin() {
-                    cx.quit();
-                }
+            |_ev, _window, _cx| {
+                // 装一次索引服务，之后每次启动都不再弹 UAC。
+                // 安装跑在后台线程里（要等提权进程结束），界面靠状态轮询看到结果。
+                super::filesearch::install_index_service();
             },
             cx.listener(|this, _ev, _window, cx| this.detect_file_search(cx)),
             cx,

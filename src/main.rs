@@ -100,7 +100,35 @@ pub const WIN_H: f32 = 520.0;
 // ---------- 入口 ----------
 
 fn main() {
-    // 索引子进程：只做 MFT/USN，绝不能初始化 GPUI（它是个无窗口的小进程）
+    // 索引服务：由 SCM 拉起，只做 MFT/USN。绝不能初始化 GPUI。
+    if search::helper_main::is_service_invocation() {
+        std::process::exit(match search::win::service::run_dispatcher() {
+            Ok(()) => 0,
+            Err(err) => {
+                eprintln!("[rastflow-index-service] {err}");
+                1
+            }
+        });
+    }
+
+    // 安装/卸载索引服务：由主进程提权调用一次（这是唯一会弹 UAC 的操作）。
+    // 注意 stdout/stderr 无处可去，成败只能靠退出码告诉调用方。
+    if let Some(install) = search::helper_main::service_admin_action() {
+        let result = if install {
+            search::helper::install_service()
+        } else {
+            search::helper::uninstall_service()
+        };
+        std::process::exit(match result {
+            Ok(()) => 0,
+            Err(err) => {
+                eprintln!("[rastflow] 服务操作失败：{err}");
+                1
+            }
+        });
+    }
+
+    // 一次性索引子进程（没有安装服务时的兜底）：只做 MFT/USN，绝不能初始化 GPUI。
     if search::helper_main::is_invocation() {
         std::process::exit(search::helper_main::run());
     }

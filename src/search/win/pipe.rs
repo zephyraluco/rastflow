@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
-    GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_NO_DATA, ERROR_PIPE_BUSY,
+    ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_MODE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile,
@@ -21,8 +21,8 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
-    NAMED_PIPE_MODE, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
-    WaitNamedPipeW,
+    GetNamedPipeServerProcessId, NAMED_PIPE_MODE, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+    PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW,
 };
 use windows::core::PCWSTR;
 
@@ -56,19 +56,30 @@ unsafe impl Send for PipeHandle {}
 unsafe impl Sync for PipeHandle {}
 
 impl PipeHandle {
-    /// 建服务端（主进程侧）。调用方随后用 [`accept`] 等子进程连上来。
+    /// 建服务端（一次性提权子进程用）：只允许一个实例。
     pub fn create_server(name: &str) -> Result<Arc<Self>> {
+        Self::create_server_with(name, 1)
+    }
+
+    /// 建服务端（常驻索引服务用）。
+    ///
+    /// 实例数取上限而不是 1：服务每次 accept 超时后都会丢弃旧实例重新建，
+    /// 万一前一个实例还卡在内核里，「已存在同名实例」会让新实例建不出来。
+    pub fn create_server_multi(name: &str) -> Result<Arc<Self>> {
+        Self::create_server_with(name, PIPE_UNLIMITED_INSTANCES)
+    }
+
+    fn create_server_with(name: &str, instances: u32) -> Result<Arc<Self>> {
         let wide = to_wide(name);
         let mode = NAMED_PIPE_MODE(
             PIPE_TYPE_BYTE.0 | PIPE_READMODE_BYTE.0 | PIPE_WAIT.0 | PIPE_REJECT_REMOTE_CLIENTS.0,
         );
-        // 只用一条实例：一次会话只需要一对进程
         let handle = unsafe {
             CreateNamedPipeW(
                 PCWSTR(wide.as_ptr()),
                 PIPE_ACCESS_DUPLEX,
                 mode,
-                1,
+                instances,
                 PIPE_BUFFER_LEN,
                 PIPE_BUFFER_LEN,
                 0,
@@ -111,13 +122,18 @@ impl PipeHandle {
                     }));
                 }
                 Err(err) => {
-                    if win32_code(&err) != ERROR_PIPE_BUSY.0 || Instant::now() >= deadline {
+                    let code = win32_code(&err);
+                    // `PIPE_BUSY`：实例都占满了；`FILE_NOT_FOUND`：管道还没被建出来
+                    // （服务刚启动 / 主进程刚拉起子进程）。两种都值得再等一会儿。
+                    let retry = code == ERROR_PIPE_BUSY.0 || code == ERROR_FILE_NOT_FOUND.0;
+                    if !retry || Instant::now() >= deadline {
                         return Err(CoreError::win32("CreateFileW(索引管道)", err));
                     }
-                    // 实例被占满：等一会儿再试
+                    // 等一会儿再试
                     unsafe {
                         let _ = WaitNamedPipeW(PCWSTR(wide.as_ptr()), CONNECT_POLL_MS);
                     }
+                    std::thread::sleep(Duration::from_millis(20));
                 }
             }
         }
@@ -127,6 +143,14 @@ impl PipeHandle {
     pub fn client_pid(&self) -> Option<u32> {
         let mut pid = 0u32;
         unsafe { GetNamedPipeClientProcessId(self.handle, &mut pid) }
+            .ok()
+            .map(|()| pid)
+    }
+
+    /// 对面的服务端进程 id（客户端侧用，确认它不是别人冒充的管道）
+    pub fn server_pid(&self) -> Option<u32> {
+        let mut pid = 0u32;
+        unsafe { GetNamedPipeServerProcessId(self.handle, &mut pid) }
             .ok()
             .map(|()| pid)
     }

@@ -19,40 +19,71 @@
 ### 固有代价：需要管理员，但只在小进程里
 
 `CreateFileW(r"\\.\C:")` 请求的是 `GENERIC_READ | GENERIC_WRITE`，所以枚举 MFT 与读
-USN 日志都要管理员。**这个代价被隔离在一个只做 MFT/USN 的子进程里**（同一个 exe +
-`--index-helper`，用 `runas` 拉起）：
+USN 日志都要管理员。**这个代价被隔离在一个只做 MFT/USN 的进程里**：
 
 ```mermaid
 flowchart LR
     subgraph M["主进程（普通用户，常驻托盘）"]
-        E[Engine: 索引 + 快照 + 搜索]
-        P[索引泵线程]
+        E["Engine: 索引 + 快照 + 搜索"]
+        P["索引泵线程"]
         E --- P
     end
-    subgraph H["索引子进程（提权）"]
-        V[Volume / MFT / USN]
+    subgraph S["索引服务（LocalSystem，随系统启动）"]
+        L["accept 循环"]
+        S1["会话：Volume / MFT / USN"]
+        L --> S1
     end
-    H -- "记录 / 事件（命名管道）" --> P
-    P -- "Scan / CatchUp / Monitor / Stop" --> H
+    subgraph H["一次性子进程（未装服务时的兜底，runas）"]
+        V["Volume / MFT / USN"]
+    end
+    S1 -- "记录 / 事件（命名管道）" --> P
+    V -- "记录 / 事件（命名管道）" --> P
+    P -- "Scan / CatchUp / Monitor / Stop" --> S1
+    P -- "同上" --> V
 ```
 
-- 子进程**不持有索引**，只输出「某个盘上哪个 FRN 叫什么、父目录是谁」；
+- 两端都**不持有索引**，只输出「某个盘上哪个 FRN 叫什么、父目录是谁」；
 - 索引、快照、匹配、排序全在主进程，所以搜索延迟与提权无关；
 - 提权失败不是死路：已有索引照常可搜，只是拿不到离线补课与实时增量。
+
+### 两种后端：服务优先，`runas` 兜底
+
+| | 索引服务（推荐） | 一次性子进程 |
+| --- | --- | --- |
+| 身份 | Windows 服务，`LocalSystem` | `runas` 拉起的提权进程 |
+| UAC | **只在安装那一次** | **每次启动都要** |
+| 随系统启动 | 是（`SERVICE_AUTO_START`） | 否 |
+| 进程生命周期 | 常驻；空闲时约 1 MB 内存 | 跟主进程同生共死 |
+| 谁建管道 | 服务（固定名） | 主进程（随机名） |
+| 连接校验 | 校验服务端进程是 `LocalSystem` | 校验客户端 PID = 刚拉起的子进程 |
+
+`HelperSession::start` 先试服务、连不上再回退。两种后端跑的是**同一套协议**
+（`Scan` / `CatchUp` / `Monitor` / `Stop`）与同一个会话函数，所以行为一致。
+
+⚠️ 服务的管道名是固定的（`\\.\pipe\rastflow-index-service`），这意味着「先占坑」
+是可能的。所以客户端连上之后会调 `GetNamedPipeServerProcessId` 再看那个进程的令牌
+是不是 `LocalSystem`，不是就拒绝 —— 而不是把全盘文件名交给一个陌生进程。
+
+⚠️ 服务会话期间 `sc stop` 不会立刻生效：服务主线程正阻塞在等客户端的 `ReadFile` 上。
+控制处理器因此会 `CancelSynchronousIo` 打断它（accept 阶段另有 2 秒轮询兜底）。
+
+**安全边界（与 Everything 同级）**：服务只返回文件名列表，不读文件内容，也不能用来
+访问文件本身。任何本地用户都能连上它拿到文件名 —— 但那些用户本来就能遍历磁盘，
+只是慢。已经拿到管理员权限的进程能做的比这更多，不在威胁模型内。
 
 ## 2. 模块划分
 
 | 模块 | 职责 | 进程 |
 | --- | --- | --- |
-| `win/` | 全部 Win32 交互：卷句柄与 IOCTL、USN 记录与 FRN、盘类型、已知文件夹、命名管道、提权 | 两侧 |
+| `win/` | 全部 Win32 交互：卷句柄与 IOCTL、USN 记录与 FRN、盘类型、已知文件夹、命名管道、提权、服务 | 两侧 |
 | `pathutil` | 路径纯函数与忽略规则 | 主 |
 | `priority` | 后缀优先级表 | 主 |
 | `index` | 内存索引、快照编解码、MFT 记录结构与扫描汇 | 主（`MftEntry`/`scan_disk` 两侧共用） |
 | `matcher` | 查询解析与匹配规则 | 主 |
 | `engine` | 索引生命周期与搜索调度 | 主 |
-| `helper` | 协议编解码 + 拉起子进程 + 会话 | 主 |
-| `helper_main` | 子进程：扫描、重放、实时跟随 | 子 |
-| `monitor` | 日志重放与跟随，按批产出事件 | 子 |
+| `helper` | 协议编解码 + 连接服务/拉起子进程 + 会话 | 主 |
+| `helper_main` | 扫描、重放、实时跟随；服务模式下的 accept 循环也在这里 | 子/服务 |
+| `monitor` | 日志重放与跟随，按批产出事件 | 子/服务 |
 
 **`unsafe` 只允许出现在 `win/` 里**，其余模块是纯逻辑或纯数据结构，因此可以脱离真机测试。
 
@@ -409,12 +440,15 @@ stateDiagram-v2
 | `ROOT_MFT_INDEX` | 5 | 每个盘的根记录号 |
 | `PROTOCOL_VERSION` | 1 | 管道协议版本（字段一变就加一） |
 
-子进程侧（`search/helper_main.rs`）：
+子进程 / 服务侧（`search/helper_main.rs`、`search/win/service.rs`）：
 
 | 常量 | 值 | 作用 |
 | --- | --- | --- |
 | `RECORD_BATCH` | 2048 | 一批往主进程发多少条扫描记录 |
-| `CONNECT_TIMEOUT` | 10 s | 连接主进程管道的超时 |
+| `CONNECT_TIMEOUT` | 10 s | 一次性子进程连接主进程管道的超时 |
+| `ACCEPT_POLL` | 2 s | 服务 accept 的轮询周期（用来响应 `sc stop`） |
+| `SERVICE_NAME` | `rastflow-index` | SCM 里的服务名（也是注册表键名） |
+| `PIPE_NAME` | `\\.\pipe\rastflow-index-service` | 服务的固定管道名 |
 
 集成层（`layout/filesearch.rs`）：
 
@@ -438,13 +472,16 @@ stateDiagram-v2
 | 快照 | `snapshot_roundtrip`、`corrupt_snapshot_is_treated_as_absent`、`snapshot_drops_deleted_entries_and_compacts_names`、`snapshot_trims_lookup_table_tail`、`lookup_table_middle_holes_are_written_as_is`、`snapshot_roundtrip_keeps_hard_links` |
 | 维护 | `orphans_are_pruned`、`compact_names_reclaims_garbage`、`ignore_rules_filter_by_path` |
 | 搜索调度 | `results_are_capped_by_limit`、`results_are_deduped_and_stable`、`lazy_delete_removes_records_that_no_longer_exist`、`path_exists_tells_found_from_missing`、`path_exists_follows_long_paths_instead_of_reporting_missing`、`priority_tiers_put_directories_last`、`priority_folder_files_found_without_index`、`cancelled_session_finishes_soon`、`empty_and_oversized_queries_scan_nothing` |
-| 子进程协议 | `every_message_survives_a_roundtrip`、`every_request_survives_a_roundtrip`、`garbage_payload_is_rejected`、`frames_carry_their_length`、`pipe_name_is_unique_and_current_process`、`pipe_carries_a_large_batch_between_threads`、`accept_gives_up_when_nobody_connects` |
+| 子进程协议 | `every_message_survives_a_roundtrip`、`every_request_survives_a_roundtrip`、`garbage_payload_is_rejected`、`frames_carry_their_length`、`pipe_name_is_unique_and_current_process`、`pipe_carries_a_large_batch_between_threads`、`accept_gives_up_when_nobody_connects`、`service_loop_serves_rounds_and_stops` |
+| 服务 | `service_name_is_stable`、`pipe_name_is_a_local_pipe`、`state_probe_does_not_panic`、`close_of_unknown_service_is_reported_as_missing`、`service_install_roundtrip`（`#[ignore]`） |
 | 启动策略 | `fresh_install_scans`、`index_with_all_marks_only_catches_up`、`a_disk_without_mark_forces_a_rescan`、`no_disks_never_catches_up` |
 | 增量 | `monitor_events_land_in_index_and_can_be_removed`、`hard_linked_file_is_searchable_under_every_name`、`renaming_directory_updates_all_child_paths`、`event_with_unknown_parent_is_rejected`、`stale_entries_of_unused_disks_are_dropped_on_open` |
 
 需要真机或大量资源的用例标了 `#[ignore]`：
 
 ```bash
+# 真的装一遍索引服务，连上它，再卸掉（需要管理员，会修改系统）
+cargo test --bin rastflow service_install -- --ignored --nocapture
 # 真实规模下的搜索性能（120 万条）
 cargo test --release --bin rastflow benchmark_search_at_real_scale -- --ignored --nocapture
 # 真实 NTFS 卷上的建库与增量（需管理员）

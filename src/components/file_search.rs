@@ -26,7 +26,7 @@ const MODIFIED_COL: f32 = 128.;
 /// 索引未就绪时的状态面板。
 ///
 /// - `Uninitialized` / `Indexing`：等待或建索引进度；
-/// - `Unavailable`：失败原因；若属于需要管理员权限，额外给出提权按钮；
+/// - `Unavailable`：失败原因；若属于需要管理员权限，额外给出「安装索引服务」按钮；
 /// - `Ready`：返回 `None`，由调用方接管结果列表。
 pub fn index_status_panel(
     status: &SearchStatus,
@@ -204,7 +204,7 @@ fn busy_panel(title: String, detail: Vec<String>, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-/// 失败状态：警示图标 + 标题 + 原因 + 提权 / 重试操作。
+/// 失败状态：警示图标 + 标题 + 原因 + 安装服务 / 重试操作。
 fn unavailable_panel(
     reason: &str,
     needs_admin: bool,

@@ -2,7 +2,8 @@
 //!
 //! `volume` 管卷句柄与 USN / MFT 的 IOCTL，`usn` 解析 USN 记录与 FRN（纯字节，不调 API），
 //! `disk` 判断盘类型，`known_folder` 取已知文件夹。
-//! `pipe` 是与提权索引子进程之间的命名管道，`process` 管提权与子进程生命周期。
+//! `pipe` 是与提权索引子进程之间的命名管道，`process` 管提权与子进程生命周期，
+//! `service` 把索引子进程做成常驻服务（免 UAC）。
 //!
 //! 本文件放宽字符串转换、线程 id、取消同步 IO、路径存在性判断。
 
@@ -10,6 +11,7 @@ pub mod disk;
 pub mod known_folder;
 pub mod pipe;
 pub mod process;
+pub mod service;
 pub mod usn;
 pub mod volume;
 
