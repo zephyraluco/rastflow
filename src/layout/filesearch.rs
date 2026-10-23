@@ -281,10 +281,10 @@ pub fn search(query: &str) -> Result<Vec<FileResult>, SearchError> {
     // 新搜索到来时取消上一次，避免上一轮的扫描继续白占 CPU
     let session = engine.search(SearchQuery::parse(query));
     let cancel = session.cancel_handle();
-    if let Ok(mut previous) = inner.last_cancel.lock() {
-        if let Some(old) = previous.replace(cancel) {
-            old.store(true, Ordering::Relaxed);
-        }
+    if let Ok(mut previous) = inner.last_cancel.lock()
+        && let Some(old) = previous.replace(cancel)
+    {
+        old.store(true, Ordering::Relaxed);
     }
 
     session.wait(SEARCH_TIMEOUT);

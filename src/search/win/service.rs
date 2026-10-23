@@ -56,6 +56,15 @@ pub const UNINSTALL_FLAG: &str = "--uninstall-service";
 /// `LocalSystem`（见 [`super::process::is_system_process`]）。
 pub const PIPE_NAME: &str = r"\\.\pipe\rastflow-index-service";
 
+/// 升级/重装时等旧服务停下来的上限。
+///
+/// 服务可能正在跑一次全量 MFT 扫描（几十秒），控制命令要等扫描结束才生效。
+/// 停不下来也继续改配置 —— 下次开机会用新二进制。
+const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 卸载时等旧服务停下来的上限。要留足「正在扫描」的时间，否则删不掉 exe。
+const UNINSTALL_STOP_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// 服务的对外状态
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ServiceState {
@@ -143,6 +152,9 @@ fn status_bytes(status: &mut SERVICE_STATUS_PROCESS) -> &mut [u8] {
 }
 
 /// 注册服务（需要管理员）。已存在就改成当前的 exe 路径，便于升级后指到新位置。
+///
+/// ⚠️ **先停再改再起**：升级时旧服务还在跑旧版本的 exe，而那个文件已经被安装器
+/// 替换（或删除）。只改配置不会让 SCM 换掉正在运行的进程，用户会一直用着旧代码。
 pub fn install() -> Result<()> {
     let exe = std::env::current_exe().map_err(CoreError::Io)?;
     // 命令行要整体加引号：路径里几乎一定有空格（Program Files）
@@ -177,7 +189,11 @@ pub fn install() -> Result<()> {
             let _ = unsafe { CloseServiceHandle(service) };
         }
         Err(err) if win32_code(&err) == ERROR_SERVICE_EXISTS.0 => {
-            // 已安装：只把可执行路径改成现在这个（升级后 exe 位置可能变了）
+            // 已安装：先停下来，否则 `ChangeServiceConfigW` 只改注册表、不换进程
+            if let Err(err) = stop(STOP_TIMEOUT) {
+                eprintln!("[rastflow] 停止旧索引服务失败（继续改配置）：{err}");
+            }
+            // 停过一次之后句柄要重新取：SCM 可能已经把这条服务换成了 pending-delete
             let service = open_service(manager, SERVICE_ALL_ACCESS);
             let _ = unsafe { CloseServiceHandle(manager) };
             let service = service?;
@@ -198,6 +214,7 @@ pub fn install() -> Result<()> {
             };
             let _ = unsafe { CloseServiceHandle(service) };
             changed.map_err(|err| CoreError::win32("ChangeServiceConfigW", err))?;
+            return start();
         }
         Err(err) => {
             let _ = unsafe { CloseServiceHandle(manager) };
@@ -225,12 +242,55 @@ pub fn start() -> Result<()> {
     }
 }
 
+/// 让服务停下来，并等它真正进入 `STOPPED`。
+///
+/// 返回 `Ok(true)` 表示确认已停。超时返回 `Ok(false)` —— 调用方自己决定要不要
+/// 继续（卸载时即便停不下来也要删，SCM 会把它标成 pending delete）。
+///
+/// 没装过、本来就没在跑，都算「已停」。
+pub fn stop(timeout: Duration) -> Result<bool> {
+    let manager = open_manager(SC_MANAGER_CONNECT)?;
+    let service = match open_service(manager, SERVICE_STOP | SERVICE_QUERY_STATUS) {
+        Ok(handle) => handle,
+        Err(CoreError::Win32 { err, .. })
+            if win32_code(&err) == ERROR_SERVICE_DOES_NOT_EXIST.0 =>
+        {
+            let _ = unsafe { CloseServiceHandle(manager) };
+            return Ok(true);
+        }
+        Err(err) => {
+            let _ = unsafe { CloseServiceHandle(manager) };
+            return Err(err);
+        }
+    };
+
+    let mut status = SERVICE_STATUS::default();
+    // 没在跑时会拿到 ERROR_SERVICE_NOT_ACTIVE，属正常
+    let _ = unsafe { ControlService(service, SERVICE_CONTROL_STOP, &mut status) };
+    let _ = unsafe { CloseServiceHandle(service) };
+    let _ = unsafe { CloseServiceHandle(manager) };
+
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        match state() {
+            ServiceState::Stopped | ServiceState::NotInstalled => return Ok(true),
+            // Running 但控制命令刚发出去：给它一点时间响应
+            _ => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+    Ok(matches!(state(), ServiceState::Stopped | ServiceState::NotInstalled))
+}
+
 /// 停掉并删除服务（需要管理员）。没装过算成功。
 pub fn uninstall() -> Result<()> {
     let Ok(manager) = open_manager(SC_MANAGER_ALL_ACCESS) else {
         return Err(CoreError::ElevationDenied);
     };
-    let service = match open_service(manager, SERVICE_STOP | SERVICE_ALL_ACCESS) {
+
+    // 先等它停：服务进程还开着 exe 时，安装器删不掉那个文件（要拖到重启）
+    let _ = stop(UNINSTALL_STOP_TIMEOUT);
+
+    let service = match open_service(manager, SERVICE_ALL_ACCESS) {
         Ok(handle) => handle,
         Err(CoreError::Win32 { err, .. }) if win32_code(&err) == ERROR_SERVICE_DOES_NOT_EXIST.0 => {
             let _ = unsafe { CloseServiceHandle(manager) };
@@ -242,10 +302,6 @@ pub fn uninstall() -> Result<()> {
         }
     };
 
-    // 先请它停：服务会置停止标志、结束当前会话、退出 accept 循环
-    let mut status = SERVICE_STATUS::default();
-    let _ = unsafe { ControlService(service, SERVICE_CONTROL_STOP, &mut status) };
-    // 服务停不下来也继续删：SCM 会把它标成 pending delete
     let deleted = unsafe { DeleteService(service) };
     let _ = unsafe { CloseServiceHandle(service) };
     let _ = unsafe { CloseServiceHandle(manager) };

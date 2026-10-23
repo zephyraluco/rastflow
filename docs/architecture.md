@@ -13,7 +13,7 @@
 | 语言 / 版本 | Rust，`edition = "2024"` |
 | 目标平台 | **仅 Windows**（`#![windows_subsystem = "windows"]`，无控制台窗口） |
 | 产物 | 单个 `rastflow.exe` |
-| 打包 | `cargo packager` → NSIS 安装包（`Cargo.toml` 的 `[package.metadata.packager]`） |
+| 打包 | `cargo packager` → WiX MSI（`Cargo.toml` 的 `[package.metadata.packager]` + `packaging/rastflow-service.wxs`） |
 | 源码规模 | 约 9 800 行（`src/` + `build.rs`，含测试） |
 
 ## 2. 技术选型
@@ -327,8 +327,26 @@ flowchart LR
 cargo check                                    # 无警告
 cargo test                                     # 131 通过，5 忽略
 cargo clippy --all-targets --all-features      # 剩余告警均在既有非 UI 代码
-cargo packager                                 # 生成 NSIS 安装包到 dist/
+cargo packager --release                       # 生成 MSI 安装包到 dist/
 ```
+
+打包链路：`cargo-packager` 自动下载 WiX 3.11 到
+`%LOCALAPPDATA%\.cargo-packager\WixTools`（无需手工安装 WiX，但首次需要联网），
+由 `main.wxs` 编译主安装包，再链上 `packaging/rastflow-service.wxs` 片段。
+片段通过 `FileKey="Path"` 引用主模板里的 `rastflow.exe`，因此不重复打包文件。
+
+MSI 是 **perMachine** 安装，并在 `InstallExecuteSequence` 里插入三个自定义动作：
+
+| 动作 | 时机 | 作用 |
+| --- | --- | --- |
+| `RollbackIndexService` | `< InstallIndexService` | 安装失败时清掉半装的索引服务 |
+| `InstallIndexService` | `After InstallFiles` | `rastflow.exe --install-service`：停旧服务 → 改路径 → 启动 |
+| `UninstallIndexService` | `Before RemoveFiles` | `rastflow.exe --uninstall-service`：先停服务，否则进程占着 exe 删不掉 |
+
+三者都是 `Execute="deferred" Impersonate="no"`，以 SYSTEM 运行，安装过程本身不需要再提权。
+卸载动作的条件是 `REMOVE~="ALL"`（**没有** `NOT UPGRADINGPRODUCTCODE`）——
+主模板的 `RemoveExistingProducts` 排在 `1501`，早于 `InstallFiles`，所以大版本升级时
+旧产品必先完整卸载一遍；不在这里停服务的话，服务进程会锁住 exe，覆盖操作会被推迟到重启。
 
 需要真机环境的用例标了 `#[ignore]`，按需手工运行：
 
@@ -352,3 +370,4 @@ shell:AppsFolder、本机安装的程序）走 `#[ignore]` 手工冒烟。
 | 托盘图标不随 DPI 变化重建 | 只在启动时算一次尺寸；缩放变化需 `WM_DPICHANGED` 处理（未做） |
 | 仅索引本地固定盘 + NTFS | 可移动盘、网络盘、非 NTFS 卷不支持 |
 | 索引不含文件大小与修改时间 | 展示时按需 `stat`，避免索引体积膨胀 |
+| MSI 卸载不删用户数据 | 配置与索引快照留在 `%LOCALAPPDATA%\rastflow`，重装可继续用 |

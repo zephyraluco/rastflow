@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  索引服务的生命周期。
+
+  cargo-packager 的 main.wxs 里，主程序是
+    Component Id="Path" … File Id="Path" Source="…" KeyPath="yes" …
+  所以这里用 FileKey="Path" 引用同一个可执行文件：不复制文件、不需要额外
+  Component，也不受安装路径（Program Files）里空格的影响（FileKey 是 MSI 的
+  Type 18 动作，可执行文件路径由 File 表给出，不存在命令行拼装问题）。
+
+  为什么用 CustomAction 而不是 ServiceInstall 元素：
+  WiX 要求它必须待在同时含 File 的 Component 里，而那个 Component 在主模板中，
+  片段无法往里加子元素；另起一个 Component 又会让同一个 exe 被写进 MSI 两次
+  （ICE 警告，且装两遍）。自定义动作直接复用 rastflow.exe 的服务安装入口，
+  注册逻辑因此只有一套实现。
+
+  执行身份：perMachine 安装 + Execute="deferred" + Impersonate="no"，即以 SYSTEM
+  运行，注册服务不需要再提权。
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <!-- 安装/修复：注册服务并启动。已存在时会停旧服务 → 改路径 → 重启。 -->
+    <CustomAction Id="InstallIndexService"
+                  FileKey="Path"
+                  ExeCommand="--install-service"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check" />
+
+    <!-- 安装中途失败时回滚：别留下一个指向半装目录的服务 -->
+    <CustomAction Id="RollbackIndexService"
+                  FileKey="Path"
+                  ExeCommand="--uninstall-service"
+                  Execute="rollback"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <!-- 卸载：先停服务再删。否则服务进程占着 exe，RemoveFiles 只能延到重启。 -->
+    <CustomAction Id="UninstallIndexService"
+                  FileKey="Path"
+                  ExeCommand="--uninstall-service"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="RollbackIndexService" Before="InstallIndexService">
+        NOT REMOVE
+      </Custom>
+      <Custom Action="InstallIndexService" After="InstallFiles">
+        NOT REMOVE
+      </Custom>
+      <!--
+        这里刻意不加 NOT UPGRADINGPRODUCTCODE。
+        主模板的 RemoveExistingProducts 排在 1501（早于 InstallFiles），所以大版本升级时
+        旧产品会先完整卸载一遍 —— 那时必须把服务停掉，否则服务进程一直占着
+        rastflow.exe，InstallFiles 覆盖不了，只能标记"重启后完成"，升级完等于没升。
+        新产品稍后会用 InstallIndexService 重新注册并启动服务。
+      -->
+      <Custom Action="UninstallIndexService" Before="RemoveFiles">
+        REMOVE~="ALL"
+      </Custom>
+    </InstallExecuteSequence>
+  </Fragment>
+</Wix>

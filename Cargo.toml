@@ -29,25 +29,36 @@ licenseFile = "LICENSE"
 # 装包时先构建 release 二进制
 beforePackagingCommand = "cargo build --release"
 
-# 只做 NSIS 安装包：单文件 exe、默认无需管理员权限、Windows 上零额外依赖。
-# 若要 .msi，需先装 WiX Toolset，再把 "wix" 加进来。
-formats = ["nsis"]
+# 只做 MSI（WiX）：安装器本身就是 perMachine + 提权的，正好用来注册索引服务。
+#
+# 为什么不用 NSIS：cargo-packager 的 NSIS 模板只开放一个 `preinstallSection`，
+# 而它插在 `Section Install` **之前** —— 那时 $INSTDIR 里还没有 exe，没法注册服务；
+# 更要紧的是 NSIS 模板根本没有卸载钩子，服务会残留。WiX 有完整的
+# InstallExecuteSequence，可以精确控制「装完起服务、卸载前停服务」。
+#
+# WiX 二进制由 cargo-packager 自动从 GitHub 下载到本地缓存
+# （wix311-binaries.zip → <tools>/WixTools），本机不需要预装 WiX Toolset，
+# 但**首次打包需要联网**。
+formats = ["wix"]
 
 outDir = "dist"
 
 # 安装器图标与快捷方式图标。exe 自身的图标由 build.rs 通过 winresource 嵌入。
 icons = ["assets/app-icon.ico"]
 
-[package.metadata.packager.nsis]
-# 安装器窗口与「添加或删除程序」里显示的图标
-installerIcon = "assets/app-icon.ico"
-# 第一个语言是兜底语言；安装器优先跟随系统语言（中文系统显示中文）
-languages = ["SimpChinese", "English"]
-# 应用把数据放在 %LOCALAPPDATA%\rastflow（见 src/utils.rs 的 app_data_dir）。
-# 声明后，卸载时会给用户一个「是否一并删除这些数据」的选项。
-appdataPaths = ["$LOCALAPPDATA/rastflow"]
-# 默认装到 %LOCALAPPDATA%\Programs，不需要管理员权限
-installMode = "currentUser"
+[package.metadata.packager.wix]
+# 索引服务的生命周期（安装 / 卸载 / 升级）都写在这个片段里。
+# 路径相对 `cargo packager` 的工作目录。
+fragmentPaths = ["packaging/rastflow-service.wxs"]
+# 片段里定义的 CustomAction 必须在这里列出来，才会被 main.wxs 引用
+customActionRefs = [
+    "InstallIndexService",
+    "RollbackIndexService",
+    "UninstallIndexService",
+]
+# MSI 界面语言（同时影响生成的 msi 文件名后缀）。
+# 标识符必须是 cargo-packager 内置 languages.json 里的键。
+languages = ["zh-CN"]
 
 [package.metadata.packager.windows]
 # 不允许用旧版本覆盖已装的新版本，避免降级后数据不兼容

@@ -32,6 +32,26 @@ rastflow.exe --install-service
 rastflow.exe --uninstall-service
 ```
 
+> 用 MSI 安装时不需要这步 —— 安装程序会自己注册并启动服务，卸载时也会自动停掉并注销。
+
+## 打包安装
+
+```bash
+cargo packager --release
+```
+
+产物：`dist/rastflow_0.1.0_x64_zh-CN.msi`。首次执行会自动下载 WiX 3.11 工具链
+（到 `%LOCALAPPDATA%\.cargo-packager\WixTools`，需联网），安装包本体与
+索引服务的注册动作定义在 `packaging/rastflow-service.wxs`。
+
+几点行为：
+
+- **perMachine 安装**，默认装到 `C:\Program Files\rastflow`，安装过程需要过一次 UAC。
+- 安装/修复时会自动`rastflow.exe --install-service`；卸载前会 `--uninstall-service`
+  先停掉服务，否则进程占着 exe 删不掉。
+- 卸载**不删** `%LOCALAPPDATA%\rastflow` 里的配置与索引快照，重装后可继续用。
+- 已装过旧的可执行版升级时，服务会被停止 → 重建 → 重启，不需要手工干预。
+
 ## 功能实现
 
 - [x] 应用搜索与启动
