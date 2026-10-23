@@ -1,32 +1,27 @@
 //! 文件搜索集成：把 [`crate::search`] 的自研索引接到界面上。
 //!
-//! `CreateFileW(r"\\.\C:")` 请求了 `GENERIC_WRITE`，所以**建索引与实时监控需要管理员**。
-//! 非管理员仍可搜索已有索引，只是不能首次建库、也拿不到实时增量。这个代价由
-//! [`startup_action`] 显式建模（把「有没有索引 / 是不是管理员」映射成该做什么），
-//! 不靠静默降级。
+//! 打开卷句柄要 `GENERIC_WRITE`（管理员），所以**碰 MFT/USN 的代码跑在提权的索引
+//! 子进程里**（[`crate::search::helper_main`]），本进程只通过命名管道收记录与事件。
+//! 索引、快照、搜索一直在本进程，子进程不持有索引。
 //!
-//! 线程模型见 `docs/architecture.md` §5：引导线程建库、监控泵线程落增量、
+//! 线程模型见 `docs/architecture.md` §5：引导线程（本进程）拉起子进程并起一条泵线程读管道，
 //! 搜索跑在调用方给的线程上（gpui 的 background executor）。
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use windows::Win32::Foundation::CloseHandle;
-use windows::Win32::Security::{
-    GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
-};
-use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::PCWSTR;
 
-use crate::search::engine::{CatchUp, CoreConfig, Engine};
+use crate::search::engine::{CoreConfig, Engine, ScanStats};
+use crate::search::helper::{HelperSession, Message, Request};
+use crate::search::index::JournalMark;
 use crate::search::matcher::SearchQuery;
-use crate::search::monitor::MonitorHandle;
+use crate::search::monitor::MonitorEvent;
 use crate::utils::app_data_dir;
 
 /// 搜索超时：超过就返回已找到的部分（索引大、关键字冷门时可能扫不完）
@@ -35,14 +30,12 @@ const SEARCH_TIMEOUT: Duration = Duration::from_secs(5);
 /// 结果条数上限
 const RESULT_LIMIT: usize = 200;
 
-/// 增量变更停下来这么久之后才落快照。
+/// 累计这么多次增量变更就落一次快照。
 ///
-/// 索引本身就在内存里（搜索走的就是它），快照只是「下次启动不用重扫 MFT」，
-/// 所以频繁写盘没有意义，反而会和用户的磁盘 IO 抢带宽。
-const SNAPSHOT_IDLE: Duration = Duration::from_secs(60);
-
-/// 泵线程单次等事件的时长：超时说明这段时间没有变更，顺便看看该不该落快照。
-const PUMP_TICK: Duration = Duration::from_millis(500);
+/// 索引本身就在内存里（搜索走的就是它），快照只是「下次启动不用重扫 MFT」。
+/// 用计数而不是定时器：泵线程只会在收到消息时醒，没必要为了查表再起一个心跳。
+/// 没来得及落的变更不会丢 —— 下次启动会从更早的位点重放回来。
+const SNAPSHOT_EVERY: u64 = 2000;
 
 // ---------- 对外类型 ----------
 
@@ -110,11 +103,6 @@ struct Inner {
     status: Mutex<SearchStatus>,
     /// 上一次搜索的取消句柄：新的搜索到来时先把旧的取消掉
     last_cancel: Mutex<Option<Arc<AtomicBool>>>,
-    /// 正在运行的监控泵线程。它退出时会把各盘的监控线程一并收掉，
-    /// 所以「句柄已结束」等于「监控已经没了」（见 [`ensure_monitor`]）
-    pump: Mutex<Option<JoinHandle<()>>>,
-    /// 防止重复触发建索引
-    building: AtomicBool,
 }
 
 impl Inner {
@@ -154,16 +142,14 @@ pub fn index_dir() -> PathBuf {
 
 /// 启动文件搜索（幂等）。
 ///
-/// 第一次调用会开一条引导线程做「打开索引库 / 建索引 / 启监控」，
-/// 之后调用只做状态查询。初始化进度请轮询 [`status`]。
+/// 第一次调用会开一条引导线程：打开索引 → 拉起提权索引子进程 → 起泵线程。
+/// 之后调用只做状态查询。初始化与建库进度请轮询 [`status`]。
 pub fn start() {
     let inner = STATE.get_or_init(|| {
         let inner = Arc::new(Inner {
             engine: OnceLock::new(),
             status: Mutex::new(SearchStatus::Uninitialized),
             last_cancel: Mutex::new(None),
-            pump: Mutex::new(None),
-            building: AtomicBool::new(false),
         });
 
         let bootstrap = Arc::clone(&inner);
@@ -175,7 +161,7 @@ pub fn start() {
                     eprintln!("[rastflow] 文件索引初始化失败：{err}");
                     bootstrap.set_status(SearchStatus::Unavailable {
                         reason: err.to_string(),
-                        needs_admin: is_access_denied(&err),
+                        needs_admin: needs_admin_hint(&err),
                     });
                 }
             });
@@ -193,32 +179,10 @@ pub fn status() -> SearchStatus {
     }
 }
 
-/// 当前进程是否以管理员身份运行
-///
-/// 直接查令牌的 `TokenElevation`，比「试着打开卷然后看报错」更准，
-/// 也能在建索引之前就给出提示。
-pub fn is_admin() -> bool {
-    unsafe {
-        let mut token = windows::Win32::Foundation::HANDLE::default();
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
-            return false;
-        }
-        let mut elevation = TOKEN_ELEVATION::default();
-        let mut returned = 0u32;
-        let ok = GetTokenInformation(
-            token,
-            TokenElevation,
-            Some(&mut elevation as *mut _ as *mut core::ffi::c_void),
-            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
-            &mut returned,
-        )
-        .is_ok();
-        let _ = CloseHandle(token);
-        ok && elevation.TokenIsElevated != 0
-    }
-}
-
 /// 以管理员身份重新启动自己。成功返回 `true`，调用方随后应退出当前实例。
+///
+/// 现在索引不再要求主进程提权（子进程自己会提权），这个入口只用于「子进程被系统
+/// 拦住、用户想手动以管理员身份重试」这类罕见情况。
 pub fn relaunch_as_admin() -> bool {
     let Ok(exe) = std::env::current_exe() else {
         return false;
@@ -361,38 +325,30 @@ pub fn open_result(result: &FileResult) -> std::io::Result<()> {
 
 // ---------- 内部实现 ----------
 
-/// 启动时该做什么 —— 由「有没有索引 / 有没有可索引的盘 / 是不是管理员」三者决定。
+/// 启动时走哪条路：补课，还是全量重扫。
 ///
-/// 抽成纯函数是为了让这条权限策略有个明确的、可测的位置：它决定了非管理员
-/// 用户到底能不能用文件搜索（能搜已有索引，但不能建索引、不能实时监控）。
+/// 抽成纯函数，让这条策略有个明确、可测的位置。只要有**任何一个盘**没有位点，
+/// 就没法只补课（那个盘得从头枚举），于是整轮重扫 —— 简单，而且不会留下半个索引。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StartupAction {
-    /// 已有索引，直接可用（试图顺带启监控）
-    Search,
-    /// 没有索引但可以建
-    Build,
-    /// 没有索引且没有管理员权限：必须提权
-    NeedAdmin,
-    /// 没有可索引的盘
-    NoDisks,
+enum StartPlan {
+    CatchUp,
+    Scan,
 }
 
-fn startup_action(indexed: bool, has_disks: bool, is_admin: bool) -> StartupAction {
-    if !has_disks {
-        return StartupAction::NoDisks;
+fn plan_start(indexed: bool, disks: &[char], marked: &HashSet<char>) -> StartPlan {
+    if !indexed || disks.is_empty() {
+        return StartPlan::Scan;
     }
-    if indexed {
-        // 有索引就能搜，哪怕不是管理员（只是拿不到实时增量）
-        return StartupAction::Search;
-    }
-    if is_admin {
-        StartupAction::Build
+    if disks.iter().all(|disk| marked.contains(disk)) {
+        StartPlan::CatchUp
     } else {
-        StartupAction::NeedAdmin
+        StartPlan::Scan
     }
 }
 
-/// 打开引擎；有索引就先补课，补不了再重建
+/// 打散引擎、拉起提权子进程、起一条泵线程。
+///
+/// 本函数**不阻塞**等索引建完：界面靠轮询 [`status`] 看进度。
 fn bootstrap_engine(inner: &Arc<Inner>) -> crate::search::Result<()> {
     let engine = Arc::new(Engine::open(CoreConfig::new(index_dir()))?);
     // 引擎先装好：即使最终状态不可用，搜索侧的报错也能更具体
@@ -406,198 +362,246 @@ fn bootstrap_engine(inner: &Arc<Inner>) -> crate::search::Result<()> {
         return Ok(());
     }
 
-    let admin = is_admin();
-    let mut action = startup_action(engine.is_indexed(), true, admin);
+    // 提权子进程：真正碰 MFT/USN 的只有它。
+    //
+    // 启动时会弹一次 UAC（今天整个进程提权也要弹）。用户拒绝时不是死路：
+    // 已有索引照样能搜，只是拿不到离线补课与实时增量。
+    let session = match HelperSession::start(engine.disks()) {
+        Ok(session) => session,
+        Err(err) if engine.is_indexed() && declined_elevation(&err) => {
+            eprintln!("[rastflow] 未取得管理员权限，索引可用但不会跟随磁盘变化：{err}");
+            inner.set_status(SearchStatus::Ready { monitoring: false });
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    };
 
-    // 有索引时先「补课」：把程序没运行期间发生的变更从 USN 日志重放进来。
-    // 没有这一步，关着程序改过的文件就只能等下次全量重扫才会出现。
-    if let StartupAction::Search = action {
-        match engine.catch_up(&mut |_| {}) {
-            CatchUp::Replayed { events } if events > 0 => {
-                eprintln!("[rastflow] 从 USN 日志补齐了 {events} 条变更");
-            }
-            CatchUp::NeedsRebuild => {
-                eprintln!("[rastflow] USN 日志已覆盖上次位点，需要重扫全盘");
-                action = if admin {
-                    StartupAction::Build
-                } else {
-                    StartupAction::NeedAdmin
-                };
-            }
-            CatchUp::Unavailable(reason) => {
-                // 非管理员很常见。索引停在快照时的状态，但搜索仍可用，
-                // 过期的条目会被搜索时的「懒删除」顺手清掉。
-                eprintln!("[rastflow] 无法补齐离线变更（结果可能滞后）：{reason}");
-            }
-            _ => {}
-        }
-    }
-
-    match action {
-        StartupAction::NoDisks => {
-            // 上面已经判过 disks 非空，这里只是把枚举穷尽掉
-            inner.set_status(SearchStatus::Unavailable {
-                reason: "没有找到可用于索引的本地 NTFS 磁盘".to_string(),
-                needs_admin: false,
-            });
-        }
-        StartupAction::Search => {
-            let monitoring = ensure_monitor(inner, &engine);
-            inner.set_status(SearchStatus::Ready { monitoring });
-        }
-        StartupAction::NeedAdmin => {
-            inner.set_status(SearchStatus::Unavailable {
-                reason: "首次建立索引需要管理员权限".to_string(),
-                needs_admin: true,
-            });
-        }
-        StartupAction::Build => {
-            if inner.building.swap(true, Ordering::SeqCst) {
-                return Ok(());
-            }
-            let result = build_index(inner);
-            inner.building.store(false, Ordering::SeqCst);
-            result?;
-        }
-    }
-    Ok(())
+    let pump_engine = Arc::clone(&engine);
+    let pump_inner = Arc::clone(inner);
+    std::thread::Builder::new()
+        .name("rastflow-index-pump".to_string())
+        .spawn(move || run_pump(pump_inner, pump_engine, session))
+        .map(|_| ())
+        .map_err(crate::search::CoreError::Io)
 }
 
-/// 建索引并实时回报进度
-fn build_index(inner: &Arc<Inner>) -> crate::search::Result<()> {
-    let Some(engine) = inner.engine.get().cloned() else {
-        return Ok(());
+/// 泵线程的累计状态
+#[derive(Default)]
+struct PumpState {
+    /// 还没报「这个盘处理完了」的盘
+    pending: HashSet<char>,
+    /// 本轮扫描里各盘覆盖到的位点
+    scan_marks: HashMap<char, JournalMark>,
+    /// 本轮扫描已写入的记录数（给界面看）
+    written: u64,
+    /// 正在扫描的盘
+    phase_disk: Option<char>,
+    /// 最近一次「这个盘碰不了」的原因，用来汇报「一个盘都没索引上」
+    last_error: Option<String>,
+    /// 距上次落快照应用了多少条增量
+    applied_since_save: u64,
+}
+
+/// 泵线程：把子进程流过来的记录与事件落到索引上。
+///
+/// 这是**唯一**改动索引的地方（除搜索时的懒删除），所以锁与状态机都集中在这里。
+fn run_pump(inner: Arc<Inner>, engine: Arc<Engine>, session: HelperSession) {
+    let marks = engine.marks();
+    let marked: HashSet<char> = marks.keys().copied().collect();
+    let first = match plan_start(engine.is_indexed(), engine.disks(), &marked) {
+        StartPlan::CatchUp => Request::CatchUp {
+            marks: marks.iter().map(|(disk, mark)| (*disk, *mark)).collect(),
+        },
+        StartPlan::Scan => Request::Scan {
+            disks: engine.disks().to_vec(),
+        },
     };
+    // 子进程连上之前状态还是 Uninitialized；先摆成「正在建索引」，
+    // 免得补课/扫描的这几十秒界面一片空白
     inner.set_status(SearchStatus::Indexing {
         disk: None,
         written: 0,
     });
-
-    let report = engine.build_index(Some(&mut |progress| {
-        inner.set_status(SearchStatus::Indexing {
-            disk: Some(progress.disk),
-            written: progress.written,
-        });
-    }))?;
-
     eprintln!(
-        "[rastflow] 索引完成：{} 条记录，用时 {} ms",
-        report.total_written(),
-        report.elapsed_ms
+        "[rastflow] 索引子进程（pid {}）：{:?}",
+        session.child_pid(),
+        first
     );
-
-    let monitoring = ensure_monitor(inner, &engine);
-    inner.set_status(SearchStatus::Ready { monitoring });
-    Ok(())
-}
-
-/// 保证增量监控在跑（幂等），返回监控当前是否可用。
-///
-/// 已在跑就原样留着：这条泵跟着 USN 日志走，换一条会把期间积在通道里的事件丢掉，
-/// 还要重新打开各盘的卷句柄。
-///
-/// 非管理员直接返回 `false`：读 USN 日志要 `GENERIC_WRITE`，起了也只会白失败一次。
-fn ensure_monitor(inner: &Arc<Inner>, engine: &Arc<Engine>) -> bool {
-    if !is_admin() {
-        return false;
+    if let Err(err) = session.send(&first) {
+        fail(&inner, err);
+        return;
     }
 
-    // 「查活 → 起新的 → 记下来」整段都在锁里：两条建索引路径可能同时走到这里，
-    // 不锁就会各起一条。泵线程自己不碰这把锁（它只用索引与 `status`），
-    // 所以下面 join 已结束的线程不会死锁。
-    let mut slot = inner
-        .pump
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-    if pump_is_live(&mut slot) {
-        return true;
-    }
-
-    let monitor = match engine.start_monitor() {
-        Ok(monitor) => monitor,
-        Err(err) => {
-            eprintln!("[rastflow] 文件监控未启动（搜索结果可能滞后）：{err}");
-            return false;
-        }
+    let mut state = PumpState {
+        pending: engine.disks().iter().copied().collect(),
+        ..Default::default()
     };
+    let mut requested_monitor = false;
+    let mut ready = false;
 
-    let pump_engine = Arc::clone(engine);
-    let pump_inner = Arc::clone(inner);
-    let spawned = std::thread::Builder::new()
-        .name("rastflow-index-pump".to_string())
-        .spawn(move || {
-            // join() 需要取得所有权，binding 本身不需要 mut
-            let monitor: MonitorHandle = monitor;
-            // 「最后一次变更」的时刻；为 None 表示没有待落盘的改动
-            let mut dirty_since: Option<Instant> = None;
+    loop {
+        let message = match session.recv() {
+            Ok(Some(message)) => message,
+            Ok(None) => {
+                eprintln!("[rastflow] 索引子进程已退出");
+                break;
+            }
+            Err(err) => {
+                eprintln!("[rastflow] 读取索引管道失败：{err}");
+                break;
+            }
+        };
 
-            // 唯一的出口是「各盘监控线程都没了」：那时通道断开，不会再有事件到来
-            loop {
-                match monitor.recv_timeout(PUMP_TICK) {
-                    Ok(event) => {
-                        // 单条事件失败不值得中断整条泵：索引会在下次重建时自愈
-                        match pump_engine.apply_event(&event) {
-                            Ok(true) => dirty_since = Some(Instant::now()),
+        match message {
+            Message::ScanStarted { disk, mark } => {
+                engine.begin_scan(disk);
+                state.scan_marks.insert(disk, mark);
+                state.written = 0;
+                state.phase_disk = Some(disk);
+                inner.set_status(SearchStatus::Indexing {
+                    disk: Some(disk),
+                    written: 0,
+                });
+            }
+            Message::Records(entries) => {
+                state.written += engine.insert_scanned_batch(&entries) as u64;
+                if let Some(disk) = state.phase_disk {
+                    inner.set_status(SearchStatus::Indexing {
+                        disk: Some(disk),
+                        written: state.written,
+                    });
+                }
+            }
+            Message::ScanFinished { disk, records } => {
+                // 位点用子进程「枚举那一刻」的 NextUsn，与本次枚举覆盖的范围严格对齐
+                let mark = state.scan_marks.get(&disk).copied().unwrap_or_default();
+                let stats = engine.finish_scan(disk, mark);
+                log_scan(disk, records, stats);
+                state.pending.remove(&disk);
+            }
+            Message::CatchUpFinished {
+                disk,
+                events,
+                mark,
+            } => {
+                if events > 0 {
+                    eprintln!("[rastflow] {disk}: 从 USN 日志补齐了 {events} 条变更");
+                }
+                engine.set_mark(disk, mark);
+                state.pending.remove(&disk);
+            }
+            Message::NeedsRebuild { disk } => {
+                eprintln!("[rastflow] {disk}: USN 日志已覆盖上次位点，改为全量重扫");
+                state = PumpState {
+                    pending: engine.disks().iter().copied().collect(),
+                    ..Default::default()
+                };
+                requested_monitor = false;
+                if let Err(err) = session.send(&Request::Scan {
+                    disks: engine.disks().to_vec(),
+                }) {
+                    fail(&inner, err);
+                    return;
+                }
+            }
+            Message::Unavailable { disk, reason } => {
+                eprintln!("[rastflow] {disk}: 无法处理该盘（{reason}），沿用已有索引");
+                state.last_error = Some(format!("{disk}: {reason}"));
+                state.pending.remove(&disk);
+            }
+            Message::Events(events) => {
+                for event in &events {
+                    match event {
+                        MonitorEvent::DiskWarning { disk, message } => {
+                            eprintln!("[rastflow] {disk}: 文件监控警告：{message}");
+                        }
+                        MonitorEvent::DiskStopped(disk) => {
+                            eprintln!("[rastflow] {disk}: 文件监控已停止");
+                        }
+                        _ => match engine.apply_event(event) {
+                            Ok(true) => state.applied_since_save += 1,
                             Ok(false) => {}
                             Err(err) => eprintln!("[rastflow] 应用文件变更失败：{err}"),
-                        }
-                    }
-                    Err(RecvTimeoutError::Timeout) => {
-                        // 空闲下来一段时间了，把内存索引落一份快照
-                        if snapshot_due(dirty_since, Instant::now()) {
-                            save_snapshot(&pump_engine);
-                            dirty_since = None;
-                        }
-                    }
-                    Err(RecvTimeoutError::Disconnected) => {
-                        eprintln!("[rastflow] 文件监控已全部停止，索引不再跟随磁盘变化");
-                        pump_inner.mark_monitoring_stopped();
-                        break;
+                        },
                     }
                 }
             }
-
-            // 退出前把关：把最后的变更落盘，下次启动就能少扫一遍 MFT
-            if dirty_since.is_some() {
-                save_snapshot(&pump_engine);
+            Message::Warning { disk, reason } => {
+                eprintln!("[rastflow] {disk}: {reason}");
             }
-            monitor.join();
+            Message::Monitoring { monitoring } => {
+                ready = true;
+                // 一个盘都没跟上、索引又是空的：说明这次什么也没拿到，
+                // 别让界面停在「就绪但永远搜不到东西」
+                if !monitoring && !engine.is_indexed() {
+                    let reason = state
+                        .last_error
+                        .take()
+                        .unwrap_or_else(|| "没有得到任何索引数据".to_string());
+                    fail(&inner, crate::search::CoreError::Helper(reason));
+                } else {
+                    eprintln!(
+                        "[rastflow] 文件索引就绪（实时监控：{}）",
+                        if monitoring { "已启动" } else { "不可用" }
+                    );
+                    inner.set_status(SearchStatus::Ready { monitoring });
+                }
+                // 建完库立刻落一份：下次启动就能直接补课，不用再扫一遍 MFT
+                save_snapshot(&engine);
+                state.applied_since_save = 0;
+            }
+            Message::Fatal(reason) => {
+                fail(&inner, crate::search::CoreError::Helper(reason));
+                return;
+            }
+            Message::Bye | Message::Ready { .. } => {}
+        }
+
+        // 所有盘都报完了，才让子进程开始实时跟随：
+        // 跟随的起点就是各盘的位点，中间不会漏事件
+        if !requested_monitor && state.pending.is_empty() {
+            requested_monitor = true;
+            if let Err(err) = session.send(&Request::Monitor) {
+                fail(&inner, err);
+                return;
+            }
+        }
+
+        if state.applied_since_save >= SNAPSHOT_EVERY {
+            save_snapshot(&engine);
+            state.applied_since_save = 0;
+        }
+    }
+
+    // 退出前把关：把最后的变更落盘，下次启动就能少补一段日志
+    if state.applied_since_save > 0 {
+        save_snapshot(&engine);
+    }
+    if !ready {
+        // 从来没到过 Ready：界面不该停在「正在建索引」
+        inner.set_status(SearchStatus::Unavailable {
+            reason: "索引子进程提前退出（可能被系统或安全软件拦截）".to_string(),
+            needs_admin: false,
         });
-
-    match spawned {
-        Ok(join) => {
-            *slot = Some(join);
-            true
-        }
-        Err(err) => {
-            // 闭包连同捕获的 `monitor` 一起被丢弃 → `MonitorHandle::drop` 会停掉各盘监控线程
-            eprintln!("[rastflow] 监控泵线程创建失败：{err}");
-            false
-        }
+    } else {
+        inner.mark_monitoring_stopped();
     }
 }
 
-/// 槽位里是否已经有一条活着的监控泵。
-///
-/// 活着就原样留着，调用方据此**复用**而不是再起一条；已经结束的（各盘监控线程全挂
-/// 之后就是这个状态）顺手 `join` 回收并清空槽位，让调用方起一条新的。
-fn pump_is_live(slot: &mut Option<JoinHandle<()>>) -> bool {
-    if slot.as_ref().is_some_and(|pump| !pump.is_finished()) {
-        return true;
-    }
-    if let Some(finished) = slot.take() {
-        let _ = finished.join();
-    }
-    false
+fn log_scan(disk: char, records: u64, stats: ScanStats) {
+    eprintln!(
+        "[rastflow] {disk}: 枚举 {records} 条，索引 {} 条（忽略 {}，断链 {}）",
+        stats.written, stats.ignored, stats.broken
+    );
 }
 
-/// 是不是到落盘的时候了
-fn snapshot_due(dirty_since: Option<Instant>, now: Instant) -> bool {
-    match dirty_since {
-        Some(at) => now.duration_since(at) >= SNAPSHOT_IDLE,
-        None => false,
-    }
+/// 把失败映射成界面状态
+fn fail(inner: &Inner, err: crate::search::CoreError) {
+    eprintln!("[rastflow] 文件索引失败：{err}");
+    inner.set_status(SearchStatus::Unavailable {
+        reason: err.to_string(),
+        needs_admin: needs_admin_hint(&err),
+    });
 }
 
 fn save_snapshot(engine: &Arc<Engine>) {
@@ -612,11 +616,22 @@ fn save_snapshot(engine: &Arc<Engine>) {
     }
 }
 
-/// 判断错误是不是「权限不足」（CreateFileW 打开卷被拒）
-fn is_access_denied(err: &crate::search::CoreError) -> bool {
-    const ERROR_ACCESS_DENIED: i32 = 5;
+/// 是不是「用户拒绝了提权」
+///
+/// 只认 [`crate::search::CoreError::ElevationDenied`]：子进程连不上（被安全软件拦住等）
+/// 是另一类问题，应该如实报出来，而不是静默降级成「可搜但无增量」。
+fn declined_elevation(err: &crate::search::CoreError) -> bool {
+    matches!(err, crate::search::CoreError::ElevationDenied)
+}
+
+/// 这个错误是不是「需要管理员权限」——界面据此决定要不要给提权按钮
+fn needs_admin_hint(err: &crate::search::CoreError) -> bool {
+    const ERROR_ACCESS_DENIED: u32 = 5;
     match err {
-        crate::search::CoreError::Win32 { err, .. } => err.code().0 == ERROR_ACCESS_DENIED,
+        crate::search::CoreError::ElevationDenied => true,
+        crate::search::CoreError::Win32 { err, .. } => {
+            crate::search::win::pipe::win32_code(err) == ERROR_ACCESS_DENIED
+        }
         _ => false,
     }
 }
@@ -786,24 +801,28 @@ mod tests {
     }
 
     #[test]
-    fn startup_searches_without_admin_when_indexed() {
-        // 这是整个权限设计里最关键的一条：非管理员不该被完全挡在门外
-        assert_eq!(startup_action(true, true, false), StartupAction::Search);
-        assert_eq!(startup_action(true, true, true), StartupAction::Search);
+    fn fresh_install_scans() {
+        assert_eq!(plan_start(false, &['C'], &HashSet::new()), StartPlan::Scan);
     }
 
     #[test]
-    fn startup_build_requires_admin_without_index() {
-        assert_eq!(startup_action(false, true, true), StartupAction::Build);
-        assert_eq!(startup_action(false, true, false), StartupAction::NeedAdmin);
+    fn index_with_all_marks_only_catches_up() {
+        let marked: HashSet<char> = ['C', 'D'].into_iter().collect();
+        assert_eq!(plan_start(true, &['C', 'D'], &marked), StartPlan::CatchUp);
     }
 
     #[test]
-    fn startup_reports_missing_disks_first() {
-        // 即使有索引/是管理员，没有可索引的盘也没意义
-        assert_eq!(startup_action(true, false, true), StartupAction::NoDisks);
-        assert_eq!(startup_action(false, false, true), StartupAction::NoDisks);
-        assert_eq!(startup_action(false, false, false), StartupAction::NoDisks);
+    fn a_disk_without_mark_forces_a_rescan() {
+        // 新加的盘没有位点：只补课会让它永远是空的
+        let marked: HashSet<char> = ['C'].into_iter().collect();
+        assert_eq!(plan_start(true, &['C', 'D'], &marked), StartPlan::Scan);
+        // 索引是空的（快照丢了/首次运行）也一样
+        assert_eq!(plan_start(true, &['C'], &HashSet::new()), StartPlan::Scan);
+    }
+
+    #[test]
+    fn no_disks_never_catches_up() {
+        assert_eq!(plan_start(true, &[], &HashSet::new()), StartPlan::Scan);
     }
 
     #[test]
@@ -824,44 +843,6 @@ mod tests {
             written: 1
         }
         .needs_admin());
-    }
-
-    #[test]
-    fn empty_pump_slot_reports_not_live() {
-        let mut slot: Option<JoinHandle<()>> = None;
-        assert!(!pump_is_live(&mut slot), "还没有泵时应当报告为不存在");
-        assert!(slot.is_none());
-    }
-
-    #[test]
-    fn live_pump_is_reused() {
-        // 还在跑的泵代表「监控正在工作」：必须原样留着让调用方复用，
-        // 换一条新的会把期间积在通道里的事件丢掉。
-        let mut slot: Option<JoinHandle<()>> = Some(std::thread::spawn(|| {
-            std::thread::sleep(Duration::from_millis(300));
-        }));
-        assert!(pump_is_live(&mut slot), "还在跑的泵应当报告为存活");
-        assert!(slot.is_some(), "存活时不能把句柄挪走");
-
-        let handle = slot.take().expect("句柄应当还在");
-        let _ = handle.join();
-    }
-
-    #[test]
-    fn finished_pump_is_reaped() {
-        // 泵是在「各盘监控线程全挂」时退出的，之后必须能起一条新的，
-        // 所以已结束的句柄要被清掉（否则会一直被当成「在跑」）。
-        let mut slot: Option<JoinHandle<()>> = Some(std::thread::spawn(|| {}));
-        std::thread::sleep(Duration::from_millis(200));
-
-        assert!(!pump_is_live(&mut slot), "已结束的泵应当让位");
-        assert!(slot.is_none(), "已结束的句柄应当被清空");
-    }
-
-    #[test]
-    fn is_admin_probe_does_not_panic() {
-        // is_admin() 在测试环境通常是 false，这里只断言它不崩
-        let _ = is_admin();
     }
 
     #[test]

@@ -1,11 +1,17 @@
 //! rastflow 自研文件搜索核心：枚举 NTFS 主文件表建立常驻内存的索引，阻塞读 USN
 //! 日志维持增量。不依赖第三方索引服务，也不依赖数据库。
 //!
+//! **打开卷句柄要 `GENERIC_WRITE`（管理员）**，所以真正碰 MFT/USN 的代码跑在一个
+//! 提权的子进程（[`helper_main`]）里，本进程只通过命名管道收记录与事件
+//! （[`helper`]）。索引、快照与搜索始终留在主进程，子进程不持有索引。
+//!
 //! `unsafe` 只允许出现在 [`win`] 里。
 //!
 //! 模块划分、索引布局、生命周期与并发约束见 `docs/search-engine.md`。
 
 pub mod engine;
+pub mod helper;
+pub mod helper_main;
 pub mod index;
 pub mod matcher;
 pub mod monitor;
@@ -33,6 +39,10 @@ pub enum CoreError {
     },
     /// 参数不合法（如空关键字、超过长度上限）
     InvalidArgument(String),
+    /// 用户在 UAC 提示上拒绝了提权（或提权被策略禁止）
+    ElevationDenied,
+    /// 与索引子进程的通信出问题（管道断开、握手失败、超时）
+    Helper(String),
 }
 
 impl CoreError {
@@ -58,6 +68,8 @@ impl std::fmt::Display for CoreError {
                 write!(f, "{letter}: 盘不可用：{reason}")
             }
             Self::InvalidArgument(msg) => write!(f, "参数不合法：{msg}"),
+            Self::ElevationDenied => write!(f, "用户取消了管理员权限请求"),
+            Self::Helper(msg) => write!(f, "索引子进程：{msg}"),
         }
     }
 }

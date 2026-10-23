@@ -1,25 +1,32 @@
-//! 实时增量监控：每个盘一条常驻线程，阻塞读 USN 日志，产出结构化的变更事件。
+//! USN 日志的两个入口：**重放**（把一段历史补齐）与**实时跟随**（阻塞等新记录）。
 //!
-//! 事件带 `(FRN, 父 FRN, 名字, 是否目录)` 而不带路径（索引按 FRN 组织，用不着拼路径）；
-//! 从 `NextUsn`（当前末尾）起读，不回溯历史。过滤规则与事件形态见
-//! `docs/search-engine.md` §6。
+//! 两者都只产出结构化事件（[`MonitorEvent`]），不带路径 —— 索引按 FRN 组织，
+//! 路径是否命中忽略规则由拿着索引的调用方去判（`docs/search-engine.md` §6）。
 //!
-//! 停止靠 `CancelSynchronousIo` 打断阻塞中的读取（[`super::win::cancel_synchronous_io`]），
-//! 而不是置标志位等它超时返回。
+//! 事件按批交付（一次 `FSCTL_READ_USN_JOURNAL` 返回多少条就是一批）：
+//! 跨进程发送与落索引都有固定开销，逐条交付会把这些开销放大几万倍。
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use windows::Win32::System::Ioctl::USN_JOURNAL_DATA_V0;
+
+use super::index::JournalMark;
 use super::win::cancel_synchronous_io;
+use super::win::current_thread_id;
 use super::win::usn::{
     USN_REASON_CLOSE, USN_REASON_FILE_CREATE, USN_REASON_FILE_DELETE, USN_REASON_RENAME_NEW_NAME,
     UsnRecord,
 };
 use super::win::volume::Volume;
-use super::Result;
+use super::{CoreError, Result};
+
+/// 事件汇：一批事件交付一次。返回 `Err` 表示下游已经没了（管道断开等），
+/// 跟随线程会据此退出。
+pub type EventSink = Arc<dyn Fn(&[MonitorEvent]) -> Result<()> + Send + Sync>;
 
 /// 监控线程抛出的事件。内容结构化（见模块文档），落到索引上是幂等 upsert。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,95 +41,190 @@ pub enum MonitorEvent {
         /// 文件名（不含路径）
         name: String,
         is_dir: bool,
+        /// 是重命名/移动（同一 FRN 换了名字），而不是新建或新增硬链接。
+        /// 索引据此决定「就地改名」还是「再加一条链接」。
+        renamed: bool,
     },
-    /// 已删除（或已移出本盘）
-    Removed { disk: char, frn: u64 },
+    /// 已删除（或已移出本盘）。
+    ///
+    /// 带 `name` 是必须的：NTFS 硬链接的同一个 FRN 有多个名字，删除事件删掉的
+    /// 只是其中一个名字，不带名字会把同一文件的其它链接一起删掉。
+    Removed {
+        disk: char,
+        frn: u64,
+        /// 被删掉的那个名字；空串表示事件里没有名字（调用方退化成按 FRN 删）
+        name: String,
+    },
     /// 某个盘出问题（打不开卷、日志不可用等），线程会继续重试
     DiskWarning { disk: char, message: String },
-    /// 某个盘的监控线程已退出
+    /// 某个盘的跟随线程已退出
     DiskStopped(char),
 }
 
-#[derive(Debug, Clone)]
+// ---------- 重放 ----------
+
+/// 重放一个盘的结果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayOutcome {
+    /// 补齐成功；`mark` 是新的位点，可以直接交给实时跟随
+    Replayed { events: u64, mark: JournalMark },
+    /// 位点在这份日志里已经没有意义（日志被重建、或已被覆盖）→ 只能全量重扫
+    NeedsRebuild,
+}
+
+/// 从 `mark` 把 USN 日志重放到当前末尾。
+///
+/// `Err` 一律视为「这个盘现在碰不了」（多半是非管理员或卷出问题），
+/// 调用方应当保留已有索引、只把结果标记为可能滞后。
+pub fn replay_disk(
+    disk: char,
+    mark: JournalMark,
+    on_progress: &mut dyn FnMut(u64),
+    on_batch: &mut dyn FnMut(&[MonitorEvent]),
+) -> Result<ReplayOutcome> {
+    let volume = Volume::open(disk)?;
+    let journal = volume.query_journal()?;
+
+    // 日志被重建过 → 位点对新日志没有意义
+    if journal.UsnJournalID != mark.journal_id {
+        return Ok(ReplayOutcome::NeedsRebuild);
+    }
+    // 日志已经跑满一圈、把位点覆盖掉了 → 中间的变更找不回来了
+    if mark.last_usn < journal.FirstUsn {
+        return Ok(ReplayOutcome::NeedsRebuild);
+    }
+
+    let target = journal.NextUsn;
+    let mut cursor = mark.last_usn;
+    let mut seen = 0u64;
+
+    // 一批一批读：内存不会因为「积了半年的变更」而爆掉
+    while cursor < target {
+        let mut batch: Vec<MonitorEvent> = Vec::new();
+        let (next, count) = volume.read_usn_records(
+            journal.UsnJournalID,
+            cursor,
+            false,
+            |record| {
+                if let Some(event) = record_to_event(disk, &record) {
+                    batch.push(event);
+                }
+            },
+        )?;
+        // 没有前进就说明读完了（或日志在这一刻被清空），防死循环
+        if next <= cursor {
+            break;
+        }
+        cursor = next;
+        if !batch.is_empty() {
+            on_batch(&batch);
+        }
+        seen += u64::from(count);
+        on_progress(seen);
+    }
+
+    // 重放是幂等的（按 FRN upsert / remove），位点略微重叠也无害
+    Ok(ReplayOutcome::Replayed {
+        events: seen,
+        mark: JournalMark {
+            last_usn: cursor.max(target),
+            journal_id: journal.UsnJournalID,
+        },
+    })
+}
+
+// ---------- 实时跟随 ----------
+
+/// 跟随参数
+#[derive(Debug, Clone, Default)]
 pub struct MonitorConfig {
     pub disks: Vec<char>,
+    /// 起始位点。
+    ///
+    /// 有就**从这个位点接着读**：重放/扫描结束到线程真正开始读之间总有几百微秒，
+    /// 直接从 `NextUsn` 起读会把这期间的变更整段丢掉。没有位点才从当前末尾开始。
+    pub start: HashMap<char, JournalMark>,
 }
 
 impl MonitorConfig {
     pub fn new(disks: Vec<char>) -> Self {
-        Self { disks }
+        Self {
+            disks,
+            start: HashMap::new(),
+        }
+    }
+
+    pub fn with_start(mut self, start: HashMap<char, JournalMark>) -> Self {
+        self.start = start;
+        self
     }
 }
 
-/// 监控句柄：持有事件接收端与停止控制
+/// 一组跟随线程。`Drop` 会请求停止，但要真正回收线程仍需 [`MonitorHandle::join`]。
 pub struct MonitorHandle {
     stop: Arc<AtomicBool>,
     thread_ids: Arc<Mutex<Vec<u32>>>,
-    live: Arc<AtomicUsize>,
     joins: Vec<JoinHandle<()>>,
-    events: Receiver<MonitorEvent>,
 }
 
 impl MonitorHandle {
-    /// 启动所有盘的监控线程
-    pub fn start(config: &MonitorConfig) -> Result<Self> {
+    /// 为每个盘起一条跟随线程。
+    ///
+    /// 返回 `(句柄, 成功跟上的盘数)`：卷打不开的盘会先报一条 `DiskWarning` 再跳过，
+    /// 不影响其它盘。`live == 0` 意味着「一个盘都盯不上」，调用方据此把状态标成
+    /// 「索引可用但没有实时增量」。
+    pub fn start(config: &MonitorConfig, sink: EventSink) -> Result<(Self, usize)> {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_ids = Arc::new(Mutex::new(Vec::new()));
-        let live = Arc::new(AtomicUsize::new(0));
-        let (sender, events) = mpsc::channel();
-
         let mut joins = Vec::with_capacity(config.disks.len());
+        let mut live = 0usize;
+
         for disk in &config.disks {
             let disk = disk.to_ascii_uppercase();
+            // 在起线程之前就把卷打开：这样「跟不跟得上」是确定的，不用等线程回报
+            let opened = Volume::open(disk)
+                .and_then(|volume| volume.ensure_journal().map(|journal| (volume, journal)));
+            let (volume, journal) = match opened {
+                Ok(pair) => pair,
+                Err(err) => {
+                    let _ = sink(&[MonitorEvent::DiskWarning {
+                        disk,
+                        message: err.to_string(),
+                    }]);
+                    continue;
+                }
+            };
+
+            let start = config.start.get(&disk).copied();
             let stop = Arc::clone(&stop);
             let thread_ids = Arc::clone(&thread_ids);
-            let live = Arc::clone(&live);
-            let sender = sender.clone();
+            let sink = Arc::clone(&sink);
             joins.push(
                 thread::Builder::new()
-                    .name(format!("rastflow-core-monitor-{disk}"))
+                    .name(format!("rastflow-usn-{disk}"))
                     .spawn(move || {
-                        live.fetch_add(1, Ordering::SeqCst);
-                        if let Err(error) = run_disk(disk, &stop, &thread_ids, &sender) {
-                            let _ = sender.send(MonitorEvent::DiskWarning {
-                                disk,
-                                message: error.to_string(),
-                            });
-                        }
-                        let _ = sender.send(MonitorEvent::DiskStopped(disk));
-                        live.fetch_sub(1, Ordering::SeqCst);
+                        follow_volume(disk, volume, journal, start, &stop, &thread_ids, &sink)
                     })
-                    .map_err(super::CoreError::Io)?,
+                    .map_err(CoreError::Io)?,
             );
+            live += 1;
         }
-        drop(sender);
 
-        Ok(Self {
-            stop,
-            thread_ids,
+        Ok((
+            Self {
+                stop,
+                thread_ids,
+                joins,
+            },
             live,
-            joins,
-            events,
-        })
-    }
-
-    /// 带超时取一条事件。
-    ///
-    /// ⚠️ `Err(Disconnected)` 表示所有盘的监控线程都已退出，不会再有事件到来。
-    /// 这时它会**不等待**地反复返回 `Disconnected`，轮询方必须据此停下，
-    /// 否则就是把 500 ms 的等待退化成空转。
-    pub fn recv_timeout(
-        &self,
-        timeout: Duration,
-    ) -> std::result::Result<MonitorEvent, RecvTimeoutError> {
-        self.events.recv_timeout(timeout)
+        ))
     }
 
     /// 请求停止：置标志，并取消阻塞中的同步 IO。
     ///
     /// 取消要重试几轮（每轮 20ms）：线程可能刚通过「检查停止标志」、还没来得及
     /// 真正阻塞，那一次取消是空操作。
-    pub fn stop(&mut self) {
+    pub fn stop(&self) {
         if self.stop.swap(true, Ordering::SeqCst) {
             return; // 幂等
         }
@@ -136,7 +238,7 @@ impl MonitorHandle {
                 // 线程可能已经退出，失败是正常的
                 let _ = cancel_synchronous_io(thread_id);
             }
-            if self.live.load(Ordering::SeqCst) == 0 || Instant::now() >= deadline {
+            if self.joins.iter().all(|join| join.is_finished()) || Instant::now() >= deadline {
                 break;
             }
             thread::sleep(Duration::from_millis(20));
@@ -158,45 +260,49 @@ impl Drop for MonitorHandle {
     }
 }
 
-/// 一个盘的监控线程主体
-fn run_disk(
+/// 一条跟随线程的主体：阻塞读日志，把每批事件交给 `sink`。
+fn follow_volume(
     disk: char,
+    volume: Volume,
+    journal: USN_JOURNAL_DATA_V0,
+    start: Option<JournalMark>,
     stop: &AtomicBool,
     thread_ids: &Mutex<Vec<u32>>,
-    events: &Sender<MonitorEvent>,
-) -> Result<()> {
-    let volume = Volume::open(disk)?;
-    let journal = volume.ensure_journal()?;
-    let mut watcher = DiskWatcher::new(
-        disk,
-        journal.UsnJournalID,
-        journal.NextUsn,
-        events.clone(),
-    );
+    sink: &EventSink,
+) {
+    let mut journal_id = journal.UsnJournalID;
+    // 有有效位点就接着读；位点失效（日志被重建）则只能从现在开始
+    let mut last_usn = match start {
+        Some(mark) if mark.journal_id == journal.UsnJournalID => mark.last_usn.max(journal.FirstUsn),
+        _ => journal.NextUsn,
+    };
 
     // 先登记线程 id，再复查停止标志，最后才进入可能阻塞的循环
-    let thread_id = super::win::current_thread_id();
+    let thread_id = current_thread_id();
     match thread_ids.lock() {
         Ok(mut guard) => guard.push(thread_id),
         Err(poisoned) => poisoned.into_inner().push(thread_id),
     }
     if stop.load(Ordering::SeqCst) {
-        return Ok(());
+        return;
     }
 
     while !stop.load(Ordering::SeqCst) {
+        let mut batch: Vec<MonitorEvent> = Vec::new();
         // wait = true → BytesToWaitFor = 1，没有新记录就阻塞在这里
-        let outcome = volume.read_usn_records(
-            watcher.journal_id,
-            watcher.last_usn,
-            true,
-            |record| watcher.handle(record),
-        );
+        let outcome = volume.read_usn_records(journal_id, last_usn, true, |record| {
+            if let Some(event) = record_to_event(disk, &record) {
+                batch.push(event);
+            }
+        });
 
         match outcome {
-            Ok((next_usn, _)) => {
-                if next_usn != watcher.last_usn {
-                    watcher.last_usn = next_usn;
+            Ok((next, _)) => {
+                if next > last_usn {
+                    last_usn = next;
+                }
+                if !batch.is_empty() && sink(&batch).is_err() {
+                    break; // 下游没了（管道断开），没必要继续读
                 }
             }
             Err(error) => {
@@ -204,26 +310,25 @@ fn run_disk(
                 if stop.load(Ordering::SeqCst) {
                     break;
                 }
-                let _ = events.send(MonitorEvent::DiskWarning {
+                let _ = sink(&[MonitorEvent::DiskWarning {
                     disk,
                     message: error.to_string(),
-                });
+                }]);
                 thread::sleep(Duration::from_millis(500));
 
-                // 日志可能被重建（索引被别的程序重建、或卷被 remount），
-                // 重新取一次；位置倒退了就跟着退，避免读到「不存在」的区域
+                // 日志可能被重建（别的程序重建了、或卷被 remount），重新取一次
                 match volume.ensure_journal() {
-                    Ok(journal) => {
-                        watcher.journal_id = journal.UsnJournalID;
-                        if journal.NextUsn < watcher.last_usn {
-                            watcher.last_usn = journal.NextUsn;
+                    Ok(refreshed) => {
+                        journal_id = refreshed.UsnJournalID;
+                        if refreshed.NextUsn < last_usn {
+                            last_usn = refreshed.NextUsn;
                         }
                     }
                     Err(inner) => {
-                        let _ = events.send(MonitorEvent::DiskWarning {
+                        let _ = sink(&[MonitorEvent::DiskWarning {
                             disk,
                             message: inner.to_string(),
-                        });
+                        }]);
                         thread::sleep(Duration::from_millis(500));
                     }
                 }
@@ -231,42 +336,13 @@ fn run_disk(
         }
     }
 
-    Ok(())
-}
-
-/// 一个盘的解析器：把 USN 记录翻译成增删事件。
-///
-/// 它**不认识路径**，也不认识索引 —— 只做过滤与字段搬运。
-/// 路径与「该不该忽略」都由 [`super::engine`] 拿着索引去判。
-struct DiskWatcher {
-    disk: char,
-    journal_id: u64,
-    last_usn: i64,
-    events: Sender<MonitorEvent>,
-}
-
-impl DiskWatcher {
-    fn new(disk: char, journal_id: u64, last_usn: i64, events: Sender<MonitorEvent>) -> Self {
-        Self {
-            disk,
-            journal_id,
-            last_usn,
-            events,
-        }
-    }
-
-    /// 处理一条 USN 记录：翻译成事件后转发出去
-    fn handle(&mut self, record: UsnRecord<'_>) {
-        if let Some(event) = record_to_event(self.disk, &record) {
-            let _ = self.events.send(event);
-        }
-    }
+    let _ = sink(&[MonitorEvent::DiskStopped(disk)]);
 }
 
 /// 把一条 USN 记录翻译成事件；返回 `None` 表示这条记录与索引无关。
 ///
-/// 自由函数，供实时监控与启动时的日志重放共用。不做路径级过滤（回收站、忽略目录），
-/// 那些在 [`super::engine`] 里做。
+/// 自由函数，供实时监控与日志重放共用。不做路径级过滤（回收站、忽略目录），
+/// 那些由调用方拿着索引去做。
 pub fn record_to_event(disk: char, record: &UsnRecord<'_>) -> Option<MonitorEvent> {
     let reason = record.reason;
 
@@ -289,6 +365,7 @@ pub fn record_to_event(disk: char, record: &UsnRecord<'_>) -> Option<MonitorEven
         return Some(MonitorEvent::Removed {
             disk,
             frn: record.frn,
+            name: record.name_lossy(),
         });
     }
 
@@ -308,6 +385,7 @@ pub fn record_to_event(disk: char, record: &UsnRecord<'_>) -> Option<MonitorEven
         parent: record.parent_frn,
         name: record.name_lossy(),
         is_dir: record.is_directory(),
+        renamed,
     })
 }
 
@@ -315,6 +393,7 @@ pub fn record_to_event(disk: char, record: &UsnRecord<'_>) -> Option<MonitorEven
 mod tests {
     use super::*;
     use crate::search::win::usn::USN_REASON_RENAME_OLD_NAME;
+
     /// 造一条只有 reason / 名字有意义的记录
     fn record(reason: u32, name: &str) -> Vec<u8> {
         let name_bytes: Vec<u8> = name
@@ -333,75 +412,73 @@ mod tests {
         buf
     }
 
-    fn watcher() -> (DiskWatcher, Receiver<MonitorEvent>) {
-        let (sender, receiver) = mpsc::channel();
-        (DiskWatcher::new('C', 1, 0, sender), receiver)
+    /// 走「记录 → 事件」这一步（监控与重放共用同一条翻译）
+    fn event_of(reason: u32, name: &str) -> Option<MonitorEvent> {
+        let buf = record(reason, name);
+        let parsed = UsnRecord::parse(&buf, 0).unwrap();
+        record_to_event('C', &parsed)
     }
 
     #[test]
     fn creation_is_reported_only_after_close() {
-        let (mut watcher, events) = watcher();
         // 只有 CREATE，没有 CLOSE → 不上报
-        let buf = record(USN_REASON_FILE_CREATE, "a.txt");
-        watcher.handle(UsnRecord::parse(&buf, 0).unwrap());
-        assert!(events.try_recv().is_err());
-
-        let buf = record(USN_REASON_FILE_CREATE | USN_REASON_CLOSE, "a.txt");
-        watcher.handle(UsnRecord::parse(&buf, 0).unwrap());
-        let event = events.try_recv().unwrap();
+        assert_eq!(event_of(USN_REASON_FILE_CREATE, "a.txt"), None);
         assert_eq!(
-            event,
-            MonitorEvent::Added {
+            event_of(USN_REASON_FILE_CREATE | USN_REASON_CLOSE, "a.txt"),
+            Some(MonitorEvent::Added {
                 disk: 'C',
                 frn: 42,
                 parent: 7,
                 name: "a.txt".to_string(),
                 is_dir: false,
-            }
+                renamed: false,
+            })
         );
     }
 
     #[test]
     fn create_then_delete_noise_is_dropped() {
-        let (mut watcher, events) = watcher();
-        let buf = record(
-            USN_REASON_FILE_CREATE | USN_REASON_FILE_DELETE | USN_REASON_CLOSE,
-            "noise.tmp",
+        assert_eq!(
+            event_of(
+                USN_REASON_FILE_CREATE | USN_REASON_FILE_DELETE | USN_REASON_CLOSE,
+                "noise.tmp",
+            ),
+            None
         );
-        watcher.handle(UsnRecord::parse(&buf, 0).unwrap());
-        assert!(events.try_recv().is_err());
     }
 
     #[test]
     fn deletion_is_reported_only_after_close() {
-        let (mut watcher, events) = watcher();
-        let buf = record(USN_REASON_FILE_DELETE, "a.txt");
-        watcher.handle(UsnRecord::parse(&buf, 0).unwrap());
-        assert!(events.try_recv().is_err());
-
-        let buf = record(USN_REASON_FILE_DELETE | USN_REASON_CLOSE, "a.txt");
-        watcher.handle(UsnRecord::parse(&buf, 0).unwrap());
+        assert_eq!(event_of(USN_REASON_FILE_DELETE, "a.txt"), None);
+        // 删除事件必须带名字：硬链接文件删掉一个名字不代表整个文件没了
         assert_eq!(
-            events.try_recv().unwrap(),
-            MonitorEvent::Removed { disk: 'C', frn: 42 }
+            event_of(USN_REASON_FILE_DELETE | USN_REASON_CLOSE, "a.txt"),
+            Some(MonitorEvent::Removed {
+                disk: 'C',
+                frn: 42,
+                name: "a.txt".to_string()
+            })
         );
     }
 
     #[test]
     fn rename_reports_new_name_only() {
-        let (mut watcher, events) = watcher();
         // 旧名：不报
-        let buf = record(USN_REASON_RENAME_OLD_NAME | USN_REASON_CLOSE, "old.txt");
-        watcher.handle(UsnRecord::parse(&buf, 0).unwrap());
-        assert!(events.try_recv().is_err());
-
-        // 新名：报一条 Added，而且带的是新名字
-        let buf = record(USN_REASON_RENAME_NEW_NAME | USN_REASON_CLOSE, "new.txt");
-        watcher.handle(UsnRecord::parse(&buf, 0).unwrap());
-        match events.try_recv().unwrap() {
-            MonitorEvent::Added { name, frn, .. } => {
+        assert_eq!(
+            event_of(USN_REASON_RENAME_OLD_NAME | USN_REASON_CLOSE, "old.txt"),
+            None
+        );
+        // 新名：报一条 Added，而且带的是新名字、并标明是重命名
+        match event_of(USN_REASON_RENAME_NEW_NAME | USN_REASON_CLOSE, "new.txt") {
+            Some(MonitorEvent::Added {
+                name,
+                frn,
+                renamed,
+                ..
+            }) => {
                 assert_eq!(name, "new.txt");
                 assert_eq!(frn, 42, "重命名前后 FRN 不变");
+                assert!(renamed, "要标明这是重命名，索引才能就地改名");
             }
             other => panic!("应当是 Added，实际 {other:?}"),
         }
@@ -409,9 +486,16 @@ mod tests {
 
     #[test]
     fn nameless_record_is_dropped() {
-        let (mut watcher, events) = watcher();
-        let buf = record(USN_REASON_FILE_CREATE | USN_REASON_CLOSE, "");
-        watcher.handle(UsnRecord::parse(&buf, 0).unwrap());
-        assert!(events.try_recv().is_err());
+        assert_eq!(event_of(USN_REASON_FILE_CREATE | USN_REASON_CLOSE, ""), None);
+    }
+
+    #[test]
+    fn monitor_config_keeps_start_marks() {
+        let mark = JournalMark {
+            last_usn: 99,
+            journal_id: 7,
+        };
+        let config = MonitorConfig::new(vec!['C']).with_start(HashMap::from([('C', mark)]));
+        assert_eq!(config.start.get(&'C'), Some(&mark));
     }
 }

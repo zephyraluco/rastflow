@@ -31,6 +31,11 @@ pub struct Volume {
     handle: HANDLE,
 }
 
+// 卷句柄是内核对象句柄，跨线程使用是合法的：监控线程就是这样在一条线程里打开、
+// 交给另一条线程阻塞读取的。
+unsafe impl Send for Volume {}
+unsafe impl Sync for Volume {}
+
 impl Volume {
     /// 打开卷并要求读写权限（需要管理员）
     pub fn open(letter: char) -> Result<Self> {

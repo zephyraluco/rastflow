@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::time::Instant;
 
 use super::pathutil::{self, IgnoreRules};
@@ -45,8 +46,11 @@ const MAX_MFT_INDEX: usize = 64 * 1024 * 1024;
 /// 快照文件里的魔数
 const MAGIC: &[u8; 8] = b"RASTIDX1";
 
-/// 快照格式版本。`Entry` 布局或段顺序变了就要加一（旧文件会被丢弃重建）
-pub const SNAPSHOT_VERSION: u32 = 1;
+/// 快照格式版本。`Entry` 布局或段顺序变了就要加一（旧文件会被丢弃重建）。
+///
+/// v2：MFT 枚举开始保留硬链接的**每个**名字。旧快照里同一 FRN 只剩一个名字，
+/// 其余名字永远搜不到，所以必须丢弃重扫。
+pub const SNAPSHOT_VERSION: u32 = 2;
 
 /// 快照文件名（放在索引目录下，是**唯一**的索引文件）
 pub const SNAPSHOT_FILE: &str = "index.dat";
@@ -91,6 +95,12 @@ impl Entry {
 struct DiskTable {
     /// 下标是 MFT 记录号，值是 `entries` 里的槽位；[`NO_SLOT`] 表示没有
     slots: Vec<u32>,
+    /// 同一 MFT 记录号上的**额外**硬链接槽位（不含 `slots` 里的主槽位）。
+    ///
+    /// NTFS 一个文件可以有多个名字（硬链接，典型如 `System32\zh-CN\*.mui` 与
+    /// WinSxS 里的原件），枚举 MFT 时会为每个名字各返回一条记录。只按 FRN 存一条
+    /// 会让其余名字彻底搜不到，所以这里把多出来的名字单独登记。单链接文件不占内存。
+    links: HashMap<u32, Vec<u32>>,
     /// 盘根条目（名字形如 `C:`）的槽位
     root: u32,
 }
@@ -216,6 +226,7 @@ impl FileIndex {
         let root_slot = NO_SLOT;
         self.tables.entry(disk).or_insert_with(|| DiskTable {
             slots: Vec::new(),
+            links: HashMap::new(),
             root: root_slot,
         })
     }
@@ -240,27 +251,78 @@ impl FileIndex {
         (slot != NO_SLOT).then_some(slot)
     }
 
+    /// 某个记录号上**额外的**硬链接槽位（可能已失效，用前要核对存活）
+    fn link_slots(&self, disk: char, mft: u32) -> &[u32] {
+        self.tables
+            .get(&disk.to_ascii_uppercase())
+            .and_then(|table| table.links.get(&mft))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// 槽位是否仍是这个盘上的存活条目
+    fn live_slot_of(&self, slot: u32, disk: char) -> Option<&Entry> {
+        self.entries
+            .get(slot as usize)
+            .filter(|entry| entry.is_live() && entry.disk() == disk)
+    }
+
+    /// 这个记录号上的主槽位（已经失效就返回 `None`）
+    fn live_primary(&self, disk: char, mft: u32) -> Option<u32> {
+        self.slot_of(disk, mft)
+            .filter(|slot| self.live_slot_of(*slot, disk).is_some())
+    }
+
     /// 按 FRN 取槽位。
     ///
     /// 会核对条目里存的完整 FRN：MFT 记录被回收给新文件后，序列号会变，
     /// 只比记录号会把新文件当成老文件。
+    ///
+    /// 硬链接文件只返回其中一条（调用方按路径搜的是「名字」，用
+    /// [`FileIndex::lookup_link`] 才精确）。
     pub fn lookup(&self, disk: char, frn: u64) -> Option<u32> {
         let disk = disk.to_ascii_uppercase();
-        let slot = if is_root(frn) {
-            self.root_slot(disk)?
-        } else {
-            self.slot_of(disk, mft_index(frn) as u32)?
+        if is_root(frn) {
+            // 盘根条目记的是第一次见到它时的 FRN，序列号可能与当下不同，所以不比
+            return self.root_slot(disk).filter(|slot| self.live_slot_of(*slot, disk).is_some());
+        }
+        let record = mft_index(frn) as u32;
+        let primary = self.slot_of(disk, record).filter(|slot| {
+            self.live_slot_of(*slot, disk)
+                .is_some_and(|entry| entry.frn == frn)
+        });
+        if let Some(slot) = primary {
+            return Some(slot);
+        }
+        // 主槽位可能已被删掉（逐个删除硬链接），退到同一记录号的其它链接
+        self.link_slots(disk, record)
+            .iter()
+            .copied()
+            .find(|slot| {
+                self.live_slot_of(*slot, disk)
+                    .is_some_and(|entry| entry.frn == frn)
+            })
+    }
+
+    /// 按 `(FRN, 名字)` 精确定位一条链接的槽位。
+    ///
+    /// 硬链接文件的同一个 FRN 有多个名字，删除事件带的是「被删掉的那个名字」，
+    /// 只有按名字找才不会误删同一文件的其它链接。
+    pub fn lookup_link(&self, disk: char, frn: u64, name: &str) -> Option<u32> {
+        let disk = disk.to_ascii_uppercase();
+        let record = mft_index(frn) as u32;
+        let same_link = |slot: u32| {
+            self.live_slot_of(slot, disk)
+                .is_some_and(|entry| entry.frn == frn)
+                && self.name_bytes(slot) == Some(name.as_bytes())
         };
-        let entry = self.entries.get(slot as usize)?;
-        if !entry.is_live() || entry.disk() != disk {
-            return None;
+        if let Some(slot) = self.slot_of(disk, record).filter(|slot| same_link(*slot)) {
+            return Some(slot);
         }
-        // 盘根条目记的是第一次见到它时的 FRN，序列号可能与当下不同，所以不比
-        if is_root(frn) || entry.frn == frn {
-            Some(slot)
-        } else {
-            None
-        }
+        self.link_slots(disk, record)
+            .iter()
+            .copied()
+            .find(|slot| same_link(*slot))
     }
 
     pub fn root_slot(&self, disk: char) -> Option<u32> {
@@ -278,7 +340,9 @@ impl FileIndex {
             return None;
         }
         match self.entries.get(slot as usize) {
-            Some(parent) if parent.is_live() => Some(slot),
+            // 槽位是全局复用的：`discard` 不清查找表里的引用，所以这里必须核对
+            // 父条目确实属于**同一个盘**，否则会拼出别的盘的同名路径。
+            Some(parent) if parent.is_live() && parent.disk() == entry.disk() => Some(slot),
             _ => None,
         }
     }
@@ -309,7 +373,8 @@ impl FileIndex {
 
     /// 插入一条记录，返回槽位。
     ///
-    /// 同名同 FRN 重复插入是幂等的（就地更新）；名字为空返回 `None`。
+    /// 同一个 FRN 可以有**多个名字**（NTFS 硬链接）：只有「同 FRN + 同名字」才就地更新，
+    /// 名字不同则登记成同一记录号上的另一条链接。名字为空返回 `None`。
     /// 父目录不在索引里**不影响插入** —— 能不能拼出路径由 `path_into` 决定。
     pub fn insert(
         &mut self,
@@ -320,56 +385,178 @@ impl FileIndex {
         is_dir: bool,
         priority: i32,
     ) -> Option<u32> {
+        self.insert_inner(disk, frn, parent_frn, name, is_dir, priority, false)
+    }
+
+    /// 重命名 / 移动之后的落库入口。
+    ///
+    /// 与 [`FileIndex::insert`] 的区别只有一点：记录号上只有一条链接时就地改名，
+    /// 旧名字彻底消失 —— 目录改名后子文件的路径要立刻跟着变。硬链接记录只能追加，
+    /// 旧名字留给搜索时的懒删除。
+    pub fn rename(
+        &mut self,
+        disk: char,
+        frn: u64,
+        parent_frn: u64,
+        name: &str,
+        is_dir: bool,
+        priority: i32,
+    ) -> Option<u32> {
+        self.insert_inner(disk, frn, parent_frn, name, is_dir, priority, true)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "参数与公开的 insert / rename 一一对应，只是多一个「是否合并重命名」的开关"
+    )]
+    fn insert_inner(
+        &mut self,
+        disk: char,
+        frn: u64,
+        parent_frn: u64,
+        name: &str,
+        is_dir: bool,
+        priority: i32,
+        collapse_rename: bool,
+    ) -> Option<u32> {
         if name.is_empty() {
             return None;
         }
         let disk = disk.to_ascii_uppercase();
         let record = mft_index(frn) as u32;
+        let flags = disk_code(disk) << DISK_SHIFT;
+        // 父目录的 MFT 记录号。⚠️ 盘根的子项存的也是 5，`NO_PARENT` 只留给盘根条目本身
+        let parent = mft_index(parent_frn) as u32;
+        let priority = if is_dir { DIR_PRIORITY } else { priority };
 
-        // 同一个 FRN 再插一次要就地更新，否则一次重命名会留下新旧两份记录
-        let existing = self.slot_of(disk, record).filter(|slot| {
-            self.entries
-                .get(*slot as usize)
-                .map(|entry| entry.frn == frn)
-                .unwrap_or(false)
-        });
+        // 同名同 FRN 再插一次是幂等的（重复枚举、事件回放、大小写不变的重命名）
+        if let Some(slot) = self.lookup_link(disk, frn, name) {
+            let (name_off, name_len) = self.push_name(name);
+            self.entries[slot as usize] = Entry {
+                name_off,
+                name_len,
+                flags,
+                parent,
+                priority,
+                frn,
+            };
+            return Some(slot);
+        }
+
+        // MFT 记录被回收给另一个文件：这条记录号上的全部旧链接一起作废
+        if self.record_bound_to_other_frn(disk, record, frn) {
+            self.free_record(disk, record);
+        }
+
+        // 重命名：记录号上只剩一条属于自己的链接 → 就地改名
+        if collapse_rename {
+            let only_link = self
+                .live_primary(disk, record)
+                .filter(|slot| self.entries[*slot as usize].frn == frn)
+                .filter(|_| {
+                    !self
+                        .link_slots(disk, record)
+                        .iter()
+                        .any(|link| self.live_slot_of(*link, disk).is_some())
+                });
+            if let Some(slot) = only_link {
+                let (name_off, name_len) = self.push_name(name);
+                self.entries[slot as usize] = Entry {
+                    name_off,
+                    name_len,
+                    flags,
+                    parent,
+                    priority,
+                    frn,
+                };
+                return Some(slot);
+            }
+        }
 
         let (name_off, name_len) = self.push_name(name);
-        let flags = disk_code(disk) << DISK_SHIFT;
-        let entry = Entry {
+        let slot = self.alloc_slot(Entry {
             name_off,
             name_len,
             flags,
-            // 父目录的 MFT 记录号。⚠️ 盘根的子项存的也是 5，
-            // `NO_PARENT` 只留给盘根条目本身
-            parent: mft_index(parent_frn) as u32,
-            priority: if is_dir { DIR_PRIORITY } else { priority },
+            parent,
+            priority,
             frn,
-        };
+        });
+        match self.live_primary(disk, record) {
+            // 同一记录号上已经有名字：这条是硬链接，挂到链接表上
+            Some(primary) => {
+                self.table_mut(disk)
+                    .links
+                    .entry(record)
+                    .or_insert_with(|| vec![primary])
+                    .push(slot);
+            }
+            None => self.set_slot(disk, frn, slot),
+        }
+        Some(slot)
+    }
 
-        match existing {
-            Some(slot) => {
-                // 记录已经在（live 数不变），只换内容
-                self.entries[slot as usize] = entry;
-                Some(slot)
+    /// 这个记录号上是否还有属于**别的** FRN 的存活条目（MFT 记录被回收）
+    fn record_bound_to_other_frn(&self, disk: char, mft: u32, frn: u64) -> bool {
+        let primary_reused = self
+            .live_primary(disk, mft)
+            .is_some_and(|slot| self.entries[slot as usize].frn != frn);
+        primary_reused
+            || self.link_slots(disk, mft).iter().any(|slot| {
+                self.live_slot_of(*slot, disk)
+                    .is_some_and(|entry| entry.frn != frn)
+            })
+    }
+
+    /// 清掉一个记录号上的主槽位与全部硬链接槽位
+    fn free_record(&mut self, disk: char, mft: u32) {
+        let mut slots: Vec<u32> = Vec::new();
+        if let Some(primary) = self.slot_of(disk, mft) {
+            slots.push(primary);
+        }
+        slots.extend_from_slice(self.link_slots(disk, mft));
+        for slot in slots {
+            if self.live_slot_of(slot, disk).is_some() {
+                self.free_slot(slot);
             }
-            None => {
-                // MFT 记录被回收：同一个记录号上已经是另一个文件的 FRN，先清掉旧的
-                if let Some(old) = self.slot_of(disk, record) {
-                    self.free_slot(old);
-                }
-                let slot = self.alloc_slot(entry);
-                self.set_slot(disk, frn, slot);
-                Some(slot)
-            }
+        }
+        if let Some(table) = self.tables.get_mut(&disk) {
+            table.links.remove(&mft);
         }
     }
 
+    /// 删除一个 FRN 的**全部**链接（含主槽位），返回是否有改动
     pub fn remove(&mut self, disk: char, frn: u64) -> bool {
-        let Some(slot) = self.lookup(disk, frn) else {
-            return false;
-        };
-        self.discard(slot)
+        let disk = disk.to_ascii_uppercase();
+        let mut removed = false;
+        if let Some(slot) = self.lookup(disk, frn) {
+            removed |= self.free_slot(slot);
+        }
+        let record = mft_index(frn) as u32;
+        let mut targets: Vec<u32> = Vec::new();
+        for slot in self.link_slots(disk, record) {
+            if self
+                .live_slot_of(*slot, disk)
+                .is_some_and(|entry| entry.frn == frn)
+            {
+                targets.push(*slot);
+            }
+        }
+        for slot in targets {
+            removed |= self.free_slot(slot);
+        }
+        removed
+    }
+
+    /// 按名字删掉**一条**链接（硬链接的删除事件带的是被删掉的那个名字）。
+    ///
+    /// 名字对不上时不做任何事：宁可留一条陈旧条目等懒删除，也不能把同一文件的
+    /// 其它链接一起删掉。
+    pub fn remove_link(&mut self, disk: char, frn: u64, name: &str) -> bool {
+        match self.lookup_link(disk, frn, name) {
+            Some(slot) => self.free_slot(slot),
+            None => false,
+        }
     }
 
     /// 删除一条记录（按槽位）。
@@ -383,16 +570,12 @@ impl FileIndex {
     /// 清掉某个盘的全部条目（重建这个盘的索引前调用）
     pub fn clear_disk(&mut self, disk: char) {
         let disk = disk.to_ascii_uppercase();
-        let Some(table) = self.tables.remove(&disk) else {
+        if self.tables.remove(&disk).is_none() {
             return;
-        };
-        for slot in &table.slots {
-            if *slot != NO_SLOT {
-                self.free_slot(*slot);
-            }
         }
-        if table.root != NO_SLOT {
-            self.free_slot(table.root);
+        // 直接扫条目：主槽位与硬链接槽位都要回收，只清 `slots` 会漏掉链接
+        for slot in self.slots_of_disk(disk) {
+            self.free_slot(slot);
         }
     }
 
@@ -496,47 +679,20 @@ impl FileIndex {
         slots.len()
     }
 
-    /// 某个盘的全部存活槽位（已排序、去重）
+    /// 某个盘的全部存活槽位（含硬链接槽位与盘根）
     fn slots_of_disk(&self, disk: char) -> Vec<u32> {
         let disk = disk.to_ascii_uppercase();
-        let Some(table) = self.tables.get(&disk) else {
-            return Vec::new();
-        };
-        let mut out: Vec<u32> = table
-            .slots
-            .iter()
-            .copied()
-            .filter(|slot| *slot != NO_SLOT)
-            .filter(|slot| self.is_live_of(*slot, disk))
-            .collect();
-        if table.root != NO_SLOT {
-            out.push(table.root);
-        }
-        out.sort_unstable();
-        out.dedup();
-        out
-    }
-
-    fn is_live_of(&self, slot: u32, disk: char) -> bool {
         self.entries
-            .get(slot as usize)
-            .map(|entry| entry.is_live() && entry.disk() == disk)
-            .unwrap_or(false)
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.is_live() && entry.disk() == disk)
+            .map(|(slot, _)| slot as u32)
+            .collect()
     }
 
-    /// 某个盘当前的存活条目数（含盘根）
+    /// 某个盘当前的存活条目数（含盘根与硬链接）
     pub fn count_disk(&self, disk: char) -> usize {
-        let disk = disk.to_ascii_uppercase();
-        let Some(table) = self.tables.get(&disk) else {
-            return 0;
-        };
-        // 盘根也在 `slots` 里，所以不用另外加一
-        table
-            .slots
-            .iter()
-            .copied()
-            .filter(|slot| *slot != NO_SLOT && self.is_live_of(*slot, disk))
-            .count()
+        self.slots_of_disk(disk).len()
     }
 
     /// 清理某个盘里「链条断了」的孤儿条目，返回清掉几条。
@@ -818,7 +974,44 @@ impl FileIndex {
 
         let mut tables = HashMap::with_capacity(raw_tables.len());
         for (disk, root, slots) in raw_tables {
-            tables.insert(disk, DiskTable { slots, root });
+            tables.insert(
+                disk,
+                DiskTable {
+                    slots,
+                    links: HashMap::new(),
+                    root,
+                },
+            );
+        }
+
+        // 快照只写「记录号 → 主槽位」，硬链接槽位从条目重建：
+        // 同一 (盘, 记录号) 上除主槽位以外的存活条目就是额外的链接。
+        for (slot, entry) in entries.iter().enumerate() {
+            if !entry.is_live() {
+                continue;
+            }
+            let disk = entry.disk();
+            let Some(table) = tables.get_mut(&disk) else {
+                continue;
+            };
+            let mft = mft_index(entry.frn) as u32;
+            let primary = table.slots.get(mft as usize).copied().unwrap_or(NO_SLOT);
+            if primary == slot as u32 {
+                continue;
+            }
+            if primary == NO_SLOT {
+                // 主槽位在保存前被删掉了（硬链接逐个删除）→ 把这条提升为主槽位
+                if mft as usize >= table.slots.len() {
+                    table.slots.resize(mft as usize + 1, NO_SLOT);
+                }
+                table.slots[mft as usize] = slot as u32;
+            } else {
+                table
+                    .links
+                    .entry(mft)
+                    .or_insert_with(|| vec![primary])
+                    .push(slot as u32);
+            }
         }
         let live = entries.iter().filter(|entry| entry.is_live()).count() as u32;
 
@@ -960,6 +1153,7 @@ impl<'a> Cursor<'a> {
 const PROGRESS_INTERVAL: u64 = 100_000;
 
 /// 建索引的参数
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct IndexConfig {
     /// 要索引的盘符
@@ -970,6 +1164,7 @@ pub struct IndexConfig {
     pub drop_previous: bool,
 }
 
+#[cfg(test)]
 impl IndexConfig {
     pub fn new(disks: Vec<char>) -> Self {
         Self {
@@ -999,6 +1194,7 @@ pub struct IndexProgress {
 }
 
 /// 单个盘的结果
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DiskReport {
     pub disk: char,
@@ -1010,16 +1206,20 @@ pub struct DiskReport {
     pub ignored: u64,
     /// 因父目录不在索引里（链条断裂）而收掉的条数
     pub broken: u64,
+    /// 本次枚举覆盖到的 USN 位点。保存下来后，实时跟随就能从这里无缝接上
+    pub mark: Option<JournalMark>,
     pub elapsed_ms: u128,
 }
 
 /// 整体结果
+#[cfg(test)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IndexReport {
     pub disks: Vec<DiskReport>,
     pub elapsed_ms: u128,
 }
 
+#[cfg(test)]
 impl IndexReport {
     pub fn total_written(&self) -> u64 {
         self.disks.iter().map(|disk| disk.written).sum()
@@ -1029,32 +1229,169 @@ impl IndexReport {
 /// 把一条 USN 记录翻译成索引条目，返回是否真的插进去了。
 ///
 /// 独立成函数以便脱开卷句柄单测。
+#[cfg(test)]
 fn insert_mft_record(
     index: &mut FileIndex,
     disk: char,
     priorities: &PriorityTable,
     record: &UsnRecord<'_>,
 ) -> bool {
-    // 盘根那条记录没有名字，必须跳过
-    if record.name_bytes.is_empty() {
+    let Some(entry) = MftEntry::from_record(disk, record) else {
         return false;
-    }
-    let name = record.name_lossy();
-    let is_dir = record.is_directory();
-    let priority = if is_dir {
-        DIR_PRIORITY
-    } else {
-        priorities.of_suffix(pathutil::suffix_str(&name))
     };
+    let priority = entry.priority(priorities);
     index
-        .insert(disk, record.frn, record.parent_frn, &name, is_dir, priority)
+        .insert(
+            entry.disk,
+            entry.frn,
+            entry.parent,
+            &entry.name,
+            entry.is_dir,
+            priority,
+        )
         .is_some()
 }
 
-/// 重建一个盘的索引：打开卷并校验 NTFS → 取/建 USN 日志拿到 `NextUsn` →
-/// 一趟 `FSCTL_ENUM_USN_DATA` 灌进内存索引 → 再走一趟按忽略规则清理并收孤儿。
+// ── 扫描（MFT 枚举）────────────────────────────────────────────────────
+
+/// 一条来自 MFT 的记录。
+///
+/// 与 [`UsnRecord`]（借用内核缓冲区）解耦：这个类型是自有的，因此既能落进索引，
+/// 也能直接编码成管道消息交给另一个进程。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MftEntry {
+    pub disk: char,
+    /// 完整文件引用号 `(序列号 << 48) | 记录号`
+    pub frn: u64,
+    /// 父目录的 FRN
+    pub parent: u64,
+    pub is_dir: bool,
+    pub name: String,
+}
+
+impl MftEntry {
+    /// 从一条 USN 记录构造；盘根那条无名记录返回 `None`
+    pub fn from_record(disk: char, record: &UsnRecord<'_>) -> Option<Self> {
+        if record.name_bytes.is_empty() {
+            return None;
+        }
+        Some(Self {
+            disk,
+            frn: record.frn,
+            parent: record.parent_frn,
+            is_dir: record.is_directory(),
+            name: record.name_lossy(),
+        })
+    }
+
+    /// 该文件的优先级（目录恒为 [`DIR_PRIORITY`]）
+    pub fn priority(&self, table: &PriorityTable) -> i32 {
+        if self.is_dir {
+            DIR_PRIORITY
+        } else {
+            table.of_suffix(pathutil::suffix_str(&self.name))
+        }
+    }
+}
+
+/// 扫描的落点：把「怎么枚举」与「枚举出来放哪儿」分开。
+///
+/// 两个实现：进程内直接灌进 `FileIndex`（[`rebuild_disk`]），或者编码后发给
+/// 主进程（提权子进程）。
+pub trait ScanSink {
+    /// 拿到该盘的日志位点、真正开始枚举之前调用
+    fn on_start(&mut self, disk: char, mark: JournalMark);
+    fn on_record(&mut self, record: &UsnRecord<'_>);
+    fn on_progress(&mut self, progress: IndexProgress);
+}
+
+/// 一次扫描的结果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanOutcome {
+    pub disk: char,
+    /// MFT 里读到的记录数
+    pub records: u64,
+    /// 本次枚举覆盖到的位点：之后的变更由 USN 日志负责，两边不重不漏
+    pub mark: JournalMark,
+}
+
+/// 枚举一个盘的整个 MFT，把每条记录交给 `sink`。
+///
+/// 位点取的是**枚举开始时**的 `NextUsn`（同时用作 `MFT_ENUM_DATA_V0.HighUsn`）。
+/// 用扫描结束后重新查到的 `NextUsn` 当位点会跳过这期间的变更 —— 那些变更既不在
+/// 这次枚举里，也不会被重放。
+pub fn scan_disk(disk: char, sink: &mut dyn ScanSink) -> Result<ScanOutcome> {
+    disk::ensure_supported(disk)?;
+    let volume = Volume::open(disk)?;
+    // 必须确认是 NTFS，否则下面这些 IOCTL 都没有意义
+    volume.verify_ntfs()?;
+    let journal = volume.ensure_journal()?;
+
+    let mark = JournalMark {
+        last_usn: journal.NextUsn,
+        journal_id: journal.UsnJournalID,
+    };
+    sink.on_start(disk, mark);
+
+    let mut scanned = 0u64;
+    let records = volume.enum_usn_records(journal.NextUsn, |record| {
+        sink.on_record(&record);
+        scanned += 1;
+        if scanned.is_multiple_of(PROGRESS_INTERVAL) {
+            sink.on_progress(IndexProgress {
+                disk,
+                scanned,
+                written: scanned,
+            });
+        }
+    })?;
+
+    Ok(ScanOutcome {
+        disk,
+        records,
+        mark,
+    })
+}
+
+/// 进程内扫描：边枚举边灌进 `FileIndex`
+#[cfg(test)]
+struct IndexSink<'a> {
+    index: &'a mut FileIndex,
+    priorities: &'a PriorityTable,
+    progress: &'a mut dyn FnMut(IndexProgress),
+    disk: char,
+    inserted: u64,
+}
+
+#[cfg(test)]
+impl ScanSink for IndexSink<'_> {
+    fn on_start(&mut self, disk: char, _mark: JournalMark) {
+        self.disk = disk;
+    }
+
+    fn on_record(&mut self, record: &UsnRecord<'_>) {
+        let disk = self.disk;
+        if insert_mft_record(&mut *self.index, disk, self.priorities, record) {
+            self.inserted += 1;
+            if self.inserted.is_multiple_of(PROGRESS_INTERVAL) {
+                (self.progress)(IndexProgress {
+                    disk,
+                    scanned: self.inserted,
+                    written: self.inserted,
+                });
+            }
+        }
+    }
+
+    fn on_progress(&mut self, progress: IndexProgress) {
+        (self.progress)(progress);
+    }
+}
+
+/// 重建一个盘的索引：清旧条目 + 建盘根 → 枚举 MFT 灌进索引 → 按忽略规则清理、收孤儿。
 ///
 /// 清理不能并进枚举那一趟：忽略规则是路径级的，而路径解析要求祖先已在索引里。
+#[cfg(test)]
 pub fn rebuild_disk(
     disk: char,
     index: &mut FileIndex,
@@ -1062,13 +1399,7 @@ pub fn rebuild_disk(
     config: &IndexConfig,
     progress: &mut dyn FnMut(IndexProgress),
 ) -> Result<DiskReport> {
-    disk::ensure_supported(disk)?;
     let started = Instant::now();
-
-    let volume = Volume::open(disk)?;
-    // 必须确认是 NTFS，否则下面这些 IOCTL 都没有意义
-    volume.verify_ntfs()?;
-    let journal = volume.ensure_journal()?;
 
     if config.drop_previous {
         index.clear_disk(disk);
@@ -1076,44 +1407,43 @@ pub fn rebuild_disk(
     // 盘根要先建出来，路径拼接靠它收尾
     index.ensure_root(disk);
 
-    let mut report = DiskReport {
-        disk,
-        ..Default::default()
+    let outcome = {
+        let mut sink = IndexSink {
+            index,
+            priorities,
+            progress,
+            disk,
+            inserted: 0,
+        };
+        scan_disk(disk, &mut sink)?
     };
-    let mut inserted = 0u64;
-
-    // ── 一趟：MFT 全量灌进内存索引 ────────────────────
-    let records = volume.enum_usn_records(journal.NextUsn, |record| {
-        if insert_mft_record(index, disk, priorities, &record) {
-            inserted += 1;
-            if inserted.is_multiple_of(PROGRESS_INTERVAL) {
-                progress(IndexProgress {
-                    disk,
-                    scanned: inserted,
-                    written: inserted,
-                });
-            }
-        }
-    })?;
-
-    report.records = records;
 
     // ── 第二趟：按路径应用忽略规则，再收掉孤儿 ──────────────
     let rules = IgnoreRules::new(&config.ignore_paths);
-    report.ignored = index.drop_ignored(disk, &rules) as u64;
-    report.broken = index.prune_orphans_of(disk) as u64;
-    report.written = index.count_disk(disk) as u64;
-    report.elapsed_ms = started.elapsed().as_millis();
+    let ignored = index.drop_ignored(disk, &rules) as u64;
+    let broken = index.prune_orphans_of(disk) as u64;
+    let written = index.count_disk(disk) as u64;
+
+    let report = DiskReport {
+        disk,
+        records: outcome.records,
+        written,
+        ignored,
+        broken,
+        mark: Some(outcome.mark),
+        elapsed_ms: started.elapsed().as_millis(),
+    };
 
     progress(IndexProgress {
         disk,
-        scanned: records,
-        written: report.written,
+        scanned: outcome.records,
+        written,
     });
     Ok(report)
 }
 
 /// 按 [`IndexConfig::disks`] 依次重建索引（串行，不同时持有多个卷句柄）
+#[cfg(test)]
 pub fn rebuild_all(
     index: &mut FileIndex,
     priorities: &PriorityTable,
@@ -1295,6 +1625,124 @@ mod tests {
         index.insert('C', frn(7), ROOT, "a.txt", false, 0);
         index.insert('C', frn(7), ROOT, "a.txt", false, 0);
         assert_eq!(index.iter_live().count(), 2, "盘根 + a.txt");
+    }
+
+    /// 建一棵带硬链接的小树：同一 FRN 在 `Windows` 与 `WinSxS` 下各有一个名字
+    fn hard_link_tree() -> FileIndex {
+        let mut index = FileIndex::new();
+        index.ensure_root('C');
+        index.insert('C', frn(10), ROOT, "Windows", true, DIR_PRIORITY);
+        index.insert('C', frn(11), ROOT, "WinSxS", true, DIR_PRIORITY);
+        index.insert('C', frn(20), frn(10), "zh-CN.mui", false, 0);
+        index.insert('C', frn(20), frn(11), "zh-CN-origin.mui", false, 0);
+        index
+    }
+
+    #[test]
+    fn hard_link_names_are_all_indexed() {
+        // NTFS 硬链接：同一个 FRN 有多个名字，枚举 MFT 会为每个名字各返回一条记录。
+        // 只留最后一条会让其余名字彻底搜不到（`System32\zh-CN\*.mui` 就是这种情况）。
+        let index = hard_link_tree();
+        let mut paths: Vec<String> = index
+            .iter_live()
+            .filter_map(|(slot, _)| index.path_of(slot))
+            .collect();
+        paths.sort();
+        assert!(paths.contains(&r"C:\Windows\zh-CN.mui".to_string()), "{paths:?}");
+        assert!(
+            paths.contains(&r"C:\WinSxS\zh-CN-origin.mui".to_string()),
+            "{paths:?}"
+        );
+        // 两个名字都指向同一个 FRN
+        assert!(index.lookup_link('C', frn(20), "zh-CN.mui").is_some());
+        assert!(index.lookup_link('C', frn(20), "zh-CN-origin.mui").is_some());
+    }
+
+    #[test]
+    fn removing_one_hard_link_keeps_the_others() {
+        let mut index = hard_link_tree();
+        assert!(index.remove_link('C', frn(20), "zh-CN.mui"));
+        assert_eq!(index.lookup_link('C', frn(20), "zh-CN.mui"), None);
+
+        let slot = index
+            .lookup_link('C', frn(20), "zh-CN-origin.mui")
+            .expect("另一条链接必须还在");
+        assert_eq!(
+            index.path_of(slot).as_deref(),
+            Some(r"C:\WinSxS\zh-CN-origin.mui")
+        );
+
+        // 名字对不上时什么也不做：不能把同一文件的其它链接一起删掉
+        assert!(!index.remove_link('C', frn(20), "missing.mui"));
+        assert!(index.lookup_link('C', frn(20), "zh-CN-origin.mui").is_some());
+        assert_eq!(index.iter_live().count(), 4);
+    }
+
+    #[test]
+    fn rename_collapses_single_link_and_updates_children() {
+        let mut index = FileIndex::new();
+        index.ensure_root('C');
+        index.insert('C', frn(10), ROOT, "old-dir", true, DIR_PRIORITY);
+        index.insert('C', frn(20), frn(10), "kept.exe", false, 30);
+
+        index.rename('C', frn(10), ROOT, "new-dir", true, DIR_PRIORITY);
+
+        assert_eq!(index.iter_live().count(), 3, "盘根 + 目录 + 文件，不该留下旧名");
+        let slot = index.lookup('C', frn(20)).unwrap();
+        assert_eq!(index.path_of(slot).as_deref(), Some(r"C:\new-dir\kept.exe"));
+    }
+
+    #[test]
+    fn reusing_an_mft_record_drops_all_its_links() {
+        let mut index = hard_link_tree();
+        let new_frn = (2u64 << 48) | 20; // 同一记录号，序列号不同 = 新文件
+        index.insert('C', new_frn, ROOT, "brand-new.txt", false, 0);
+
+        assert!(index.lookup_link('C', frn(20), "zh-CN.mui").is_none());
+        assert!(index.lookup_link('C', frn(20), "zh-CN-origin.mui").is_none());
+        let slot = index.lookup('C', new_frn).expect("新条目要在");
+        assert_eq!(name_of(&index, slot), "brand-new.txt");
+    }
+
+    #[test]
+    fn snapshot_roundtrip_keeps_hard_links() {
+        let dir = temp_dir("links-roundtrip");
+        let path = snapshot_path(&dir);
+        let mut index = hard_link_tree();
+        index
+            .save(&path, &PriorityTable::default(), &HashMap::new())
+            .unwrap();
+
+        let mut loaded = FileIndex::load(&path).unwrap().expect("应当能读回来");
+        assert_eq!(loaded.index.iter_live().count(), 5);
+        assert!(loaded.index.lookup_link('C', frn(20), "zh-CN.mui").is_some());
+        assert!(
+            loaded.index
+                .lookup_link('C', frn(20), "zh-CN-origin.mui")
+                .is_some()
+        );
+        // 载入后仍能精确删掉一条链接
+        assert!(loaded.index.remove_link('C', frn(20), "zh-CN.mui"));
+        assert!(
+            loaded.index
+                .lookup_link('C', frn(20), "zh-CN-origin.mui")
+                .is_some()
+        );
+
+        // 主槽位被删后再落一次快照，剩下的链接不能丢
+        loaded
+            .index
+            .save(&path, &PriorityTable::default(), &HashMap::new())
+            .unwrap();
+        let again = FileIndex::load(&path).unwrap().unwrap();
+        assert!(
+            again
+                .index
+                .lookup_link('C', frn(20), "zh-CN-origin.mui")
+                .is_some(),
+            "主槽位删掉后，剩下的链接要能被提升为新的主槽位"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

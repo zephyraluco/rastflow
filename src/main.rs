@@ -100,6 +100,11 @@ pub const WIN_H: f32 = 520.0;
 // ---------- 入口 ----------
 
 fn main() {
+    // 索引子进程：只做 MFT/USN，绝不能初始化 GPUI（它是个无窗口的小进程）
+    if search::helper_main::is_invocation() {
+        std::process::exit(search::helper_main::run());
+    }
+
     gpui_kit::application().with_assets(Assets).run(move |cx| {
         gpui_kit::init(cx);
         cx.set_global(AppSettings::default());

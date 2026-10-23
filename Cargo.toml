@@ -84,6 +84,8 @@ windows = { version = "0.62", features = [
     "Win32_System_IO",
     # FSCTL_* 常量与 MFT_ENUM_DATA_V0 / USN_RECORD_V2 等 USN 结构体
     "Win32_System_Ioctl",
+    # 命名管道：主进程与提权索引子进程之间的唯一通道
+    "Win32_System_Pipes",
     # OpenThread（用于中断阻塞在 USN 读取上的线程）
     "Win32_System_Threading",
     "Win32_UI_Controls",

@@ -16,17 +16,20 @@ use std::thread;
 use std::time::Duration;
 
 use super::index::{
-    self as index_mod, FileIndex, IndexConfig, IndexProgress, IndexReport, JournalMark, PathScratch,
-    SaveStats,
+    self as index_mod, FileIndex, JournalMark, MftEntry, PathScratch, SaveStats,
 };
+#[cfg(test)]
+use super::index::{IndexConfig, IndexProgress, IndexReport};
 use super::matcher::SearchQuery;
-use super::monitor::{self, MonitorConfig, MonitorEvent, MonitorHandle};
+use super::monitor::MonitorEvent;
+#[cfg(test)]
+use super::monitor;
 use super::pathutil::{self, IgnoreRules};
 use super::priority::{DIR_PRIORITY, PriorityTable};
 use super::win::disk;
 use super::win::known_folder;
+use super::win::path_exists;
 use super::win::usn::is_root;
-use super::win::volume::Volume;
 use super::{DEFAULT_MAX_RESULTS, MAX_SEARCH_TEXT_LEN, Result};
 
 #[derive(Clone, Debug)]
@@ -61,6 +64,7 @@ impl CoreConfig {
 }
 
 /// 启动时日志重放的结果
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CatchUp {
     /// 快照里没记位点（首次运行，或本来就是空索引）
@@ -71,6 +75,17 @@ pub enum CatchUp {
     NeedsRebuild,
     /// 补不了（多半是非管理员打不开卷），索引会停留在快照时的状态
     Unavailable(String),
+}
+
+/// 一个盘扫描收尾后的统计
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScanStats {
+    /// 最终留在索引里的条数
+    pub written: u64,
+    /// 因命中忽略目录而丢掉的条数
+    pub ignored: u64,
+    /// 因祖先链断裂而收掉的条数
+    pub broken: u64,
 }
 
 /// 搜索核心。需要放进 `Arc` 才能发起搜索（[`Engine::search`] 会起后台线程）。
@@ -152,6 +167,10 @@ impl Engine {
     }
 
     /// 重建索引。**会阻塞**，请放到后台线程里调用。完成后落一次快照。
+    ///
+    /// 生产路径不用它：建库跑在提权子进程里，主进程只接收记录（见 [`Engine::begin_scan`]）。
+    /// 保留它是为了给需要真实卷的端到端测试一条不跨进程的路径。
+    #[cfg(test)]
     pub fn build_index(
         &self,
         progress: Option<&mut dyn FnMut(IndexProgress)>,
@@ -169,23 +188,15 @@ impl Engine {
             index_mod::rebuild_all(&mut index, &read(&self.priorities), &index_config, progress)?
         };
 
-        // 位点重新对齐到「现在」：旧位点对应的日志区间已经由这次全量扫描覆盖了
+        // 位点用「枚举那一刻」的 NextUsn：它同时是这次 MFT 枚举的 HighUsn，
+        // 之后的变更由 USN 日志负责，两边不重不漏。扫描结束后再查一次 NextUsn
+        // 会把它与枚举之间发生的变更整段跳掉。
         let mut marks = lock(&self.marks);
         marks.clear();
-        for disk in &self.disks {
-            let Ok(volume) = Volume::open(*disk) else {
-                continue;
-            };
-            let Ok(journal) = volume.ensure_journal() else {
-                continue;
-            };
-            marks.insert(
-                *disk,
-                JournalMark {
-                    last_usn: journal.NextUsn,
-                    journal_id: journal.UsnJournalID,
-                },
-            );
+        for disk in &report.disks {
+            if let Some(mark) = disk.mark {
+                marks.insert(disk.disk, mark);
+            }
         }
         drop(marks);
 
@@ -205,6 +216,9 @@ impl Engine {
     /// 启动时的「补课」：从快照里记的位点把日志重放到当前末尾。
     ///
     /// 每个盘独立判断，一个盘的日志没用了不会拖累其它盘。
+    ///
+    /// 生产路径不用它：重放同样需要卷句柄，跑在提权子进程里。
+    #[cfg(test)]
     pub fn catch_up(&self, progress: &mut dyn FnMut(IndexProgress)) -> CatchUp {
         let marks = lock(&self.marks).clone();
         if marks.is_empty() {
@@ -226,72 +240,100 @@ impl Engine {
         CatchUp::Replayed { events: replayed }
     }
 
+    #[cfg(test)]
     fn catch_up_disk(
         &self,
         disk: char,
         mark: JournalMark,
         progress: &mut dyn FnMut(IndexProgress),
     ) -> Result<CatchUp> {
-        let volume = Volume::open(disk)?;
-        let journal = volume.query_journal()?;
-
-        // 日志被重建过 → 位点对新日志没有意义
-        if journal.UsnJournalID != mark.journal_id {
-            return Ok(CatchUp::NeedsRebuild);
-        }
-        // 日志已经跑满一圈、把位点覆盖掉了 → 中间的变更找不回来了
-        if mark.last_usn < journal.FirstUsn {
-            return Ok(CatchUp::NeedsRebuild);
-        }
-
-        let target = journal.NextUsn;
-        let mut cursor = mark.last_usn;
-        let mut seen = 0u64;
-
-        // 一批一批读：每次 read 返回一缓冲区的记录，处理完再接着读，
-        // 这样内存不会因为「积了半年的变更」而爆掉
-        while cursor < target {
-            let mut events: Vec<MonitorEvent> = Vec::new();
-            let (next, count) =
-                volume.read_usn_records(journal.UsnJournalID, cursor, false, |record| {
-                    if let Some(event) = monitor::record_to_event(disk, &record) {
-                        events.push(event);
-                    }
-                })?;
-            // 没有前进就说明读完了（或日志在这一刻被清空），防死循环
-            if next <= cursor {
-                break;
-            }
-            cursor = next;
-
-            let mut index = write(&self.index);
-            for event in &events {
-                apply_to_index(&mut index, event, &self.ignore, &read(&self.priorities));
-            }
-            drop(index);
-
-            seen += u64::from(count);
-            progress(IndexProgress {
-                disk,
-                scanned: seen,
-                written: seen,
-            });
-        }
-
-        // 重放是幂等的（按 FRN upsert / remove），所以位点略微重叠也无害
-        lock(&self.marks).insert(
+        let outcome = monitor::replay_disk(
             disk,
-            JournalMark {
-                last_usn: cursor.max(target),
-                journal_id: journal.UsnJournalID,
+            mark,
+            &mut |seen| {
+                progress(IndexProgress {
+                    disk,
+                    scanned: seen,
+                    written: seen,
+                });
             },
-        );
-        Ok(CatchUp::Replayed { events: seen })
+            &mut |batch| {
+                let mut index = write(&self.index);
+                let priorities = read(&self.priorities);
+                for event in batch {
+                    apply_to_index(&mut index, event, &self.ignore, &priorities);
+                }
+            },
+        )?;
+
+        match outcome {
+            monitor::ReplayOutcome::Replayed { events, mark } => {
+                lock(&self.marks).insert(disk, mark);
+                Ok(CatchUp::Replayed { events })
+            }
+            monitor::ReplayOutcome::NeedsRebuild => Ok(CatchUp::NeedsRebuild),
+        }
     }
 
-    /// 启动增量监控
-    pub fn start_monitor(&self) -> Result<MonitorHandle> {
-        MonitorHandle::start(&MonitorConfig::new(self.disks.clone()))
+    /// 开始接收某个盘的全量扫描：清掉该盘的旧条目并建出盘根。
+    ///
+    /// 之后用 [`Engine::insert_scanned_batch`] 灌记录，最后 [`Engine::finish_scan`] 收尾。
+    /// 这三步对应子进程流过来的 `ScanStarted` / `Records` / `ScanFinished`。
+    pub fn begin_scan(&self, disk: char) {
+        let mut index = write(&self.index);
+        index.clear_disk(disk);
+        index.ensure_root(disk);
+    }
+
+    /// 落入一批扫描记录，返回真正插进去的条数。
+    ///
+    /// 这里**不**做路径级过滤：忽略规则要等祖先都到齐、能拼出完整路径之后再判。
+    pub fn insert_scanned_batch(&self, entries: &[MftEntry]) -> usize {
+        let mut index = write(&self.index);
+        let priorities = read(&self.priorities);
+        let mut inserted = 0;
+        for entry in entries {
+            let priority = entry.priority(&priorities);
+            if index
+                .insert(
+                    entry.disk,
+                    entry.frn,
+                    entry.parent,
+                    &entry.name,
+                    entry.is_dir,
+                    priority,
+                )
+                .is_some()
+            {
+                inserted += 1;
+            }
+        }
+        inserted
+    }
+
+    /// 扫描收尾：按忽略规则清理、收掉孤儿，并记下本次扫描覆盖到的位点。
+    pub fn finish_scan(&self, disk: char, mark: JournalMark) -> ScanStats {
+        let mut index = write(&self.index);
+        let ignored = index.drop_ignored(disk, &self.ignore) as u64;
+        let broken = index.prune_orphans_of(disk) as u64;
+        let written = index.count_disk(disk) as u64;
+        drop(index);
+        lock(&self.marks).insert(disk, mark);
+        ScanStats {
+            written,
+            ignored,
+            broken,
+        }
+    }
+
+    /// 记下一个盘的日志位点（重放成功之后调用）
+    pub fn set_mark(&self, disk: char, mark: JournalMark) {
+        lock(&self.marks).insert(disk, mark);
+    }
+
+    /// 当前各盘的位点快照
+    pub fn marks(&self) -> HashMap<char, JournalMark> {
+        lock(&self.marks).clone()
     }
 
     /// 把一条监控事件应用到索引（不重扫全盘，只改一条记录）。
@@ -431,10 +473,11 @@ impl Engine {
                 if !index.path_into(*slot, &mut scratch, &mut path) {
                     continue; // 链条断了（孤儿），跳过
                 }
-                if Path::new(&path).exists() {
-                    state.push(&path);
-                } else {
-                    ghosts.push(*slot);
+                // `Some(false)` 才是「确实不在了」；权限不足、长路径判断不了时
+                // （`None`）宁可把结果留下，也不能把条目从索引里摘掉。
+                match path_exists(&path) {
+                    Some(false) => ghosts.push(*slot),
+                    _ => state.push(&path),
                 }
             }
         }
@@ -527,6 +570,7 @@ fn apply_to_index(
             parent,
             name,
             is_dir,
+            renamed,
         } => {
             // 父目录必须已经在索引里。不在的话这条记录永远解析不出路径、
             // 搜不到，插进去只是白占内存 —— 等下次全量重建再收它。
@@ -538,7 +582,13 @@ fn apply_to_index(
             } else {
                 priorities.of_suffix(pathutil::suffix_str(name))
             };
-            let Some(slot) = index.insert(*disk, *frn, *parent, name, *is_dir, priority) else {
+            // 重命名要就地改名（旧名立刻消失）；新建 / 新增硬链接要再加一条名字
+            let slots = if *renamed {
+                index.rename(*disk, *frn, *parent, name, *is_dir, priority)
+            } else {
+                index.insert(*disk, *frn, *parent, name, *is_dir, priority)
+            };
+            let Some(slot) = slots else {
                 return false;
             };
             // 路径级过滤：忽略目录（默认表里就含回收站）。
@@ -553,16 +603,28 @@ fn apply_to_index(
             }
             true
         }
-        MonitorEvent::Removed { disk, frn } => {
+        MonitorEvent::Removed { disk, frn, name } => {
+            // 删除事件带的是「被删掉的那个名字」：硬链接文件只删这一条链接，
+            // 同一 FRN 的其它名字还在。名字缺失时才退化成按 FRN 删。
+            let slot = if name.is_empty() {
+                index.lookup(*disk, *frn)
+            } else {
+                index
+                    .lookup_link(*disk, *frn, name)
+                    .or_else(|| index.lookup(*disk, *frn))
+            };
             // 删到回收站不算删除：否则用户还没清空回收站，搜索里就找不到了
-            let recycled = index
-                .lookup(*disk, *frn)
+            let recycled = slot
                 .and_then(|slot| index.path_of(slot))
                 .is_some_and(|path| pathutil::is_recycle_bin(&path));
             if recycled {
                 return false;
             }
-            index.remove(*disk, *frn)
+            if name.is_empty() {
+                index.remove(*disk, *frn)
+            } else {
+                index.remove_link(*disk, *frn, name)
+            }
         }
         // 这两种只是通知，不涉及索引内容
         MonitorEvent::DiskWarning { .. } | MonitorEvent::DiskStopped(_) => false,
@@ -977,6 +1039,27 @@ mod tests {
             parent,
             name: name.to_string(),
             is_dir,
+            renamed: false,
+        }
+    }
+
+    /// 重命名/移动：同一 FRN 换了名字或换了父目录
+    fn renamed(disk: char, frn: u64, parent: u64, name: &str, is_dir: bool) -> MonitorEvent {
+        MonitorEvent::Added {
+            disk,
+            frn,
+            parent,
+            name: name.to_string(),
+            is_dir,
+            renamed: true,
+        }
+    }
+
+    fn removed(disk: char, frn: u64, name: &str) -> MonitorEvent {
+        MonitorEvent::Removed {
+            disk,
+            frn,
+            name: name.to_string(),
         }
     }
 
@@ -1014,19 +1097,13 @@ mod tests {
 
         // 删除
         assert!(engine
-            .apply_event(&MonitorEvent::Removed {
-                disk: 'C',
-                frn: file_frn
-            })
+            .apply_event(&removed('C', file_frn, "rastflow-event.exe"))
             .unwrap());
         assert!(read(&engine.index).lookup('C', file_frn).is_none());
         assert!(search(&engine, "rastflow-event").is_empty());
         // 再删一次就「没改动」
         assert!(!engine
-            .apply_event(&MonitorEvent::Removed {
-                disk: 'C',
-                frn: file_frn
-            })
+            .apply_event(&removed('C', file_frn, "rastflow-event.exe"))
             .unwrap());
 
         // DiskWarning / DiskStopped 不涉及索引内容
@@ -1058,6 +1135,50 @@ mod tests {
     }
 
     #[test]
+    fn hard_linked_file_is_searchable_under_every_name() {
+        // 真机上的典型形态：`System32\zh-CN\*.mui` 与 WinSxS 里的原件是同一个 FRN。
+        // 索引只留一个名字时，另一个名字就永远搜不到。
+        let data_dir = temp_dir("hard-link-index");
+        let files_dir = temp_dir("hard-link-files");
+        let engine = open_in_memory(test_config(&data_dir), vec!['C']);
+        write(&engine.index).ensure_root('C');
+
+        let dir_text = files_dir.to_string_lossy().to_string();
+        index_dir_path(&engine, &dir_text);
+        let dir_frn = synthetic_frn(&dir_text);
+
+        let origin = files_dir.join("origin.mui");
+        std::fs::write(&origin, b"x").unwrap();
+        let linked = files_dir.join("linked.mui");
+        std::fs::hard_link(&origin, &linked).unwrap();
+
+        // 同一 FRN、两个名字 —— 与 MFT 枚举出来的两条记录一致
+        let shared_frn = synthetic_frn(&origin.to_string_lossy());
+        assert!(engine
+            .apply_event(&added('C', shared_frn, dir_frn, "origin.mui", false))
+            .unwrap());
+        assert!(engine
+            .apply_event(&added('C', shared_frn, dir_frn, "linked.mui", false))
+            .unwrap());
+
+        let origin_text = origin.to_string_lossy().to_string();
+        let linked_text = linked.to_string_lossy().to_string();
+        assert_eq!(search(&engine, "origin.mui"), vec![origin_text.clone()]);
+        assert_eq!(search(&engine, "linked.mui"), vec![linked_text.clone()]);
+
+        // 删掉一条链接：另一条仍然搜得到
+        std::fs::remove_file(&linked).unwrap();
+        assert!(engine
+            .apply_event(&removed('C', shared_frn, "linked.mui"))
+            .unwrap());
+        assert!(search(&engine, "linked.mui").is_empty());
+        assert_eq!(search(&engine, "origin.mui"), vec![origin_text]);
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(&files_dir);
+    }
+
+    #[test]
     fn renaming_directory_updates_all_child_paths() {
         // 这是层次化内存索引相对「存完整路径」最大的好处
         let data_dir = temp_dir("rename-dir");
@@ -1078,7 +1199,7 @@ mod tests {
 
         // 目录改名：只更新目录那一条
         assert!(engine
-            .apply_event(&added('C', dir_frn, ROOT_MFT_INDEX, "new-dir", true))
+            .apply_event(&renamed('C', dir_frn, ROOT_MFT_INDEX, "new-dir", true))
             .unwrap());
 
         // 子文件的路径自动变成新名字，**不需要**逐条更新
@@ -1300,7 +1421,7 @@ mod tests {
 
         let started = std::time::Instant::now();
         let report = engine.build_index(None).expect("建索引失败");
-        println!("建索引完成：{report:?}");
+        println!("建索引完成：共 {} 条，{report:?}", report.total_written());
 
         let (entries, bytes) = {
             let index = read(&engine.index);
@@ -1340,20 +1461,30 @@ mod tests {
         if std::env::var("RASTFLOW_CORE_E2E_MONITOR").is_ok() {
             use std::sync::mpsc::RecvTimeoutError;
 
-            let monitor = engine.start_monitor().expect("启动监控失败");
-            println!("监控已启动，10 秒内随意新建/删除文件…");
+            let (sender, receiver) = std::sync::mpsc::channel::<Vec<MonitorEvent>>();
+            let sink: monitor::EventSink = Arc::new(move |batch: &[MonitorEvent]| {
+                let _ = sender.send(batch.to_vec());
+                Ok(())
+            });
+            let config =
+                monitor::MonitorConfig::new(engine.disks().to_vec()).with_start(engine.marks());
+            let (handle, live) =
+                monitor::MonitorHandle::start(&config, sink).expect("启动监控失败");
+            println!("监控已启动（{live} 个盘），10 秒内随意新建/删除文件…");
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             while std::time::Instant::now() < deadline {
-                match monitor.recv_timeout(Duration::from_millis(500)) {
-                    Ok(event) => {
-                        println!("  事件 {event:?}");
-                        let _ = engine.apply_event(&event);
+                match receiver.recv_timeout(Duration::from_millis(500)) {
+                    Ok(batch) => {
+                        for event in batch {
+                            println!("  事件 {event:?}");
+                            let _ = engine.apply_event(&event);
+                        }
                     }
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => break,
                 }
             }
-            monitor.join();
+            handle.join();
             println!("监控已停止");
         }
 
