@@ -554,20 +554,22 @@ pub struct HelperSession {
 }
 
 impl HelperSession {
-    /// 优先连常驻索引服务（零 UAC）；没有服务时回退到 `runas` 拉起一次性子进程。
-    pub fn start(disks: &[char]) -> Result<Self> {
-        match Self::connect_service() {
-            Ok(session) => {
-                eprintln!(
-                    "[rastflow] 已连接索引服务（pid {}），无需要管理员权限",
-                    session.pid
-                );
-                return Ok(session);
-            }
-            Err(err) => {
-                eprintln!("[rastflow] 索引服务不可用（{err}），改用一次性的提权子进程");
-            }
-        }
+    /// 只连常驻索引服务，**绝不提权**。
+    ///
+    /// 启动路径用它：服务不可用时宁可这轮没有实时增量，也不为了它弹 UAC。
+    pub fn connect_running_service() -> Result<Self> {
+        let session = Self::connect_service()?;
+        eprintln!(
+            "[rastflow] 已连接索引服务（pid {}），无需管理员权限",
+            session.pid
+        );
+        Ok(session)
+    }
+
+    /// 直接拉起一次性的提权子进程（会弹一次 UAC）。
+    ///
+    /// 只在「本地还没有索引快照、必须建库」时用：那时不提权就什么也搜不到。
+    pub fn spawn_elevated_session(disks: &[char]) -> Result<Self> {
         Self::spawn_once(disks)
     }
 
@@ -577,10 +579,10 @@ impl HelperSession {
         let pid = handle
             .server_pid()
             .ok_or_else(|| CoreError::Helper("取不到索引服务的进程 id".to_string()))?;
-        if !process::is_system_process(pid) {
+        if !process::is_trusted_server_process(pid) {
             // 有人抢先把管道名占了：拒绝，而不是把文件名列表交给一个陌生进程
             return Err(CoreError::Helper(format!(
-                "索引管道被非系统进程占用（pid {pid}）"
+                "索引管道的服务端不是索引服务（pid {pid}）"
             )));
         }
         Self::handshake(handle, None, pid)
@@ -866,7 +868,7 @@ mod tests {
         );
 
         // 服务在跑，主进程连它不需要任何提权
-        let session = HelperSession::start(&[]).expect("应当能连上索引服务");
+        let session = HelperSession::connect_running_service().expect("应当能连上索引服务");
         assert!(session.is_service(), "应当走服务而不是一次性子进程");
         drop(session);
 

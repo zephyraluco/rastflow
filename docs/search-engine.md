@@ -33,7 +33,7 @@ flowchart LR
         S1["会话：Volume / MFT / USN"]
         L --> S1
     end
-    subgraph H["一次性子进程（未装服务时的兜底，runas）"]
+    subgraph H["一次性子进程（仅首轮建库，runas）"]
         V["Volume / MFT / USN"]
     end
     S1 -- "记录 / 事件（命名管道）" --> P
@@ -51,18 +51,33 @@ flowchart LR
 | | 索引服务（推荐） | 一次性子进程 |
 | --- | --- | --- |
 | 身份 | Windows 服务，`LocalSystem` | `runas` 拉起的提权进程 |
-| UAC | **只在安装那一次** | **每次启动都要** |
+| UAC | **只在安装那一次** | **只在「还没有索引快照」的首轮建库时** |
 | 随系统启动 | 是（`SERVICE_AUTO_START`） | 否 |
 | 进程生命周期 | 常驻；空闲时约 1 MB 内存 | 跟主进程同生共死 |
 | 谁建管道 | 服务（固定名） | 主进程（随机名） |
-| 连接校验 | 校验服务端进程是 `LocalSystem` | 校验客户端 PID = 刚拉起的子进程 |
+| 连接校验 | 能读令牌时校验 `LocalSystem`；读不到（普通用户对 SYSTEM 必然 `ACCESS_DENIED`）按「权限更高」放行 | 校验客户端 PID = 刚拉起的子进程 |
 
-`HelperSession::start` 先试服务、连不上再回退。两种后端跑的是**同一套协议**
+启动路径的策略在 `layout/filesearch.rs`：**先只试服务**（`HelperSession::connect_running_service`，
+绝不提权）；连不上时，有快照就直接用（`Ready { monitoring: false }`），没有快照才
+`spawn_elevated_session` 提权建库。两种后端跑的是**同一套协议**
 （`Scan` / `CatchUp` / `Monitor` / `Stop`）与同一个会话函数，所以行为一致。
+
+这么分层是因为服务是**单会话**的：只要托盘里已经有一个实例连着服务，新实例就会
+「连不上」。如果这里自动回退 `runas`，双开（含开发时 `cargo run`）就会每次弹 UAC。
 
 ⚠️ 服务的管道名是固定的（`\\.\pipe\rastflow-index-service`），这意味着「先占坑」
 是可能的。所以客户端连上之后会调 `GetNamedPipeServerProcessId` 再看那个进程的令牌
 是不是 `LocalSystem`，不是就拒绝 —— 而不是把全盘文件名交给一个陌生进程。
+
+这里有个容易踩的坑：**普通用户进程打不开 `LocalSystem` 进程的句柄与令牌**（连
+`PROCESS_QUERY_LIMITED_INFORMATION` 都是 `Access Denied`），而普通用户自己的进程
+一定打得开。所以校验把「拒绝访问」当成「对方权限更高」放行；若当成失败，主进程
+会误判服务不可用→回退 `runas`→**每次启动都弹 UAC**。
+
+⚠️ 服务创建管道时必须显式指定 DACL（`A;;FA;;;SY` / `A;;FA;;;BA` / `A;;GRGW;;;AU`）。
+不指定的话管道继承 `LocalSystem` 的默认 DACL，`Everyone` 只有 `FR`（只读），而客户端
+请求 `GENERIC_READ | GENERIC_WRITE`，于是普通用户**连不上**——同样会误回退到 `runas`。
+回归测试：`pipe::tests::service_pipe_dacl_grants_read_write_to_authenticated_users`。
 
 ⚠️ 服务会话期间 `sc stop` 不会立刻生效：服务主线程正阻塞在等客户端的 `ReadFile` 上。
 控制处理器因此会 `CancelSynchronousIo` 打断它（accept 阶段另有 2 秒轮询兜底）。

@@ -89,6 +89,8 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Gdi",
     # CreateFileW 参数里的 SECURITY_ATTRIBUTES（传 None 也需要类型可见）
     "Win32_Security",
+    # 索引服务管道的显式 DACL（SDDL → SECURITY_DESCRIPTOR）
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_LibraryLoader",
     # DeviceIoControl / CancelSynchronousIo

@@ -6,7 +6,9 @@
 
 use std::mem::size_of;
 
-use windows::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, HANDLE, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_CANCELLED, HANDLE, WAIT_OBJECT_0,
+};
 use windows::Win32::Security::{
     GetTokenInformation, IsWellKnownSid, TOKEN_QUERY, TOKEN_USER, TokenUser, WinLocalSystemSid,
 };
@@ -167,24 +169,32 @@ pub fn exit_with_parent(parent_pid: u32) {
         });
 }
 
-/// 这个进程是不是以 `LocalSystem` 身份运行。
+/// 这个进程是否可信地“以更高权限运行”（典型就是索引服务的 `LocalSystem`）。
 ///
-/// 用来识别「连上的管道对面到底是不是我们装的索引服务」：普通用户（包括管理员
-/// 之外的任何本地账户）都无法拿到 SYSTEM 令牌，所以这一条能挡住「先占坑再冒充」
-/// 的管道劫持。已经是管理员的进程本来就能做任何事，不在威胁模型内。
-pub fn is_system_process(pid: u32) -> bool {
+/// 用来识别「连上的管道对面到底是不是我们装的索引服务」。判定分两种情况：
+///
+/// - **令牌读得到**：严格要求 `TokenUser` 是 `WinLocalSystemSid`。
+/// - **令牌读不到**：普通用户打不开 `LocalSystem` 进程的句柄与令牌（`ACCESS_DENIED`），
+///   而普通用户自己的进程一定能打开。所以“拒绝访问”本身就已经证明对方权限高于本进程。
+///
+/// 第二类是必需的：如果把它当成失败，主进程就会误判服务不可用而回退到 `runas`，
+/// 导致每次启动都弹 UAC。已经拿到管理员权限的进程本来就能做更多，不在威胁模型内。
+pub fn is_trusted_server_process(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
     unsafe {
-        let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
-            return false;
+        let process = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            Ok(process) => process,
+            // 打不开只可能是权限不足（进程已退出会是 INVALID_PARAMETER）
+            Err(err) => return win32_code(&err) == ERROR_ACCESS_DENIED.0,
         };
         let mut token = HANDLE::default();
         let opened = OpenProcessToken(process, TOKEN_QUERY, &mut token).is_ok();
         let _ = CloseHandle(process);
         if !opened {
-            return false;
+            // 同上：句柄已经打开，令牌却拿不到，只能是对方权限更高
+            return true;
         }
 
         // 先问需要多大（TokenUser 的数据长度取决于 SID 长度）

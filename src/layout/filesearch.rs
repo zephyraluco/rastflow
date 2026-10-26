@@ -386,18 +386,38 @@ fn bootstrap_engine(inner: &Arc<Inner>) -> crate::search::Result<()> {
         return Ok(());
     }
 
-    // 提权子进程：真正碰 MFT/USN 的只有它。
+    // 先**只连服务**：这条路径不提权，所以启动绝不会弹 UAC。
     //
-    // 启动时会弹一次 UAC（今天整个进程提权也要弹）。用户拒绝时不是死路：
-    // 已有索引照样能搜，只是拿不到离线补课与实时增量。
-    let session = match HelperSession::start(engine.disks()) {
+    // 为什么不直接 HelperSession::start：它连不上服务时会回退到 `runas`，而服务是
+    // 单会话的 —— 只要托盘里已经有一个实例连上了服务，新实例 1.5 秒后就会「连不上」
+    // 并去提权，每次启动都弹 UAC。
+    let session = match HelperSession::connect_running_service() {
         Ok(session) => session,
-        Err(err) if engine.is_indexed() && declined_elevation(&err) => {
-            eprintln!("[rastflow] 未取得管理员权限，索引可用但不会跟随磁盘变化：{err}");
-            inner.set_status(SearchStatus::Ready { monitoring: false });
-            return Ok(());
+        Err(err) => {
+            if engine.is_indexed() {
+                // 已有快照：直接用，这轮只是拿不到离线补课与实时增量。
+                eprintln!(
+                    "[rastflow] 索引服务不可用（{err}）；本次启动不提权，先用已有索引搜索"
+                );
+                inner.set_status(SearchStatus::Ready { monitoring: false });
+                return Ok(());
+            }
+            // 没有快照就什么都搜不到，只能提权建库（整个启动路径里唯一会弹 UAC 的情况）
+            eprintln!("[rastflow] 索引服务不可用（{err}），且尚无索引，改为一次性提权子进程");
+            match HelperSession::spawn_elevated_session(engine.disks()) {
+                Ok(session) => session,
+                Err(err) if declined_elevation(&err) => {
+                    eprintln!("[rastflow] 未取得管理员权限，索引尚未建立：{err}");
+                    inner.set_status(SearchStatus::Unavailable {
+                        reason: "建立文件索引需要一次管理员权限；也可以安装索引服务，之后永久免提权"
+                            .to_string(),
+                        needs_admin: true,
+                    });
+                    return Ok(());
+                }
+                Err(err) => return Err(err),
+            }
         }
-        Err(err) => return Err(err),
     };
 
     let pump_engine = Arc::clone(&engine);

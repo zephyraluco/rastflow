@@ -53,7 +53,7 @@ pub const UNINSTALL_FLAG: &str = "--uninstall-service";
 /// 服务看到的管道名。固定名字，服务是长期存在的服务端。
 ///
 /// 固定名意味着「先占坑」是可能的，所以客户端连上之后必须校验服务端进程是
-/// `LocalSystem`（见 [`super::process::is_system_process`]）。
+/// `LocalSystem`（见 [`super::process::is_trusted_server_process`]）。
 pub const PIPE_NAME: &str = r"\\.\pipe\rastflow-index-service";
 
 /// 升级/重装时等旧服务停下来的上限。
