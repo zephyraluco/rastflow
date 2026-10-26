@@ -117,7 +117,7 @@ windows = { version = "0.62", features = [
     "Win32_System_Registry",
 ] }
 
-[target.'cfg(windows)'.build-dependencies]
+[build-dependencies]
 # 把 assets/app-icon.ico 与版本信息写进 exe 的资源段，
 # 否则打包出来的程序在资源管理器/任务栏里是默认空白图标。
 winresource = "0.1"
