@@ -222,6 +222,10 @@ mod imp {
             return LRESULT(0);
         }
 
+        if message == crate::platform::instance::ACTIVATE_MESSAGE {
+            let _ = context.events.send(TrayEvent::LeftClick);
+            return LRESULT(0);
+        }
         match message {
             TRAY_CALLBACK_MESSAGE => {
                 // 这里用的是旧版回调协议（不调 NIM_SETVERSION）：

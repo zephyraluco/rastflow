@@ -5,7 +5,6 @@ use gpui_kit::component::{
     list::{ListDelegate, ListItem, ListState},
     *,
 };
-use std::process::Command;
 use std::sync::Arc;
 
 use crate::app_list::{
@@ -22,28 +21,7 @@ use super::icon_cache::IconCache;
 
 #[cfg(windows)]
 pub(super) fn launch_entry(entry: &AppEntry) -> std::io::Result<()> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
-
-    let target = entry
-        .launch_target
-        .clone()
-        .unwrap_or_else(|| entry.name.to_string());
-
-    // UWP / Store 应用没有可直接执行的文件（目标是 `shell:AppsFolder\<AppID>`），
-    // 交给 explorer 去解析 shell 命名空间；`cmd /C start` 认不出这种目标。
-    if target.starts_with("shell:") {
-        return Command::new("explorer.exe")
-            .arg(&target)
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn()
-            .map(|_| ());
-    }
-
-    let mut cmd = Command::new("cmd");
-    cmd.args(["/C", "start", ""]);
-    cmd.arg(&target);
-    cmd.creation_flags(CREATE_NO_WINDOW).spawn().map(|_| ())
+    crate::platform::open_target(entry.launch_target.as_deref().unwrap_or(entry.name.as_ref()))
 }
 
 #[cfg(not(windows))]

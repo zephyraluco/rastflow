@@ -407,17 +407,7 @@ impl FileResult {
 
 /// 打开搜索结果（文件用默认程序，目录用资源管理器）
 pub fn open_result(result: &FileResult) -> std::io::Result<()> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-    // 用 cmd /C start 而不是 ShellExecuteW：空参数 `""` 会被当作窗口标题，
-    // 这样路径里的空格与引号都不需要自己转义
-    std::process::Command::new("cmd")
-        .args(["/C", "start", ""])
-        .arg(&result.path)
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
-        .map(|_| ())
+    crate::platform::open_target(&result.path.to_string_lossy())
 }
 
 // ---------- 内部实现 ----------

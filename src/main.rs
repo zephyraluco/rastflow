@@ -11,6 +11,7 @@ mod app_icon;
 mod search;
 mod tray;
 mod updater;
+mod platform;
 
 use gpui::*;
 use gpui_kit::component::*;
@@ -128,6 +129,12 @@ fn main() {
             }
         });
     }
+
+    let _desktop_instance = match platform::instance::DesktopInstance::acquire() {
+        Ok(Some(instance)) => instance,
+        Ok(None) => { if let Err(err) = platform::instance::activate_existing() { eprintln!("[rastflow] 唤出已有实例失败：{err}"); } return; }
+        Err(err) => { eprintln!("[rastflow] 创建桌面单例失败：{err}"); return; }
+    };
 
     gpui_kit::application().with_assets(Assets).run(move |cx| {
         gpui_kit::init(cx);
@@ -251,24 +258,21 @@ fn main() {
                 let new_hotkey_str: String = cx
                     .update(|cx| cx.global::<AppSettings>().hotkey.to_string());
                 if new_hotkey_str != current_hotkey_str {
-                    // 注销旧快捷键
-                    if let Some(old_id) = registered_hotkey_id.take() {
-                        if let Some(hk) = parse_hotkey(&current_hotkey_str) {
-                            if hk.id() == old_id {
-                                let _ = hk_manager.unregister(hk);
+                    if let Some(new_hotkey) = parse_hotkey(&new_hotkey_str) {
+                        match hk_manager.register(new_hotkey) {
+                            Ok(()) => {
+                                if let Some(old_hotkey) = parse_hotkey(&current_hotkey_str) { let _ = hk_manager.unregister(old_hotkey); }
+                                registered_hotkey_id = Some(new_hotkey.id());
+                                current_hotkey_str = new_hotkey_str;
+                            }
+                            Err(err) => {
+                                eprintln!("[rastflow] 快捷键冲突，保留原快捷键：{err}");
+                                cx.update(|cx| cx.global_mut::<AppSettings>().hotkey = current_hotkey_str.clone().into());
                             }
                         }
+                    } else {
+                        cx.update(|cx| cx.global_mut::<AppSettings>().hotkey = current_hotkey_str.clone().into());
                     }
-                    // 注册新快捷键
-                    if let Some(hk) = parse_hotkey(&new_hotkey_str) {
-                        let id = hk.id();
-                        if hk_manager.register(hk).is_ok() {
-                            registered_hotkey_id = Some(id);
-                        } else {
-                            eprintln!("快捷键注册失败：{new_hotkey_str}");
-                        }
-                    }
-                    current_hotkey_str = new_hotkey_str;
                 }
 
                 // 处理全局快捷键事件 → 切换窗口显示/隐藏
