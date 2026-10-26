@@ -593,7 +593,7 @@ fn apply_to_index(
             parent,
             name,
             is_dir,
-            renamed,
+            renamed: _,
         } => {
             let priority = if *is_dir {
                 DIR_PRIORITY
@@ -601,11 +601,7 @@ fn apply_to_index(
                 priorities.of_suffix(pathutil::suffix_str(name))
             };
             // 重命名要就地改名（旧名立刻消失）；新建 / 新增硬链接要再加一条名字
-            let slots = if *renamed {
-                index.rename(*disk, *frn, *parent, name, *is_dir, priority)
-            } else {
-                index.insert(*disk, *frn, *parent, name, *is_dir, priority)
-            };
+            let slots = index.insert(*disk, *frn, *parent, name, *is_dir, priority);
             let Some(slot) = slots else {
                 return false;
             };
@@ -621,14 +617,14 @@ fn apply_to_index(
             }
             true
         }
-        MonitorEvent::Removed { disk, frn, name } => {
+        MonitorEvent::Removed { disk, frn, parent, name } => {
             // 删除事件带的是「被删掉的那个名字」：硬链接文件只删这一条链接，
             // 同一 FRN 的其它名字还在。名字缺失时才退化成按 FRN 删。
             let slot = if name.is_empty() {
                 index.lookup(*disk, *frn)
             } else {
                 index
-                    .lookup_link(*disk, *frn, name)
+                    .lookup_link_at(*disk, *frn, *parent, name)
                     .or_else(|| index.lookup(*disk, *frn))
             };
             // 删到回收站不算删除：否则用户还没清空回收站，搜索里就找不到了
@@ -641,7 +637,7 @@ fn apply_to_index(
             if name.is_empty() {
                 index.remove(*disk, *frn)
             } else {
-                index.remove_link(*disk, *frn, name)
+                index.remove_link_at(*disk, *frn, *parent, name)
             }
         }
         // 这两种只是通知，不涉及索引内容
@@ -1069,10 +1065,11 @@ mod tests {
         }
     }
 
-    fn removed(disk: char, frn: u64, name: &str) -> MonitorEvent {
+    fn removed(disk: char, frn: u64, parent: u64, name: &str) -> MonitorEvent {
         MonitorEvent::Removed {
             disk,
             frn,
+            parent,
             name: name.to_string(),
         }
     }
@@ -1116,7 +1113,7 @@ mod tests {
         // 删除
         assert!(
             engine
-                .apply_event(&removed('C', file_frn, "rastflow-event.exe"))
+                .apply_event(&removed('C', file_frn, dir_frn, "rastflow-event.exe"))
                 .unwrap()
         );
         assert!(read(&engine.index).lookup('C', file_frn).is_none());
@@ -1124,7 +1121,7 @@ mod tests {
         // 再删一次就「没改动」
         assert!(
             !engine
-                .apply_event(&removed('C', file_frn, "rastflow-event.exe"))
+                .apply_event(&removed('C', file_frn, dir_frn, "rastflow-event.exe"))
                 .unwrap()
         );
 
@@ -1214,7 +1211,7 @@ mod tests {
         std::fs::remove_file(&linked).unwrap();
         assert!(
             engine
-                .apply_event(&removed('C', shared_frn, "linked.mui"))
+                .apply_event(&removed('C', shared_frn, dir_frn, "linked.mui"))
                 .unwrap()
         );
         assert!(search(&engine, "linked.mui").is_empty());
@@ -1243,6 +1240,7 @@ mod tests {
             Some(r"C:\old-dir\kept.exe")
         );
 
+        engine.apply_event(&removed('C', dir_frn, ROOT_MFT_INDEX, "old-dir")).unwrap();
         // 目录改名：只更新目录那一条
         assert!(
             engine

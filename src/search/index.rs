@@ -20,7 +20,7 @@ use super::win::volume::Volume;
 use super::{CoreError, MAX_PATH_DEPTH, Result};
 
 /// 「没有父」：这个条目是某个盘的根（名字形如 `C:`）
-pub const NO_PARENT: u32 = u32::MAX;
+pub const NO_PARENT: u64 = u64::MAX;
 
 /// 查找表里的空槽
 const NO_SLOT: u32 = u32::MAX;
@@ -52,7 +52,7 @@ const MAGIC: &[u8; 8] = b"RASTIDX1";
 ///
 /// v2：MFT 枚举开始保留硬链接的**每个**名字。旧快照里同一 FRN 只剩一个名字，
 /// 其余名字永远搜不到，所以必须丢弃重扫。
-pub const SNAPSHOT_VERSION: u32 = 2;
+pub const SNAPSHOT_VERSION: u32 = 3;
 
 /// 快照文件名（放在索引目录下，是**唯一**的索引文件）
 pub const SNAPSHOT_FILE: &str = "index.dat";
@@ -70,14 +70,14 @@ pub struct Entry {
     /// [`FLAG_DEAD`] 与盘符编码
     pub flags: u16,
     /// **父目录的 MFT 记录号**；[`NO_PARENT`] 表示这是盘根
-    pub parent: u32,
+    pub parent: u64,
     /// 后缀优先级；目录恒为 [`DIR_PRIORITY`]
     pub priority: i32,
     /// 文件引用号 `(序列号 << 48) | 记录号`，用于识别 MFT 记录复用
     pub frn: u64,
 }
 
-const _: () = assert!(std::mem::size_of::<Entry>() == 24);
+const _: () = assert!(std::mem::size_of::<Entry>() == 32);
 const _: () = assert!(std::mem::align_of::<Entry>() == 8);
 
 impl Entry {
@@ -310,11 +310,17 @@ impl FileIndex {
     /// 硬链接文件的同一个 FRN 有多个名字，删除事件带的是「被删掉的那个名字」，
     /// 只有按名字找才不会误删同一文件的其它链接。
     pub fn lookup_link(&self, disk: char, frn: u64, name: &str) -> Option<u32> {
+        self.find_link(disk, frn, None, name)
+    }
+    pub fn lookup_link_at(&self, disk: char, frn: u64, parent: u64, name: &str) -> Option<u32> {
+        self.find_link(disk, frn, Some(parent), name)
+    }
+    fn find_link(&self, disk: char, frn: u64, parent: Option<u64>, name: &str) -> Option<u32> {
         let disk = disk.to_ascii_uppercase();
         let record = mft_index(frn) as u32;
         let same_link = |slot: u32| {
             self.live_slot_of(slot, disk)
-                .is_some_and(|entry| entry.frn == frn)
+                .is_some_and(|entry| entry.frn == frn && parent.is_none_or(|parent| entry.parent == parent || (is_root(parent) && is_root(entry.parent))))
                 && self.name_bytes(slot) == Some(name.as_bytes())
         };
         if let Some(slot) = self.slot_of(disk, record).filter(|slot| same_link(*slot)) {
@@ -335,17 +341,9 @@ impl FileIndex {
     ///
     /// ⚠️ 必须查**条目自己的盘**：每个盘的盘根记录号都是 5，跨盘查会命中另一个盘的根。
     pub fn parent_of(&self, entry: &Entry) -> Option<u32> {
-        let table = self.tables.get(&entry.disk())?;
-        let slot = *table.slots.get(entry.parent as usize)?;
-        if slot == NO_SLOT {
-            return None;
-        }
-        match self.entries.get(slot as usize) {
-            // 槽位是全局复用的：`discard` 不清查找表里的引用，所以这里必须核对
-            // 父条目确实属于**同一个盘**，否则会拼出别的盘的同名路径。
-            Some(parent) if parent.is_live() && parent.disk() == entry.disk() => Some(slot),
-            _ => None,
-        }
+        let slot = self.lookup(entry.disk(), entry.parent)?;
+        let parent = self.entries.get(slot as usize)?;
+        (parent.is_live() && parent.disk() == entry.disk() && parent.priority == DIR_PRIORITY).then_some(slot)
     }
 
     /// 建出（或取出）盘根条目。根的名字就是 `C:` 这种形式，所以拼路径不需要特殊分支。
@@ -392,12 +390,7 @@ impl FileIndex {
             if entry.disk() != disk || is_root(entry.frn) {
                 continue;
             }
-            let Some(parent) = source
-                .parent_of(entry)
-                .map(|slot| source.entries[slot as usize].frn)
-            else {
-                continue;
-            };
+            let parent = entry.parent;
             if let Some(name) = source
                 .name_bytes(slot)
                 .and_then(|name| std::str::from_utf8(name).ok())
@@ -471,11 +464,11 @@ impl FileIndex {
         let record = mft_index(frn) as u32;
         let flags = disk_code(disk) << DISK_SHIFT;
         // 父目录的 MFT 记录号。⚠️ 盘根的子项存的也是 5，`NO_PARENT` 只留给盘根条目本身
-        let parent = mft_index(parent_frn) as u32;
+        let parent = parent_frn;
         let priority = if is_dir { DIR_PRIORITY } else { priority };
 
         // 同名同 FRN 再插一次是幂等的（重复枚举、事件回放、大小写不变的重命名）
-        if let Some(slot) = self.lookup_link(disk, frn, name) {
+        if let Some(slot) = self.lookup_link_at(disk, frn, parent_frn, name) {
             let (name_off, name_len) = self.push_name(name);
             self.entries[slot as usize] = Entry {
                 name_off,
@@ -602,6 +595,10 @@ impl FileIndex {
             Some(slot) => self.free_slot(slot),
             None => false,
         }
+    }
+
+    pub fn remove_link_at(&mut self, disk: char, frn: u64, parent: u64, name: &str) -> bool {
+        self.lookup_link_at(disk, frn, parent, name).is_some_and(|slot| self.free_slot(slot))
     }
 
     /// 删除一条记录（按槽位）。
@@ -893,7 +890,7 @@ impl FileIndex {
             put_u32(&mut buf, entry.name_off);
             put_u16(&mut buf, entry.name_len);
             put_u16(&mut buf, entry.flags);
-            put_u32(&mut buf, entry.parent);
+            put_u64(&mut buf, entry.parent);
             put_i32(&mut buf, entry.priority);
             put_u64(&mut buf, entry.frn);
         }
@@ -981,7 +978,7 @@ impl FileIndex {
                 name_off: cursor.u32()?,
                 name_len: cursor.u16()?,
                 flags: cursor.u16()?,
-                parent: cursor.u32()?,
+                parent: cursor.u64()?,
                 priority: cursor.i32()?,
                 frn: cursor.u64()?,
             });
@@ -1572,6 +1569,25 @@ mod tests {
         index.insert('C', frn(30), frn(10), "notepad.exe", false, 30);
         index.insert('C', frn(40), frn(20), "ntfs.sys", false, 0);
         index
+    }
+
+    #[test]
+    fn identical_hardlink_names_in_different_directories_are_independent() {
+        let mut index = sample_tree();
+        index.insert('C',frn(200),frn(10),"same.txt",false,0);
+        index.insert('C',frn(200),frn(20),"same.txt",false,0);
+        assert!(index.lookup_link_at('C',frn(200),frn(10),"same.txt").is_some());
+        assert!(index.lookup_link_at('C',frn(200),frn(20),"same.txt").is_some());
+        assert!(index.remove_link_at('C',frn(200),frn(10),"same.txt"));
+        assert!(index.lookup_link_at('C',frn(200),frn(20),"same.txt").is_some());
+    }
+    #[test]
+    fn reused_parent_record_does_not_attach_old_children_to_new_directory() {
+        let mut index = sample_tree();
+        index.remove('C',frn(10));
+        let replacement = (2u64<<48) | 10;
+        index.insert('C',replacement,ROOT,"replacement",true,DIR_PRIORITY);
+        assert!(index.path_of(index.lookup('C',frn(30)).unwrap()).is_none());
     }
 
     #[test]

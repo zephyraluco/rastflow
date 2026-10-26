@@ -2,7 +2,7 @@
 use super::index::{JournalMark, MftEntry};
 use super::model::{MonitorEvent, VolumeInfo};
 use super::{CoreError, Result};
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 // ---------- 消息类型 ----------
 
@@ -134,10 +134,11 @@ fn put_event(buf: &mut Vec<u8>, event: &MonitorEvent) {
             put_u8(buf, u8::from(*renamed));
             put_str(buf, name);
         }
-        MonitorEvent::Removed { disk, frn, name } => {
+        MonitorEvent::Removed { disk, frn, parent, name } => {
             put_u8(buf, 2);
             put_u8(buf, *disk as u8);
             put_u64(buf, *frn);
+            put_u64(buf, *parent);
             put_str(buf, name);
         }
         MonitorEvent::DiskWarning { disk, message } => {
@@ -359,6 +360,7 @@ impl<'a> Decoder<'a> {
             2 => Ok(MonitorEvent::Removed {
                 disk: self.disk()?,
                 frn: self.u64()?,
+                parent: self.u64()?,
                 name: self.text()?,
             }),
             3 => Ok(MonitorEvent::DiskWarning {
@@ -540,6 +542,7 @@ mod tests {
                 MonitorEvent::Removed {
                     disk: 'C',
                     frn: 7,
+                    parent: 5,
                     name: "a.txt".to_string(),
                 },
                 MonitorEvent::DiskWarning {

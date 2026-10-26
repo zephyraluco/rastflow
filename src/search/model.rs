@@ -25,6 +25,7 @@ pub enum MonitorEvent {
     Removed {
         disk: char,
         frn: u64,
+        parent: u64,
         /// 被删掉的那个名字；空串表示事件里没有名字（调用方退化成按 FRN 删）
         name: String,
     },
