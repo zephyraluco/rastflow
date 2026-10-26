@@ -19,7 +19,10 @@ pub fn atomic_replace(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if path.exists() {
         let backup_temp = sibling(path, ".bak.tmp");
         std::fs::copy(path, &backup_temp)?;
-        std::fs::OpenOptions::new().write(true).open(&backup_temp)?.sync_all()?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&backup_temp)?
+            .sync_all()?;
         std::fs::rename(&backup_temp, sibling(path, ".bak"))?;
     }
     std::fs::rename(temp, path)

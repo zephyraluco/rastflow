@@ -1,15 +1,11 @@
-//! 命名管道：主进程（服务端）与提权索引子进程（客户端）之间唯一的通道。
-//!
-//! 服务端由**主进程**创建、子进程去连。反过来的话，任何本地进程都能连上那个管道，
-//! 把一个提权进程看到的整盘文件名列表要出来。
-//!
-//! 只做同步（阻塞）读写：一个方向一条线程，正好对上「一侧读、另一侧写」的用法。
+//! 本地命名管道。Windows 服务创建服务端，桌面客户端通过 SCM PID 验证对端。
+//! 服务使用显式 ACL、拒绝远程连接并验证客户端映像路径。同步帧读写提供背压。
 
 use std::ffi::c_void;
 use std::mem::size_of;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{
@@ -20,8 +16,8 @@ use windows::Win32::Foundation::{
 use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_MODE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile,
-    WriteFile,
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_MODE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+    ReadFile, WriteFile,
 };
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
@@ -76,12 +72,7 @@ fn service_security_attributes() -> Result<(SECURITY_ATTRIBUTES, PSECURITY_DESCR
             None,
         )
     }
-    .map_err(|err| {
-        CoreError::win32(
-            "ConvertStringSecurityDescriptorToSecurityDescriptorW",
-            err,
-        )
-    })?;
+    .map_err(|err| CoreError::win32("ConvertStringSecurityDescriptorToSecurityDescriptorW", err))?;
 
     let attributes = SECURITY_ATTRIBUTES {
         nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -117,11 +108,7 @@ impl PipeHandle {
     /// 安全性靠 `A;;GA;;;BA` + `A;;GRGW;;;AU` 的 DACL（见 [`SERVICE_PIPE_SDDL`]）。
     pub fn create_server_multi(name: &str) -> Result<Arc<Self>> {
         let (attributes, descriptor) = service_security_attributes()?;
-        let result = Self::create_server_with(
-            name,
-            PIPE_UNLIMITED_INSTANCES,
-            Some(&attributes),
-        );
+        let result = Self::create_server_with(name, PIPE_UNLIMITED_INSTANCES, Some(&attributes));
         // 描述符只要活到 `CreateNamedPipeW` 返回即可
         if !descriptor.0.is_null() {
             unsafe {
@@ -226,14 +213,8 @@ impl PipeHandle {
         let mut filled = 0usize;
         while filled < buf.len() {
             let mut read = 0u32;
-            let result = unsafe {
-                ReadFile(
-                    self.handle,
-                    Some(&mut buf[filled..]),
-                    Some(&mut read),
-                    None,
-                )
-            };
+            let result =
+                unsafe { ReadFile(self.handle, Some(&mut buf[filled..]), Some(&mut read), None) };
             match result {
                 Ok(()) if read > 0 => filled += read as usize,
                 // 0 字节就是「对端关了」
@@ -319,7 +300,9 @@ pub fn accept(handle: &PipeHandle, timeout: Duration) -> Result<()> {
         }
         Ok(Err(code)) => {
             let _ = worker.join();
-            Err(CoreError::Io(std::io::Error::from_raw_os_error(code as i32)))
+            Err(CoreError::Io(std::io::Error::from_raw_os_error(
+                code as i32,
+            )))
         }
         Ok(Ok(())) => {
             let _ = worker.join();

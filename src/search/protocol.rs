@@ -134,7 +134,12 @@ fn put_event(buf: &mut Vec<u8>, event: &MonitorEvent) {
             put_u8(buf, u8::from(*renamed));
             put_str(buf, name);
         }
-        MonitorEvent::Removed { disk, frn, parent, name } => {
+        MonitorEvent::Removed {
+            disk,
+            frn,
+            parent,
+            name,
+        } => {
             put_u8(buf, 2);
             put_u8(buf, *disk as u8);
             put_u64(buf, *frn);
@@ -605,9 +610,16 @@ mod tests {
 
     #[test]
     fn volume_identity_roundtrip() {
-        let volumes = Message::Volumes(vec![VolumeInfo { disk: 'C', guid: r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\".into(), serial: 42 }]);
+        let volumes = Message::Volumes(vec![VolumeInfo {
+            disk: 'C',
+            guid: r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\".into(),
+            serial: 42,
+        }]);
         assert_eq!(roundtrip(&volumes), volumes);
-        assert_eq!(decode_request(&encode_request(&Request::ListVolumes)).unwrap(), Request::ListVolumes);
+        assert_eq!(
+            decode_request(&encode_request(&Request::ListVolumes)).unwrap(),
+            Request::ListVolumes
+        );
     }
 
     #[test]

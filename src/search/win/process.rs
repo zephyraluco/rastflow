@@ -4,7 +4,7 @@ use std::mem::size_of;
 
 use windows::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::{
-    GetCurrentProcessId, GetExitCodeProcess, GetProcessId, INFINITE, OpenProcess, OpenProcessToken,
+    GetCurrentProcessId, GetExitCodeProcess, GetProcessId, INFINITE, OpenProcess,
     PROCESS_QUERY_LIMITED_INFORMATION, TerminateProcess, WaitForSingleObject,
 };
 use windows::Win32::UI::Shell::{
@@ -28,17 +28,9 @@ pub fn current_pid() -> u32 {
 /// `Drop` 会杀掉它：父进程无论怎么退出（包括崩溃），都不能留下一个提权的孤儿。
 pub struct ElevatedChild {
     process: HANDLE,
-    pid: u32,
 }
 
-unsafe impl Send for ElevatedChild {}
-unsafe impl Sync for ElevatedChild {}
-
 impl ElevatedChild {
-    pub fn pid(&self) -> u32 {
-        self.pid
-    }
-
     /// 等它退出，返回退出码
     pub fn wait(&self) -> Option<u32> {
         let waited = unsafe { WaitForSingleObject(self.process, INFINITE) };
@@ -107,7 +99,6 @@ pub fn spawn_elevated(parameters: &str) -> Result<ElevatedChild> {
     }
     Ok(ElevatedChild {
         process: info.hProcess,
-        pid,
     })
 }
 

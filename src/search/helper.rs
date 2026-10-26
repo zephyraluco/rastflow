@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::win::pipe::{self, PipeHandle};
+use super::win::pipe::PipeHandle;
 use super::win::process;
 use super::win::service;
 use super::{CoreError, Result};
@@ -226,6 +226,7 @@ pub fn run_service_installer(install: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::win::pipe;
     use super::*;
     use crate::search::index::MftEntry;
 
@@ -238,43 +239,6 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         )
-    }
-
-    /// 真的装一遍服务、连上它、再卸掉。
-    ///
-    /// ⚠️ 需要**管理员**，而且会**真的修改系统**（注册后立即删除一个 Windows 服务）。
-    /// 手动跑：
-    ///
-    /// ```powershell
-    /// cargo test --bin rastflow service_install -- --ignored --nocapture
-    /// ```
-    #[test]
-    #[ignore = "需要管理员权限，会真的注册/删除 Windows 服务"]
-    fn service_install_roundtrip() {
-        // 起点必须是「没装」，否则测不出安装本身
-        if service::state().is_running() {
-            eprintln!("索引服务已在运行，先跳过（请先卸载再跑）");
-            return;
-        }
-
-        install_service().expect("安装服务失败（多半不是管理员）");
-        assert!(
-            service::wait_until_running(Duration::from_secs(15)),
-            "服务应当进入 Running"
-        );
-
-        // 服务在跑，主进程连它不需要任何提权
-        let session = HelperSession::connect_running_service().expect("应当能连上索引服务");
-        drop(session);
-
-        uninstall_service().expect("卸载服务失败");
-        assert!(
-            matches!(
-                service::state(),
-                crate::search::win::service::ServiceState::NotInstalled
-            ),
-            "卸载后应当查不到服务"
-        );
     }
 
     /// 真的建一对命名管道，把一条大消息（远超单次 `ReadFile` 的返回量）送过去。

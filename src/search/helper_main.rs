@@ -75,7 +75,10 @@ pub fn run_service_loop(stop: &AtomicBool, pipe_name: &str) {
             Err(_) => continue,
         }
 
-        if !server.client_pid().is_some_and(super::win::process::is_desktop_client) {
+        if !server
+            .client_pid()
+            .is_some_and(super::win::process::is_desktop_client)
+        {
             eprintln!("[rastflow-index-service] 拒绝非本安装目录客户端");
             continue;
         }
@@ -244,7 +247,13 @@ fn catch_up_all(
     stop: Option<&AtomicBool>,
 ) -> Result<()> {
     for (disk, mark) in marks {
-        if !volumes.contains_key(disk) { writer.send(&Message::Unavailable { disk: *disk, reason: "未发现的卷".into() })?; continue; }
+        if !volumes.contains_key(disk) {
+            writer.send(&Message::Unavailable {
+                disk: *disk,
+                reason: "未发现的卷".into(),
+            })?;
+            continue;
+        }
         let outcome =
             monitor::replay_disk(*disk, *mark, volumes.get(disk), &mut |_| {}, &mut |batch| {
                 if stop.is_some_and(|stop| stop.load(Ordering::SeqCst)) {
@@ -295,6 +304,11 @@ fn follow(
     writer.send(&Message::Monitoring {
         monitoring: live > 0,
     })?;
+    if live == 0 {
+        handle.join();
+        writer.send(&Message::Bye)?;
+        return Ok(());
+    }
 
     // 只有 `Stop`（或主进程断开、服务被停）能让它停下来。跟随线程自己跑在别的
     // 线程上，所以这里阻塞读不会影响它们。
@@ -363,7 +377,10 @@ mod tests {
                 other => panic!("第 {round} 轮应当是 Monitoring，实际 {other:?}"),
             }
 
-            writer.send_request(&Request::Stop).expect("发 Stop");
+            assert_eq!(
+                reader.recv().expect("无监控卷时结束会话"),
+                Some(Message::Bye)
+            );
             // 客户端松手，服务应当回到 accept 等下一轮
         }
 

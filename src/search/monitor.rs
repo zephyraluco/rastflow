@@ -18,8 +18,8 @@ use super::index::JournalMark;
 use super::win::cancel_synchronous_io;
 use super::win::current_thread_id;
 use super::win::usn::{
-    USN_REASON_CLOSE, USN_REASON_FILE_CREATE, USN_REASON_FILE_DELETE, USN_REASON_RENAME_NEW_NAME, USN_REASON_RENAME_OLD_NAME,
-    UsnRecord,
+    USN_REASON_CLOSE, USN_REASON_FILE_CREATE, USN_REASON_FILE_DELETE, USN_REASON_RENAME_NEW_NAME,
+    USN_REASON_RENAME_OLD_NAME, UsnRecord,
 };
 use super::win::volume::Volume;
 use super::{CoreError, Result};
@@ -353,7 +353,12 @@ pub fn record_to_event(disk: char, record: &UsnRecord<'_>) -> Option<MonitorEven
     // 「是重命名 且 不带新名」而不是「带旧名」—— 万一两条合在一起，也要按新名处理，
     // 不能把这次重命名整个丢掉。
     if reason & USN_REASON_RENAME_OLD_NAME != 0 && reason & USN_REASON_RENAME_NEW_NAME == 0 {
-        return Some(MonitorEvent::Removed { disk, frn: record.frn, parent: record.parent_frn, name: record.name_lossy() });
+        return Some(MonitorEvent::Removed {
+            disk,
+            frn: record.frn,
+            parent: record.parent_frn,
+            name: record.name_lossy(),
+        });
     }
 
     // 删除：要求 CLOSE 同时成立，避免「打开后删除」被重复上报
@@ -464,7 +469,12 @@ mod tests {
         // 旧名：不报
         assert_eq!(
             event_of(USN_REASON_RENAME_OLD_NAME | USN_REASON_CLOSE, "old.txt"),
-            Some(MonitorEvent::Removed { disk: 'C', frn: 42, parent: 7, name: "old.txt".into() })
+            Some(MonitorEvent::Removed {
+                disk: 'C',
+                frn: 42,
+                parent: 7,
+                name: "old.txt".into()
+            })
         );
         // 新名：报一条 Added，而且带的是新名字、并标明是重命名
         match event_of(USN_REASON_RENAME_NEW_NAME | USN_REASON_CLOSE, "new.txt") {

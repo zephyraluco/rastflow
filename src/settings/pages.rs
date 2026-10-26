@@ -16,20 +16,18 @@ fn pick_program_file() -> Option<String> {
     use windows::{
         Win32::{
             System::Com::{
-                CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL,
-                COINIT_APARTMENTTHREADED,
+                CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+                CoTaskMemFree,
             },
             UI::Shell::{
-                Common::COMDLG_FILTERSPEC, FileOpenDialog, IFileOpenDialog,
-                SIGDN_FILESYSPATH,
+                Common::COMDLG_FILTERSPEC, FileOpenDialog, IFileOpenDialog, SIGDN_FILESYSPATH,
             },
         },
         core::w,
     };
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-        let dialog: IFileOpenDialog =
-            CoCreateInstance(&FileOpenDialog, None, CLSCTX_ALL).ok()?;
+        let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_ALL).ok()?;
 
         let filters = [
             COMDLG_FILTERSPEC {
@@ -94,24 +92,31 @@ pub fn build_settings_pages(lang: &str) -> Vec<SettingPage> {
                             zh_en(lang, "配色主题", "Color Theme"),
                             SettingField::dropdown(
                                 vec![
-                                    ("system".into(), zh_en(lang, "跟随系统", "Follow System").into()),
-                                    ("light".into(),  zh_en(lang, "浅色", "Light").into()),
-                                    ("dark".into(),   zh_en(lang, "深色", "Dark").into()),
+                                    (
+                                        "system".into(),
+                                        zh_en(lang, "跟随系统", "Follow System").into(),
+                                    ),
+                                    ("light".into(), zh_en(lang, "浅色", "Light").into()),
+                                    ("dark".into(), zh_en(lang, "深色", "Dark").into()),
                                 ],
                                 |cx: &App| cx.global::<AppSettings>().theme.clone(),
                                 |val: SharedString, cx: &mut App| {
                                     cx.global_mut::<AppSettings>().theme = val.clone();
                                     match val.as_ref() {
-                                        "dark"   => Theme::change(ThemeMode::Dark, None, cx),
-                                        "light"  => Theme::change(ThemeMode::Light, None, cx),
-                                        _        => Theme::sync_system_appearance(None, cx),
+                                        "dark" => Theme::change(ThemeMode::Dark, None, cx),
+                                        "light" => Theme::change(ThemeMode::Light, None, cx),
+                                        _ => Theme::sync_system_appearance(None, cx),
                                     }
                                     cx.refresh_windows();
                                 },
                             )
                             .default_value(default.theme.clone()),
                         )
-                        .description(zh_en(lang, "选择应用程序的配色主题", "Choose the color theme for the application")),
+                        .description(zh_en(
+                            lang,
+                            "选择应用程序的配色主题",
+                            "Choose the color theme for the application",
+                        )),
                     )
                     .item(
                         SettingItem::new(
@@ -129,7 +134,11 @@ pub fn build_settings_pages(lang: &str) -> Vec<SettingPage> {
                             )
                             .default_value(default.language.clone()),
                         )
-                        .description(zh_en(lang, "选择界面显示语言", "Select the display language")),
+                        .description(zh_en(
+                            lang,
+                            "选择界面显示语言",
+                            "Select the display language",
+                        )),
                     ),
             ),
         SettingPage::new(zh_en(lang, "行为", "Behavior"))
@@ -148,7 +157,11 @@ pub fn build_settings_pages(lang: &str) -> Vec<SettingPage> {
                             )
                             .default_value(default.auto_launch),
                         )
-                        .description(zh_en(lang, "系统启动时自动运行程序启动器", "Automatically start the launcher at system boot")),
+                        .description(zh_en(
+                            lang,
+                            "系统启动时自动运行程序启动器",
+                            "Automatically start the launcher at system boot",
+                        )),
                     ),
             ),
         SettingPage::new(zh_en(lang, "快捷键", "Hotkeys"))
@@ -161,10 +174,10 @@ pub fn build_settings_pages(lang: &str) -> Vec<SettingPage> {
                             zh_en(lang, "唤出界面", "Show Launcher"),
                             SettingField::dropdown(
                                 vec![
-                                    ("alt+space".into(),        "Alt + Space".into()),
-                                    ("ctrl+space".into(),       "Ctrl + Space".into()),
-                                    ("ctrl+alt+space".into(),   "Ctrl + Alt + Space".into()),
-                                    ("super+space".into(),      "Win + Space".into()),
+                                    ("alt+space".into(), "Alt + Space".into()),
+                                    ("ctrl+space".into(), "Ctrl + Space".into()),
+                                    ("ctrl+alt+space".into(), "Ctrl + Alt + Space".into()),
+                                    ("super+space".into(), "Win + Space".into()),
                                     ("ctrl+shift+space".into(), "Ctrl + Shift + Space".into()),
                                 ],
                                 |cx: &App| cx.global::<AppSettings>().hotkey.clone(),
@@ -213,11 +226,15 @@ pub fn build_settings_pages(lang: &str) -> Vec<SettingPage> {
                                     .spawn(async move { rx.recv().ok().flatten() })
                                     .await;
                                 if let Some(path) = picked {
-                                    let result = async_cx.background_executor().spawn(async move { upsert_custom_entry("", "", &path) }).await;
-                                    if let Err(error) = result { eprintln!("添加程序失败：{error}"); }
+                                    let result = async_cx
+                                        .background_executor()
+                                        .spawn(async move { upsert_custom_entry("", "", &path) })
+                                        .await;
+                                    if let Err(error) = result {
+                                        eprintln!("添加程序失败：{error}");
+                                    }
                                     async_cx.update(|cx| {
-                                        cx.global_mut::<AppSettings>()
-                                            .custom_programs_version += 1;
+                                        cx.global_mut::<AppSettings>().custom_programs_version += 1;
                                     });
                                 }
                             })

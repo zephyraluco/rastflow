@@ -7,10 +7,7 @@ use gpui_kit::component::{
 };
 use std::sync::Arc;
 
-use crate::app_list::{
-    record_launch,
-    sort_entries_by_launch, AppEntry,
-};
+use crate::app_list::{AppEntry, record_launch, sort_entries_by_launch};
 use crate::components::app_list_item::app_row;
 use crate::locale::t;
 use crate::utils::hide_window;
@@ -21,7 +18,12 @@ use super::icon_cache::IconCache;
 
 #[cfg(windows)]
 pub(super) fn launch_entry(entry: &AppEntry) -> std::io::Result<()> {
-    crate::platform::open_target(entry.launch_target.as_deref().unwrap_or(entry.name.as_ref()))
+    crate::platform::open_target(
+        entry
+            .launch_target
+            .as_deref()
+            .unwrap_or(entry.name.as_ref()),
+    )
 }
 
 #[cfg(not(windows))]
@@ -82,8 +84,7 @@ impl LauncherDelegate {
             self.all_entries
                 .iter()
                 .filter(|e| {
-                    e.name.to_lowercase().contains(&q)
-                        || e.category.to_lowercase().contains(&q)
+                    e.name.to_lowercase().contains(&q) || e.category.to_lowercase().contains(&q)
                 })
                 .cloned()
                 .collect()
@@ -98,19 +99,11 @@ impl LauncherDelegate {
     pub(super) fn mark_launched(&mut self, launched: &AppEntry) {
         let launched_id = &launched.id;
 
-        if let Some(item) = self
-            .all_entries
-            .iter_mut()
-            .find(|e| e.id == *launched_id)
-        {
+        if let Some(item) = self.all_entries.iter_mut().find(|e| e.id == *launched_id) {
             item.launch_count += 1;
         }
 
-        if let Some(item) = self
-            .filtered
-            .iter_mut()
-            .find(|e| e.id == *launched_id)
-        {
+        if let Some(item) = self.filtered.iter_mut().find(|e| e.id == *launched_id) {
             item.launch_count += 1;
         }
 
@@ -135,9 +128,17 @@ impl LauncherDelegate {
             None => IndexPath::default(),
             Some(ix) => {
                 if forward {
-                    IndexPath { section: 0, row: (ix.row + 1).min(len - 1), column: 0 }
+                    IndexPath {
+                        section: 0,
+                        row: (ix.row + 1).min(len - 1),
+                        column: 0,
+                    }
                 } else {
-                    IndexPath { section: 0, row: ix.row.saturating_sub(1), column: 0 }
+                    IndexPath {
+                        section: 0,
+                        row: ix.row.saturating_sub(1),
+                        column: 0,
+                    }
                 }
             }
         })
@@ -171,10 +172,11 @@ impl ListDelegate for LauncherDelegate {
             cx.spawn(async move |this, cx| {
                 let icon = crate::app_icon::load_async(target.clone()).await;
                 let _ = this.update(cx, |state, cx| {
-                    state.delegate_mut().insert_icons(vec![(target,icon)]);
+                    state.delegate_mut().insert_icons(vec![(target, icon)]);
                     cx.notify();
                 });
-            }).detach();
+            })
+            .detach();
         }
 
         Some(

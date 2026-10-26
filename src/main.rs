@@ -1,18 +1,23 @@
 #![windows_subsystem = "windows"]
 
+use rastflow::diagnostics;
+macro_rules! eprintln {
+    ($($argument:tt)*) => { crate::diagnostics::write(format_args!($($argument)*)) };
+}
+
+mod app_icon;
 mod app_list;
 mod components;
-mod settings;
+mod icons;
 mod layout;
 mod locale;
+mod settings;
 mod utils;
-mod icons;
-mod app_icon;
-mod search;
+use rastflow::search;
+mod application;
+mod platform;
 mod tray;
 mod updater;
-mod platform;
-mod application;
 
 use gpui::*;
 use gpui_kit::component::*;
@@ -40,8 +45,8 @@ impl AssetSource for Assets {
             .collect())
     }
 }
-use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
+use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 
 use layout::LauncherView;
 use settings::AppSettings;
@@ -57,13 +62,13 @@ fn parse_hotkey(s: &str) -> Option<HotKey> {
 
     for part in s.to_lowercase().split('+') {
         match part.trim() {
-            "alt"                        => mods |= Modifiers::ALT,
-            "ctrl" | "control"           => mods |= Modifiers::CONTROL,
-            "shift"                      => mods |= Modifiers::SHIFT,
+            "alt" => mods |= Modifiers::ALT,
+            "ctrl" | "control" => mods |= Modifiers::CONTROL,
+            "shift" => mods |= Modifiers::SHIFT,
             "super" | "win" | "meta" | "cmd" => mods |= Modifiers::SUPER,
-            "space"  => code = Some(Code::Space),
-            "tab"    => code = Some(Code::Tab),
-            "enter"  => code = Some(Code::Enter),
+            "space" => code = Some(Code::Space),
+            "tab" => code = Some(Code::Tab),
+            "enter" => code = Some(Code::Enter),
             _ => {}
         }
     }
@@ -103,6 +108,19 @@ pub const WIN_H: f32 = 520.0;
 // ---------- 入口 ----------
 
 fn main() {
+    let service_role = search::helper_main::is_service_invocation()
+        || search::helper_main::service_admin_action().is_some();
+    let log = if service_role {
+        std::env::var_os("ProgramData")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("rastflow")
+            .join("service.log")
+    } else {
+        utils::app_data_dir().join("desktop.log")
+    };
+    diagnostics::initialize(log);
+
     // 索引服务：由 SCM 拉起，只做 MFT/USN。绝不能初始化 GPUI。
     if search::helper_main::is_service_invocation() {
         std::process::exit(match search::win::service::run_dispatcher() {
@@ -133,39 +151,59 @@ fn main() {
 
     let _desktop_instance = match platform::instance::DesktopInstance::acquire() {
         Ok(Some(instance)) => instance,
-        Ok(None) => { if let Err(err) = platform::instance::activate_existing() { eprintln!("[rastflow] 唤出已有实例失败：{err}"); } return; }
-        Err(err) => { eprintln!("[rastflow] 创建桌面单例失败：{err}"); return; }
+        Ok(None) => {
+            if let Err(err) = platform::instance::activate_existing() {
+                eprintln!("[rastflow] 唤出已有实例失败：{err}");
+            }
+            return;
+        }
+        Err(err) => {
+            eprintln!("[rastflow] 创建桌面单例失败：{err}");
+            return;
+        }
     };
 
     let events = application::initialize();
-    GlobalHotKeyEvent::set_event_handler(Some(|event| application::send(application::Event::Hotkey(event))));
+    GlobalHotKeyEvent::set_event_handler(Some(|event| {
+        application::send(application::Event::Hotkey(event))
+    }));
     gpui_kit::application().with_assets(Assets).run(move |cx| {
         gpui_kit::init(cx);
         cx.set_global(AppSettings::default());
         let updater = updater::create(cx);
-        cx.observe(&updater, |_, _| application::send(application::Event::UpdaterChanged)).detach();
+        cx.observe(&updater, |_, _| {
+            application::send(application::Event::UpdaterChanged)
+        })
+        .detach();
         // 从 settings.json 加载持久化设置（主题、语言等）
         {
             let persisted = settings::load_settings();
             let s = cx.global_mut::<AppSettings>();
-            if !persisted.theme.is_empty() { s.theme = persisted.theme.into(); }
-            if !persisted.language.is_empty() { s.language = persisted.language.into(); }
-            if parse_hotkey(&persisted.hotkey).is_some() { s.hotkey = persisted.hotkey.into(); }
+            if !persisted.theme.is_empty() {
+                s.theme = persisted.theme.into();
+            }
+            if !persisted.language.is_empty() {
+                s.language = persisted.language.into();
+            }
+            if parse_hotkey(&persisted.hotkey).is_some() {
+                s.hotkey = persisted.hotkey.into();
+            }
         }
         // 设置变更时自动写入 settings.json
         cx.observe_global::<AppSettings>(|cx| {
             settings::save_settings(cx.global::<AppSettings>());
             application::send(application::Event::SettingsChanged);
-        }).detach();
+        })
+        .detach();
         // 启动时从注册表读取实际自启状态并同步到设置，确保开关显示正确
         cx.global_mut::<AppSettings>().auto_launch = auto_launch_is_enabled();
         // 启动时应用已保存的主题设置
         {
             let saved_theme = cx.global::<AppSettings>().theme.clone();
             match saved_theme.as_ref() {
-                "dark"  => Theme::change(ThemeMode::Dark, None, cx),
+                "dark" => Theme::change(ThemeMode::Dark, None, cx),
                 "light" => Theme::change(ThemeMode::Light, None, cx),
-                _       => Theme::sync_system_appearance(None, cx),
+                _ => Theme::sync_system_appearance(None, cx),
             }
         }
 
@@ -214,8 +252,8 @@ fn main() {
             // ── 全局快捷键 ────────────────────────────────────────────────
             // GlobalHotKeyManager 必须在拥有 Win32 消息循环的线程上创建。
             // gpui 的 spawn 任务运行在主线程，与消息循环同线程，故此处安全。
-            let hk_manager = GlobalHotKeyManager::new()
-                .expect("Failed to create GlobalHotKeyManager");
+            let hk_manager =
+                GlobalHotKeyManager::new().expect("Failed to create GlobalHotKeyManager");
 
             // 读取初始快捷键设置并注册
             let mut current_hotkey_str: String =
@@ -253,38 +291,44 @@ fn main() {
             // ── 托盘事件轮询循环 ─────────────────────────────────────────
             while let Ok(event) = events.recv().await {
                 // 检测 auto_launch 设置变化，同步到注册表
-                let new_auto_launch: bool =
-                    cx.update(|cx| cx.global::<AppSettings>().auto_launch);
+                let new_auto_launch: bool = cx.update(|cx| cx.global::<AppSettings>().auto_launch);
                 if new_auto_launch != current_auto_launch {
                     auto_launch_set(new_auto_launch);
                     current_auto_launch = new_auto_launch;
                 }
 
                 // 检测快捷键设置是否发生变化，若变则重新注册
-                let new_hotkey_str: String = cx
-                    .update(|cx| cx.global::<AppSettings>().hotkey.to_string());
+                let new_hotkey_str: String =
+                    cx.update(|cx| cx.global::<AppSettings>().hotkey.to_string());
                 if new_hotkey_str != current_hotkey_str {
                     if let Some(new_hotkey) = parse_hotkey(&new_hotkey_str) {
                         match hk_manager.register(new_hotkey) {
                             Ok(()) => {
-                                if let Some(old_hotkey) = parse_hotkey(&current_hotkey_str) { let _ = hk_manager.unregister(old_hotkey); }
+                                if let Some(old_hotkey) = parse_hotkey(&current_hotkey_str) {
+                                    let _ = hk_manager.unregister(old_hotkey);
+                                }
                                 registered_hotkey_id = Some(new_hotkey.id());
                                 current_hotkey_str = new_hotkey_str;
                             }
                             Err(err) => {
                                 eprintln!("[rastflow] 快捷键冲突，保留原快捷键：{err}");
-                                cx.update(|cx| cx.global_mut::<AppSettings>().hotkey = current_hotkey_str.clone().into());
+                                cx.update(|cx| {
+                                    cx.global_mut::<AppSettings>().hotkey =
+                                        current_hotkey_str.clone().into()
+                                });
                             }
                         }
                     } else {
-                        cx.update(|cx| cx.global_mut::<AppSettings>().hotkey = current_hotkey_str.clone().into());
+                        cx.update(|cx| {
+                            cx.global_mut::<AppSettings>().hotkey =
+                                current_hotkey_str.clone().into()
+                        });
                     }
                 }
 
                 // 处理全局快捷键事件 → 切换窗口显示/隐藏
-                if let application::Event::Hotkey(event) = &event {
-                    if event.state == HotKeyState::Pressed
-                        && registered_hotkey_id == Some(event.id)
+                if let application::Event::Hotkey(event) = &event
+                    && event.state == HotKeyState::Pressed && registered_hotkey_id == Some(event.id)
                     {
                         cx.update(|cx| {
                             window_handle
@@ -300,42 +344,41 @@ fn main() {
                                 .ok();
                         });
                     }
-                }
 
                 // 处理托盘交互（左键单击、右键菜单项）
                 if let application::Event::Tray(event) = event {
-                        if event == TrayEvent::Quit {
-                            layout::filesearch::shutdown();
-                            app_list::flush();
-                            settings::flush();
-                            cx.update(|cx| cx.quit());
-                            return;
-                        }
+                    if event == TrayEvent::Quit {
+                        layout::filesearch::shutdown();
+                        app_list::flush();
+                        settings::flush();
+                        cx.update(|cx| cx.quit());
+                        return;
+                    }
 
-                        if event == TrayEvent::CheckForUpdates {
-                            // 只发起后台检查，然后**跳出本轮托盘处理**：
-                            // 下面的代码是"唤出/隐藏主窗口"，绝不能让它顺带执行。
-                            reporter.begin();
-                            updater.update(cx, |updater, cx| updater.check(cx));
-                            continue;
-                        }
+                    if event == TrayEvent::CheckForUpdates {
+                        // 只发起后台检查，然后**跳出本轮托盘处理**：
+                        // 下面的代码是"唤出/隐藏主窗口"，绝不能让它顺带执行。
+                        reporter.begin();
+                        updater.update(cx, |updater, cx| updater.check(cx));
+                        continue;
+                    }
 
-                        // 左键单击总是唤出；菜单项则是显示/隐藏切换
-                        let toggle = event == TrayEvent::ToggleWindow;
-                        cx.update(|cx| {
-                            window_handle
-                                .update(cx, |_, window, cx| {
-                                    if toggle && window.is_window_active() {
-                                        hide_window(window);
-                                    } else {
-                                        // SW_SHOW 让隐藏窗口可见，再居中，再聚焦
-                                        show_window(window);
-                                        center_window(window, cx);
-                                        window.activate_window();
-                                    }
-                                })
-                                .ok();
-                        });
+                    // 左键单击总是唤出；菜单项则是显示/隐藏切换
+                    let toggle = event == TrayEvent::ToggleWindow;
+                    cx.update(|cx| {
+                        window_handle
+                            .update(cx, |_, window, cx| {
+                                if toggle && window.is_window_active() {
+                                    hide_window(window);
+                                } else {
+                                    // SW_SHOW 让隐藏窗口可见，再居中，再聚焦
+                                    show_window(window);
+                                    center_window(window, cx);
+                                    window.activate_window();
+                                }
+                            })
+                            .ok();
+                    });
                 }
 
                 // ── 更新结果 → 原生提示框（不唤出主界面）───────────────────
@@ -349,15 +392,14 @@ fn main() {
                     reporter.begin();
                     updater.update(cx, |updater, cx| updater.download_and_install(cx));
                 }
-
             }
         })
         .detach();
     });
 }
 
-mod catalog;
+use rastflow::catalog;
 
-mod storage;
+use rastflow::storage;
 
-mod cache;
+use rastflow::cache;

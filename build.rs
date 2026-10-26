@@ -2,8 +2,11 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 fn main() {
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") { return; }
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is not set"));
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    let manifest_dir =
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is not set"));
     embed_windows_resources(&manifest_dir);
 }
 

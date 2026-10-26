@@ -38,7 +38,9 @@ pub fn activate_existing() -> windows::core::Result<()> {
             return unsafe { PostMessageW(Some(window), ACTIVATE_MESSAGE, WPARAM(0), LPARAM(0)) };
         }
         if std::time::Instant::now() >= deadline {
-            return Err(windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(1460)));
+            return Err(windows::core::Error::from_hresult(
+                windows::core::HRESULT::from_win32(1460),
+            ));
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }

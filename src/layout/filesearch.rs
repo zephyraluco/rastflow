@@ -1,11 +1,5 @@
-//! 文件搜索集成：把 [`crate::search`] 的自研索引接到界面上。
-//!
-//! 打开卷句柄要 `GENERIC_WRITE`（管理员），所以**碰 MFT/USN 的代码跑在提权的索引
-//! 子进程里**（[`crate::search::helper_main`]），本进程只通过命名管道收记录与事件。
-//! 索引、快照、搜索一直在本进程，子进程不持有索引。
-//!
-//! 线程模型见 `docs/architecture.md` §5：引导线程（本进程）拉起子进程并起一条泵线程读管道，
-//! 搜索跑在调用方给的线程上（gpui 的 background executor）。
+//! 桌面文件搜索协调：连接 Windows 服务，串行应用元数据、维护快照和查询状态。
+//! 服务不可用时保留已有索引；单协调线程负责退避重连，不创建提权索引子进程。
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -159,12 +153,20 @@ impl Inner {
 
     fn set_status(&self, status: SearchStatus) {
         let mut current = self.status.lock().unwrap_or_else(|e| e.into_inner());
-        if *current == status { return; }
+        if *current == status {
+            return;
+        }
         *current = status;
         drop(current);
-        self.subscribers.lock().unwrap_or_else(|e| e.into_inner()).retain(|sender| {
-            !matches!(sender.try_send(()), Err(async_channel::TrySendError::Closed(_)))
-        });
+        self.subscribers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|sender| {
+                !matches!(
+                    sender.try_send(()),
+                    Err(async_channel::TrySendError::Closed(_))
+                )
+            });
     }
 
     /// 增量监控已停止（监控线程全部退出）：把「监控中」降级。
@@ -284,7 +286,13 @@ pub fn shutdown() {
 pub fn subscribe_status() -> async_channel::Receiver<()> {
     start();
     let (sender, receiver) = async_channel::bounded(1);
-    STATE.get().unwrap().subscribers.lock().unwrap_or_else(|e| e.into_inner()).push(sender.clone());
+    STATE
+        .get()
+        .unwrap()
+        .subscribers
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(sender.clone());
     let _ = sender.try_send(());
     receiver
 }
@@ -337,10 +345,23 @@ pub fn install_index_service() {
 
 // ---------- 搜索 ----------
 
+pub fn can_search() -> bool {
+    STATE
+        .get()
+        .and_then(|inner| inner.engine())
+        .is_some_and(|engine| engine.is_indexed())
+}
+
 pub fn cancel_search() {
-    if let Some(inner) = STATE.get() {
-        if let Some(cancel) = inner.last_cancel.lock().unwrap_or_else(|e| e.into_inner()).take() { cancel.store(true, Ordering::Relaxed); }
-    }
+    if let Some(inner) = STATE.get()
+        && let Some(cancel) = inner
+            .last_cancel
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            cancel.store(true, Ordering::Relaxed);
+        }
 }
 
 /// 按关键字搜索。
@@ -352,13 +373,14 @@ pub fn search(query: &str) -> Result<Vec<FileResult>, SearchError> {
     let inner = STATE.get().ok_or(SearchError::NotReady)?;
     match inner.status() {
         SearchStatus::Ready { .. } => {}
+        SearchStatus::Indexing { .. } if can_search() => {}
         SearchStatus::Unavailable { reason, .. } => {
             return Err(SearchError::Unavailable(reason));
         }
         _ => return Err(SearchError::NotReady),
     }
     let query = query.trim();
-    if query.is_empty() {
+    if query.is_empty() || query.len() > crate::search::MAX_SEARCH_TEXT_LEN {
         return Err(SearchError::InvalidQuery);
     }
     let engine = inner.engine().ok_or(SearchError::NotReady)?;
@@ -455,7 +477,11 @@ fn bootstrap_engine(inner: &Arc<Inner>) -> crate::search::Result<()> {
     };
 
     engine.configure_volumes(session.volumes()?)?;
-    if engine.disks().is_empty() { return Err(crate::search::CoreError::Helper("没有可用于索引的本地 NTFS 卷".into())); }
+    if engine.disks().is_empty() {
+        return Err(crate::search::CoreError::Helper(
+            "没有可用于索引的本地 NTFS 卷".into(),
+        ));
+    }
     run_pump(Arc::clone(inner), engine, session);
     Ok(())
 }
@@ -640,7 +666,13 @@ fn run_pump(inner: Arc<Inner>, engine: Arc<Engine>, session: HelperSession) {
                 return;
             }
             Message::Bye | Message::Ready { .. } => {}
-            Message::Volumes(_) => { fail(&inner, crate::search::CoreError::Helper("意外的卷列表消息".into())); return; }
+            Message::Volumes(_) => {
+                fail(
+                    &inner,
+                    crate::search::CoreError::Helper("意外的卷列表消息".into()),
+                );
+                return;
+            }
         }
 
         // 所有盘都报完了，才让子进程开始实时跟随：

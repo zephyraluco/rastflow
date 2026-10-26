@@ -54,7 +54,7 @@ impl Volume {
     }
 
     fn open_path(device: &str) -> Result<Self> {
-        let wide = to_wide(&device);
+        let wide = to_wide(device);
         let handle = unsafe {
             CreateFileW(
                 PCWSTR(wide.as_ptr()),

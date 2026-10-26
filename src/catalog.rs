@@ -56,7 +56,10 @@ impl Store {
             launch_target TEXT, launch_count INTEGER NOT NULL DEFAULT 0
         ); CREATE TEMP TABLE IF NOT EXISTS incoming_ids(id TEXT PRIMARY KEY);",
         )?;
-        let has_source = connection.prepare("PRAGMA table_info(app_entries)")?.query_map([], |row| row.get::<_, String>(1))?.any(|column| column.as_deref() == Ok("discovered"));
+        let has_source = connection
+            .prepare("PRAGMA table_info(app_entries)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .any(|column| column.as_deref() == Ok("discovered"));
         if !has_source {
             connection.execute_batch("BEGIN; ALTER TABLE app_entries ADD COLUMN discovered INTEGER NOT NULL DEFAULT 0; UPDATE app_entries SET discovered=1 WHERE category='系统程序'; COMMIT;")?;
         }
@@ -64,7 +67,9 @@ impl Store {
     }
     pub fn load(&self) -> rusqlite::Result<Vec<Record>> {
         self.0
-            .prepare("SELECT id,name,category,launch_target,launch_count,discovered FROM app_entries")?
+            .prepare(
+                "SELECT id,name,category,launch_target,launch_count,discovered FROM app_entries",
+            )?
             .query_map([], |row| {
                 Ok(Record {
                     id: row.get(0)?,
@@ -98,7 +103,8 @@ impl Store {
                     entry.name,
                     entry.category,
                     entry.target,
-                    entry.launches.min(i64::MAX as u64) as i64, entry.discovered
+                    entry.launches.min(i64::MAX as u64) as i64,
+                    entry.discovered
                 ])?;
             }
         }
@@ -164,11 +170,12 @@ mod tests {
     }
     #[test]
     fn category_is_not_used_as_discovery_ownership() {
-        let mut store=Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();
-        let mut custom=record("custom",SYSTEM_SOURCE,0); custom.discovered=false;
+        let mut store = Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        let mut custom = record("custom", SYSTEM_SOURCE, 0);
+        custom.discovered = false;
         store.save(&[custom.clone()]).unwrap();
         store.save(&[]).unwrap();
-        assert_eq!(store.load().unwrap(),vec![custom]);
+        assert_eq!(store.load().unwrap(), vec![custom]);
     }
 
     #[test]

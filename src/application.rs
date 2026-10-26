@@ -12,9 +12,7 @@ static EVENTS: OnceLock<async_channel::Sender<Event>> = OnceLock::new();
 pub fn initialize() -> async_channel::Receiver<Event> {
     let (sender, receiver) = async_channel::unbounded();
     EVENTS
-        .set(sender)
-        .ok()
-        .expect("desktop event loop initialized twice");
+        .set(sender).expect("desktop event loop initialized twice");
     receiver
 }
 pub fn send(event: Event) {

@@ -23,8 +23,8 @@ use super::monitor;
 use super::monitor::MonitorEvent;
 use super::pathutil::{self, IgnoreRules};
 use super::priority::{DIR_PRIORITY, PriorityTable};
-use super::scheduler::LatestWorker;
 use super::ranking::TopResults;
+use super::scheduler::LatestWorker;
 use super::win::disk;
 use super::{DEFAULT_MAX_RESULTS, MAX_SEARCH_TEXT_LEN, Result};
 
@@ -77,6 +77,8 @@ pub struct ScanStats {
     pub broken: u64,
 }
 
+type SearchTask = (SearchQuery, Arc<SessionState>);
+
 /// 搜索核心。需要放进 `Arc` 才能发起搜索（[`Engine::search`] 会起后台线程）。
 pub struct Engine {
     config: CoreConfig,
@@ -89,7 +91,7 @@ pub struct Engine {
     marks: Mutex<HashMap<char, JournalMark>>,
     snapshot: PathBuf,
     staging: Mutex<HashMap<char, FileIndex>>,
-    queries: OnceLock<std::io::Result<LatestWorker<(SearchQuery, Arc<SessionState>)>>>,
+    queries: OnceLock<std::io::Result<LatestWorker<SearchTask>>>,
     /// 预编译的忽略规则
     ignore: IgnoreRules,
 }
@@ -171,7 +173,10 @@ impl Engine {
             .map(|volume| (volume.disk, volume))
             .collect();
         for volume in current.values() {
-            for old in previous.values().filter(|old| old.guid == volume.guid && old.disk != volume.disk) {
+            for old in previous
+                .values()
+                .filter(|old| old.guid == volume.guid && old.disk != volume.disk)
+            {
                 write(&self.index).clear_disk(old.disk);
                 lock(&self.marks).remove(&old.disk);
             }
@@ -447,11 +452,10 @@ impl Engine {
             LatestWorker::new(
                 "rastflow-core-search",
                 move |(query, state): (SearchQuery, Arc<SessionState>)| {
-                    if let Some(engine) = engine.upgrade() {
-                        if !state.should_stop() {
+                    if let Some(engine) = engine.upgrade()
+                        && !state.should_stop() {
                             engine.run_search(&query, &state);
                         }
-                    }
                     state.finish();
                 },
             )
@@ -478,13 +482,6 @@ impl Engine {
         self.scan_index(query, state);
     }
 
-    /// 结果分档顺序：文件按后缀优先级降序，最后才是目录
-    fn priority_tiers(&self) -> Vec<i32> {
-        let mut tiers = read(&self.priorities).priorities();
-        tiers.push(DIR_PRIORITY);
-        tiers
-    }
-
     fn scan_index(&self, query: &SearchQuery, state: &SessionState) {
         let mut results = TopResults::new(self.config.max_results);
         let total = read(&self.index).slot_count();
@@ -492,16 +489,33 @@ impl Engine {
         let mut scratch = PathScratch::new();
         let mut dir = String::new();
         for start in (0..total).step_by(4096) {
-            if state.should_stop() { return; }
+            if state.should_stop() {
+                return;
+            }
             let index = read(&self.index);
-            for (slot, entry) in index.iter_live_range(start, start+4096) {
-                if state.should_stop() { return; }
-                let Some(name) = index.name_bytes(slot).and_then(|name| std::str::from_utf8(name).ok()) else { continue };
+            for (slot, entry) in index.iter_live_range(start, start + 4096) {
+                if state.should_stop() {
+                    return;
+                }
+                let Some(name) = index
+                    .name_bytes(slot)
+                    .and_then(|name| std::str::from_utf8(name).ok())
+                else {
+                    continue;
+                };
                 if needs_dir {
-                    let Some(parent) = index.parent_of(entry) else { continue };
+                    let Some(parent) = index.parent_of(entry) else {
+                        continue;
+                    };
                     dir.clear();
-                    if !index.path_into(parent, &mut scratch, &mut dir) || !query.matches_parts(name, &dir) { continue; }
-                } else if !query.matches_name(name.as_bytes()) { continue; }
+                    if !index.path_into(parent, &mut scratch, &mut dir)
+                        || !query.matches_parts(name, &dir)
+                    {
+                        continue;
+                    }
+                } else if !query.matches_name(name.as_bytes()) {
+                    continue;
+                }
                 let mut path = String::new();
                 if index.path_into(slot, &mut scratch, &mut path) {
                     results.insert(query.name_rank(name), entry.priority, path);
@@ -509,11 +523,12 @@ impl Engine {
             }
         }
         for path in results.into_paths() {
-            if state.should_stop() { return; }
+            if state.should_stop() {
+                return;
+            }
             state.push(&path);
         }
     }
-
 }
 
 /// 清掉旧版索引（SQLite 分表）留下的库文件。只删认识的那几个名字，不做通配匹配。
@@ -583,7 +598,12 @@ fn apply_to_index(
             }
             true
         }
-        MonitorEvent::Removed { disk, frn, parent, name } => {
+        MonitorEvent::Removed {
+            disk,
+            frn,
+            parent,
+            name,
+        } => {
             // 删除事件带的是「被删掉的那个名字」：硬链接文件只删这一条链接，
             // 同一 FRN 的其它名字还在。名字缺失时才退化成按 FRN 删。
             let slot = if name.is_empty() {
@@ -661,10 +681,6 @@ impl SessionState {
         }
     }
 
-    fn len(&self) -> usize {
-        lock(&self.results).paths.len()
-    }
-
     fn should_stop(&self) -> bool {
         self.cancelled.load(Ordering::Relaxed)
     }
@@ -710,7 +726,7 @@ impl SearchSession {
         let (guard, _) = self
             .state
             .finished
-            .wait_timeout(guard, timeout)
+            .wait_timeout_while(guard, timeout, |done| !*done)
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *guard
     }
@@ -728,7 +744,6 @@ impl Drop for SearchSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::search::priority::DEFAULT_PRIORITY;
     use crate::search::win::usn::ROOT_MFT_INDEX;
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -844,21 +859,6 @@ mod tests {
                 .iter()
                 .any(|item| item.to_lowercase().contains("recycle"))
         );
-    }
-
-    #[test]
-    fn priority_tiers_put_directories_last() {
-        let dir = temp_dir("tiers");
-        let engine = open_in_memory(test_config(&dir), vec!['C']);
-
-        let tiers = engine.priority_tiers();
-        assert_eq!(*tiers.last().unwrap(), DIR_PRIORITY, "目录排在最后");
-        // 文件档是降序
-        let files = &tiers[..tiers.len() - 1];
-        assert!(files.windows(2).all(|pair| pair[0] >= pair[1]));
-        // 兜底档一定在（没命中后缀规则的文件都落这里）
-        assert!(files.contains(&DEFAULT_PRIORITY));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1206,7 +1206,9 @@ mod tests {
             Some(r"C:\old-dir\kept.exe")
         );
 
-        engine.apply_event(&removed('C', dir_frn, ROOT_MFT_INDEX, "old-dir")).unwrap();
+        engine
+            .apply_event(&removed('C', dir_frn, ROOT_MFT_INDEX, "old-dir"))
+            .unwrap();
         // 目录改名：只更新目录那一条
         assert!(
             engine

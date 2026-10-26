@@ -13,7 +13,6 @@ const FILE_SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
 
 /// 每批从后台取回的图标数量。分批是为了让首屏先拿到图标、其余陆续补齐；
 /// 一次全提完再回填的话，列表要等很久才能显示图标。
-
 use crate::components::{
     file_search::{index_status_panel, no_results, result_header, result_row, searching_row},
     launcher_footer::LauncherFooter,
@@ -100,12 +99,11 @@ impl ListDelegate for FileSearchDelegate {
         window: &mut Window,
         _cx: &mut Context<ListState<Self>>,
     ) {
-        if let Some(ix) = self.selected_index {
-            if let Some(result) = self.results.get(ix.row) {
+        if let Some(ix) = self.selected_index
+            && let Some(result) = self.results.get(ix.row) {
                 let _ = open_result(result);
                 hide_window(window);
             }
-        }
     }
 
     fn render_empty(
@@ -133,9 +131,8 @@ pub struct LauncherView {
     file_search_generation: u64,
     file_searching: bool,
     file_error: Option<String>,
-    /// 是否已有一个图标预取任务在跑（避免重复开链）
     _subscriptions: Vec<Subscription>,
-    /// watcher 轮询任务（detach 后独立运行，不随订阅管理）
+    /// 拥有应用目录通知与刷新任务，视图释放时取消。
     _watcher_task: Option<Task<()>>,
     _index_task: Option<Task<()>>,
 }
@@ -143,11 +140,7 @@ pub struct LauncherView {
 impl LauncherView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         // 注册 Tab 键：在 Launcher 上下文中切换文件搜索模式
-        cx.bind_keys([KeyBinding::new(
-            "tab",
-            ToggleFileMode,
-            Some("Launcher"),
-        )]);
+        cx.bind_keys([KeyBinding::new("tab", ToggleFileMode, Some("Launcher"))]);
 
         let input_state =
             cx.new(|cx| InputState::new(window, cx).placeholder(t("search.placeholder", cx)));
@@ -252,23 +245,39 @@ impl LauncherView {
         let watcher_task = {
             let list_state = list_state.clone();
             let input_state = input_state.clone();
-            Some(cx.spawn_in(window, async move |this, cx| {
+            Some(cx.spawn_in(window, async move |_this, cx| {
                 loop {
-                    let entries = cx.background_executor().spawn(async {
-                        crate::app_list::load_or_discover_entries()
-                    }).await;
-                    if cx.update(|_, cx| {
-                        let query = input_state.read(cx).value().to_string();
-                        list_state.update(cx, |list, cx| {
-                            list.delegate_mut().replace_entries(entries, &query);
-                            cx.notify();
-                        });
-                    }).is_err() { break; }
+                    let entries = cx
+                        .background_executor()
+                        .spawn(async { crate::app_list::load_or_discover_entries() })
+                        .await;
+                    if cx
+                        .update(|_, cx| {
+                            let query = input_state.read(cx).value().to_string();
+                            list_state.update(cx, |list, cx| {
+                                list.delegate_mut().replace_entries(entries, &query);
+                                cx.notify();
+                            });
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
                     // 通知去抖；每五分钟低频校准以补偿丢失的目录通知。
                     let changed = watcher.changed();
                     let timer = cx.background_executor().timer(Duration::from_secs(300));
-                    let _ = futures_lite::future::race(async { changed.await; }, async { timer.await; }).await;
-                    cx.background_executor().timer(Duration::from_millis(250)).await;
+                    let _ = futures_lite::future::race(
+                        async {
+                            changed.await;
+                        },
+                        async {
+                            timer.await;
+                        },
+                    )
+                    .await;
+                    cx.background_executor()
+                        .timer(Duration::from_millis(250))
+                        .await;
                     watcher.drain();
                     crate::app_list::discovery_cache::invalidate();
                 }
@@ -302,7 +311,7 @@ impl LauncherView {
         self.watch_file_search(cx);
     }
 
-    /// 轮询索引状态，直到稳定（就绪或不可用）。
+    /// 订阅索引状态，包含服务断开及自动恢复。
     ///
     /// 建索引可能要几十秒，期间靠这个循环刷新进度；每次重新开始建索引都要订阅一次。
     fn watch_file_search(&mut self, cx: &mut Context<Self>) {
@@ -311,22 +320,27 @@ impl LauncherView {
         self._index_task = Some(cx.spawn(async move |_this, cx: &mut gpui::AsyncApp| {
             while changes.recv().await.is_ok() {
                 let status = super::filesearch::status();
-                let alive = cx.update(|app| entity.update(app, |this, cx| {
-                    let first_ready = !matches!(this.file_status, SearchStatus::Ready { .. }) && matches!(status, SearchStatus::Ready { .. });
-                    this.file_status = status;
-                    if first_ready {
-                        let query = this.input_state.read(cx).value().to_string();
-                        this.search_files(query, cx);
-                    }
-                    cx.notify();
-                }));
-                if alive.is_err() { break; }
+                let alive = cx.update(|app| {
+                    entity.update(app, |this, cx| {
+                        let first_ready = !matches!(this.file_status, SearchStatus::Ready { .. })
+                            && matches!(status, SearchStatus::Ready { .. });
+                        this.file_status = status;
+                        if first_ready {
+                            let query = this.input_state.read(cx).value().to_string();
+                            this.search_files(query, cx);
+                        }
+                        cx.notify();
+                    })
+                });
+                if alive.is_err() {
+                    break;
+                }
             }
         }));
     }
 
     fn search_files(&mut self, query: String, cx: &mut Context<Self>) {
-        if !matches!(self.file_status, SearchStatus::Ready { .. }) {
+        if !super::filesearch::can_search() {
             self.file_results.clear();
             self.file_list_state.update(cx, |state, cx| {
                 state.delegate_mut().clear();
@@ -359,15 +373,12 @@ impl LauncherView {
 
         let entity = cx.entity().downgrade();
         cx.spawn(async move |_this, cx: &mut gpui::AsyncApp| {
-            cx.background_executor()
-                .timer(FILE_SEARCH_DEBOUNCE)
-                .await;
-            let should_search = cx
-                .update(|app| {
-                    entity
-                        .read_with(app, |this, _| this.file_search_generation == generation)
-                        .unwrap_or(false)
-                });
+            cx.background_executor().timer(FILE_SEARCH_DEBOUNCE).await;
+            let should_search = cx.update(|app| {
+                entity
+                    .read_with(app, |this, _| this.file_search_generation == generation)
+                    .unwrap_or(false)
+            });
             if !should_search {
                 return;
             }
@@ -376,7 +387,7 @@ impl LauncherView {
                 .background_executor()
                 .spawn(async move { search_file_index(&query) })
                 .await;
-            let _ = cx.update(|app| {
+            cx.update(|app| {
                 let _ = entity.update(app, |this, cx| {
                     if this.file_search_generation != generation {
                         return;
@@ -567,12 +578,11 @@ impl Render for LauncherView {
                         }),
                     )
                     .on_mouse_move(cx.listener(|this, _ev: &MouseMoveEvent, window, _cx| {
-                        if let Some(start) = this.drag_start {
-                            if start.elapsed() >= std::time::Duration::from_millis(200) {
+                        if let Some(start) = this.drag_start
+                            && start.elapsed() >= std::time::Duration::from_millis(200) {
                                 this.drag_start = None;
                                 window.start_window_move();
                             }
-                        }
                     }))
                     .on_mouse_up(
                         MouseButton::Left,
@@ -638,9 +648,10 @@ impl LauncherView {
             },
             cx.listener(|this, _ev, _window, cx| this.detect_file_search(cx)),
             cx,
-        ) {
-            return panel;
-        }
+        )
+            && !super::filesearch::can_search() {
+                return panel;
+            }
 
         // 索引就绪：搜索进度、错误、空态与结果列表
         v_flex()
@@ -648,9 +659,10 @@ impl LauncherView {
             .min_w_0()
             .p_2()
             .gap_1()
-            .when(self.file_searching && self.file_results.is_empty(), |this| {
-                this.child(searching_row(cx))
-            })
+            .when(
+                self.file_searching && self.file_results.is_empty(),
+                |this| this.child(searching_row(cx)),
+            )
             .when_some(self.file_error.as_ref(), |this, error| {
                 this.child(Alert::error(
                     "filesearch-error",
@@ -658,9 +670,7 @@ impl LauncherView {
                 ))
             })
             .when(
-                !self.file_searching
-                    && self.file_error.is_none()
-                    && self.file_results.is_empty(),
+                !self.file_searching && self.file_error.is_none() && self.file_results.is_empty(),
                 |this| this.child(no_results(cx)),
             )
             .when(!self.file_results.is_empty(), |this| {

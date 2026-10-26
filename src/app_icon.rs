@@ -36,17 +36,26 @@ pub fn load(target: &Path) -> Option<Arc<RenderImage>> {
 /// 所有常规图标提取都由同一个 OS/COM 线程完成，队列有界。
 pub async fn load_async(target: String) -> Option<Arc<RenderImage>> {
     type Request = (String, async_channel::Sender<Option<Arc<RenderImage>>>);
-    static WORKER: std::sync::OnceLock<Option<async_channel::Sender<Request>>> = std::sync::OnceLock::new();
-    let worker = WORKER.get_or_init(|| {
-        let (sender, receiver) = async_channel::bounded::<Request>(32);
-        std::thread::Builder::new().name("rastflow-shell-icons".into()).spawn(move || {
-            while let Ok((target,reply)) = receiver.recv_blocking() {
-                if !reply.is_closed() { let _ = reply.try_send(load(Path::new(&target))); }
-            }
-        }).ok().map(|_| sender)
-    }).as_ref()?;
+    static WORKER: std::sync::OnceLock<Option<async_channel::Sender<Request>>> =
+        std::sync::OnceLock::new();
+    let worker = WORKER
+        .get_or_init(|| {
+            let (sender, receiver) = async_channel::bounded::<Request>(32);
+            std::thread::Builder::new()
+                .name("rastflow-shell-icons".into())
+                .spawn(move || {
+                    while let Ok((target, reply)) = receiver.recv_blocking() {
+                        if !reply.is_closed() {
+                            let _ = reply.try_send(load(Path::new(&target)));
+                        }
+                    }
+                })
+                .ok()
+                .map(|_| sender)
+        })
+        .as_ref()?;
     let (reply, result) = async_channel::bounded(1);
-    worker.send((target,reply)).await.ok()?;
+    worker.send((target, reply)).await.ok()?;
     result.recv().await.ok().flatten()
 }
 
@@ -188,19 +197,19 @@ mod imp {
     use std::os::windows::ffi::OsStrExt as _;
     use std::path::Path;
 
-    use windows::core::PCWSTR;
     use windows::Win32::Graphics::Gdi::{
-        BITMAP, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteObject, GetDC, GetDIBits,
-        GetObjectW, HBITMAP, HGDIOBJ, ReleaseDC,
+        BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteObject, GetDC,
+        GetDIBits, GetObjectW, HBITMAP, HGDIOBJ, ReleaseDC,
     };
     use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
     use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
-    use windows::Win32::UI::Controls::{ILD_TRANSPARENT, IImageList};
+    use windows::Win32::UI::Controls::{IImageList, ILD_TRANSPARENT};
     use windows::Win32::UI::Shell::{
-        SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_SYSICONINDEX, SHGetFileInfoW, SHGetImageList,
-        SHIL_JUMBO,
+        SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_SYSICONINDEX, SHGetFileInfoW,
+        SHGetImageList, SHIL_JUMBO,
     };
     use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, HICON, ICONINFO};
+    use windows::core::PCWSTR;
 
     /// 取出图标的像素数据，返回 `(宽, 高, BGRA 字节)`。
     pub(super) fn icon_bgra(target: &Path) -> Option<(u32, u32, Vec<u8>)> {
@@ -272,10 +281,8 @@ mod imp {
             cx: super::MAX_ICON_EDGE as i32,
             cy: super::MAX_ICON_EDGE as i32,
         };
-        let bitmap = unsafe {
-            factory.GetImage(size, SIIGBF_RESIZETOFIT | SIIGBF_BIGGERSIZEOK)
-        }
-        .ok()?;
+        let bitmap =
+            unsafe { factory.GetImage(size, SIIGBF_RESIZETOFIT | SIIGBF_BIGGERSIZEOK) }.ok()?;
         let owned = OwnedBitmap(bitmap);
 
         let (width, height) = unsafe { bitmap_size(owned.0) }?;
@@ -373,16 +380,12 @@ mod imp {
         let mut pixels = unsafe { dib_bits(bitmaps.color, width, height) }?;
 
         // 现代图标自带 alpha 通道；老式图标 alpha 全为 0，透明度在掩码位图里。
-        let has_alpha = pixels
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .any(|pixel| pixel[3] != 0);
+        let has_alpha = pixels.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 0);
         if !has_alpha {
             let mask = match unsafe { bitmap_size(bitmaps.mask) } {
-                Some(size) if size == (width, height) => {
-                    unsafe { dib_bits(bitmaps.mask, width, height) }
-                }
+                Some(size) if size == (width, height) => unsafe {
+                    dib_bits(bitmaps.mask, width, height)
+                },
                 _ => None,
             };
             match mask {
@@ -532,8 +535,10 @@ mod icon_probe {
                 Some((width, height, pixels)) => {
                     let chunks = pixels.as_chunks::<4>().0;
                     let opaque = chunks.iter().filter(|pixel| pixel[3] > 8).count();
-                    let raw = image::RgbaImage::from_raw(width, height, pixels).expect("尺寸应匹配");
-                    let cropped = super::crop_to_content(raw).map(|img| (img.width(), img.height()));
+                    let raw =
+                        image::RgbaImage::from_raw(width, height, pixels).expect("尺寸应匹配");
+                    let cropped =
+                        super::crop_to_content(raw).map(|img| (img.width(), img.height()));
                     println!(
                         "{target}\n  原图 {width}x{height}，不透明 {opaque}，裁剪后 {cropped:?}"
                     );
@@ -606,7 +611,10 @@ mod resample_tests {
         let scaled = resample_box(&source, 2, 2);
         let pixel = scaled.get_pixel(0, 0);
 
-        assert_eq!([pixel[0], pixel[1], pixel[2], pixel[3]], [200, 100, 50, 255]);
+        assert_eq!(
+            [pixel[0], pixel[1], pixel[2], pixel[3]],
+            [200, 100, 50, 255]
+        );
     }
 }
 
@@ -641,7 +649,10 @@ mod tests {
             .map(|target| {
                 std::thread::spawn(move || {
                     let icon = load(Path::new(target));
-                    (target, icon.map(|icon| (icon.size(0).width.0, icon.size(0).height.0)))
+                    (
+                        target,
+                        icon.map(|icon| (icon.size(0).width.0, icon.size(0).height.0)),
+                    )
                 })
             })
             .collect();

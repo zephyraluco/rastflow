@@ -25,12 +25,13 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::Services::{
-    CloseServiceHandle, ControlService, CreateServiceW, DeleteService, OpenSCManagerW, OpenServiceW,
-    QueryServiceStatusEx, RegisterServiceCtrlHandlerExW, SC_HANDLE, SC_MANAGER_ALL_ACCESS,
-    SC_MANAGER_CONNECT, SC_STATUS_PROCESS_INFO, SERVICE_ACCEPT_STOP, SERVICE_ALL_ACCESS,
-    SERVICE_AUTO_START, SERVICE_CONTROL_STOP, SERVICE_ERROR_NORMAL, SERVICE_QUERY_STATUS,
-    SERVICE_RUNNING, SERVICE_STOP_PENDING, SERVICE_ACCEPT_SHUTDOWN, SERVICE_START, SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STATUS_HANDLE,
-    SERVICE_STATUS_PROCESS, SERVICE_STOP, SERVICE_STOPPED, SERVICE_TABLE_ENTRYW,
+    CloseServiceHandle, ControlService, CreateServiceW, DeleteService, OpenSCManagerW,
+    OpenServiceW, QueryServiceStatusEx, RegisterServiceCtrlHandlerExW, SC_HANDLE,
+    SC_MANAGER_ALL_ACCESS, SC_MANAGER_CONNECT, SC_STATUS_PROCESS_INFO, SERVICE_ACCEPT_SHUTDOWN,
+    SERVICE_ACCEPT_STOP, SERVICE_ALL_ACCESS, SERVICE_AUTO_START, SERVICE_CONTROL_STOP,
+    SERVICE_ERROR_NORMAL, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START,
+    SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STATUS_HANDLE, SERVICE_STATUS_PROCESS,
+    SERVICE_STOP, SERVICE_STOP_PENDING, SERVICE_STOPPED, SERVICE_TABLE_ENTRYW,
     SERVICE_WIN32_OWN_PROCESS, SetServiceStatus, StartServiceCtrlDispatcherW, StartServiceW,
 };
 use windows::core::{PCWSTR, PWSTR};
@@ -110,10 +111,18 @@ pub fn process_id() -> Option<u32> {
     let service = service.ok()?;
     let mut status = SERVICE_STATUS_PROCESS::default();
     let mut needed = 0;
-    let result = unsafe { QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, Some(status_bytes(&mut status)), &mut needed) };
+    let result = unsafe {
+        QueryServiceStatusEx(
+            service,
+            SC_STATUS_PROCESS_INFO,
+            Some(status_bytes(&mut status)),
+            &mut needed,
+        )
+    };
     let _ = unsafe { CloseServiceHandle(service) };
     result.ok()?;
-    (status.dwProcessId != 0 && status.dwCurrentState == SERVICE_RUNNING).then_some(status.dwProcessId)
+    (status.dwProcessId != 0 && status.dwCurrentState == SERVICE_RUNNING)
+        .then_some(status.dwProcessId)
 }
 
 /// 查询服务当前状态。**不需要管理员**（`SC_MANAGER_CONNECT` + `SERVICE_QUERY_STATUS`）。
@@ -266,9 +275,7 @@ pub fn stop(timeout: Duration) -> Result<bool> {
     let manager = open_manager(SC_MANAGER_CONNECT)?;
     let service = match open_service(manager, SERVICE_STOP | SERVICE_QUERY_STATUS) {
         Ok(handle) => handle,
-        Err(CoreError::Win32 { err, .. })
-            if win32_code(&err) == ERROR_SERVICE_DOES_NOT_EXIST.0 =>
-        {
+        Err(CoreError::Win32 { err, .. }) if win32_code(&err) == ERROR_SERVICE_DOES_NOT_EXIST.0 => {
             let _ = unsafe { CloseServiceHandle(manager) };
             return Ok(true);
         }
@@ -292,7 +299,10 @@ pub fn stop(timeout: Duration) -> Result<bool> {
             _ => std::thread::sleep(Duration::from_millis(100)),
         }
     }
-    Ok(matches!(state(), ServiceState::Stopped | ServiceState::NotInstalled))
+    Ok(matches!(
+        state(),
+        ServiceState::Stopped | ServiceState::NotInstalled
+    ))
 }
 
 /// 停掉并删除服务（需要管理员）。没装过算成功。
@@ -364,7 +374,8 @@ pub fn run_dispatcher() -> Result<()> {
     }
 }
 
-fn report(state: windows::Win32::System::Services::SERVICE_STATUS_CURRENT_STATE, hint_ms: u32) {    let raw = STATUS_HANDLE.load(Ordering::SeqCst);
+fn report(state: windows::Win32::System::Services::SERVICE_STATUS_CURRENT_STATE, hint_ms: u32) {
+    let raw = STATUS_HANDLE.load(Ordering::SeqCst);
     if raw == 0 {
         return;
     }

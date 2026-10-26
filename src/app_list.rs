@@ -19,23 +19,7 @@ pub struct AppEntry {
 }
 
 impl AppEntry {
-    pub fn new(name: &str, category: &str) -> Self {
-        let id = Self::compute_id(name, None);
-        Self {
-            id: id.into(),
-            name: name.into(),
-            category: category.into(),
-            launch_target: None,
-            launch_count: 0,
-            discovered: category == crate::catalog::SYSTEM_SOURCE,
-        }
-    }
-
-    pub fn with_launch_target(
-        name: &str,
-        category: &str,
-        launch_target: Option<String>,
-    ) -> Self {
+    pub fn with_launch_target(name: &str, category: &str, launch_target: Option<String>) -> Self {
         let id = Self::compute_id(name, launch_target.as_deref());
         Self {
             id: id.into(),
@@ -65,30 +49,67 @@ static DB: OnceLock<std::sync::mpsc::Sender<DbCommand>> = OnceLock::new();
 fn db() -> &'static std::sync::mpsc::Sender<DbCommand> {
     DB.get_or_init(|| {
         let (sender, receiver) = std::sync::mpsc::channel();
-        std::thread::Builder::new().name("rastflow-catalog-store".into()).spawn(move || {
-            let mut store = match crate::catalog::Store::open(&db_path()) {
-                Ok(store) => store,
-                Err(error) => { eprintln!("[rastflow] 打开应用目录失败：{error}"); return; }
-            };
-            for command in receiver {
-                match command {
-                    DbCommand::Load(reply) => { let records = store.load().unwrap_or_else(|error| { eprintln!("[rastflow] 读取应用目录失败：{error}"); Vec::new() });
-                        let _ = reply.send(records.into_iter().map(|record| AppEntry { id: record.id.into(),name: record.name.into(),category: record.category.into(),launch_target: record.target,launch_count: record.launches, discovered: record.discovered }).collect()); }
-                    DbCommand::Save(entries) => if let Err(error) = store.save(&entries) { eprintln!("[rastflow] 保存应用目录失败：{error}"); },
-                    DbCommand::Launch(id) => if let Err(error) = store.record_launch(&id) { eprintln!("[rastflow] 保存启动次数失败：{error}"); },
-                    DbCommand::Flush(reply) => { let _ = reply.send(()); }
+        std::thread::Builder::new()
+            .name("rastflow-catalog-store".into())
+            .spawn(move || {
+                let mut store = match crate::catalog::Store::open(&db_path()) {
+                    Ok(store) => store,
+                    Err(error) => {
+                        eprintln!("[rastflow] 打开应用目录失败：{error}");
+                        return;
+                    }
+                };
+                for command in receiver {
+                    match command {
+                        DbCommand::Load(reply) => {
+                            let records = store.load().unwrap_or_else(|error| {
+                                eprintln!("[rastflow] 读取应用目录失败：{error}");
+                                Vec::new()
+                            });
+                            let _ = reply.send(
+                                records
+                                    .into_iter()
+                                    .map(|record| AppEntry {
+                                        id: record.id.into(),
+                                        name: record.name.into(),
+                                        category: record.category.into(),
+                                        launch_target: record.target,
+                                        launch_count: record.launches,
+                                        discovered: record.discovered,
+                                    })
+                                    .collect(),
+                            );
+                        }
+                        DbCommand::Save(entries) => {
+                            if let Err(error) = store.save(&entries) {
+                                eprintln!("[rastflow] 保存应用目录失败：{error}");
+                            }
+                        }
+                        DbCommand::Launch(id) => {
+                            if let Err(error) = store.record_launch(&id) {
+                                eprintln!("[rastflow] 保存启动次数失败：{error}");
+                            }
+                        }
+                        DbCommand::Flush(reply) => {
+                            let _ = reply.send(());
+                        }
+                    }
                 }
-            }
-        }).expect("cannot start catalog store");
+            })
+            .expect("cannot start catalog store");
         sender
     })
 }
-pub fn record_launch(id: &str) { let _ = db().send(DbCommand::Launch(id.into())); }
+pub fn record_launch(id: &str) {
+    let _ = db().send(DbCommand::Launch(id.into()));
+}
 
 pub fn flush() {
     if let Some(db) = DB.get() {
         let (reply, done) = std::sync::mpsc::channel();
-        if db.send(DbCommand::Flush(reply)).is_ok() { let _ = done.recv_timeout(std::time::Duration::from_secs(5)); }
+        if db.send(DbCommand::Flush(reply)).is_ok() {
+            let _ = done.recv_timeout(std::time::Duration::from_secs(5));
+        }
     }
 }
 
@@ -106,24 +127,29 @@ pub const CUSTOM_APP_CATEGORY: &str = "自定义程序";
 
 fn load_all_from_db() -> Vec<AppEntry> {
     let (reply, result) = std::sync::mpsc::channel();
-    if db().send(DbCommand::Load(reply)).is_err() { return Vec::new(); }
+    if db().send(DbCommand::Load(reply)).is_err() {
+        return Vec::new();
+    }
     result.recv().unwrap_or_default()
 }
 
 /// UI 只投递保存命令；数据库连接由专用线程独占。
 pub fn save_entries(entries: &[AppEntry]) {
-    let records = entries.iter().map(|entry| crate::catalog::Record {
-        id: entry.id.to_string(),name: entry.name.to_string(),category: entry.category.to_string(),
-        target: entry.launch_target.clone(),launches: entry.launch_count, discovered: entry.discovered,
-    }).collect();
+    let records = entries
+        .iter()
+        .map(|entry| crate::catalog::Record {
+            id: entry.id.to_string(),
+            name: entry.name.to_string(),
+            category: entry.category.to_string(),
+            target: entry.launch_target.clone(),
+            launches: entry.launch_count,
+            discovered: entry.discovered,
+        })
+        .collect();
     let _ = db().send(DbCommand::Save(records));
 }
 
-pub fn upsert_custom_entry(
-    name: &str,
-    category: &str,
-    launch_target: &str,
-) -> Result<(), String> {
+pub fn upsert_custom_entry(name: &str, category: &str, launch_target: &str) -> Result<(), String> {
     use std::path::Path;
     let launch_target = launch_target.trim();
     if launch_target.is_empty() {
@@ -204,7 +230,9 @@ pub mod discovery_cache {
     static CACHE: Mutex<Option<(Instant, Vec<AppEntry>)>> = Mutex::new(None);
 
     pub fn get() -> Vec<AppEntry> {
-        let mut cache = CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut cache = CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some((at, entries)) = cache.as_ref()
             && at.elapsed() < MIN_INTERVAL
         {
@@ -217,7 +245,9 @@ pub mod discovery_cache {
 
     /// 强制使缓存失效（由 watcher 在检测到开始菜单变化时调用）。
     pub fn invalidate() {
-        let mut cache = CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut cache = CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         *cache = None;
     }
 }
@@ -275,16 +305,10 @@ fn scan_windows_apps() -> Vec<AppEntry> {
 
     let mut roots = Vec::new();
     if let Ok(program_data) = std::env::var("ProgramData") {
-        roots.push(
-            PathBuf::from(program_data)
-                .join("Microsoft\\Windows\\Start Menu\\Programs"),
-        );
+        roots.push(PathBuf::from(program_data).join("Microsoft\\Windows\\Start Menu\\Programs"));
     }
     if let Ok(app_data) = std::env::var("APPDATA") {
-        roots.push(
-            PathBuf::from(app_data)
-                .join("Microsoft\\Windows\\Start Menu\\Programs"),
-        );
+        roots.push(PathBuf::from(app_data).join("Microsoft\\Windows\\Start Menu\\Programs"));
     }
 
     let mut seen = HashSet::new();
@@ -299,7 +323,9 @@ fn scan_windows_apps() -> Vec<AppEntry> {
     // shell:AppsFolder 补上。这里按**显示名**与快捷方式比对：同一个程序的两个
     // 入口只保留快捷方式那条，免得列表里出现两条同名项。
     for entry in discover_apps_folder() {
-        if seen.insert(entry_key(&entry)) { out.push(entry); }
+        if seen.insert(entry_key(&entry)) {
+            out.push(entry);
+        }
     }
 
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -313,7 +339,7 @@ fn scan_windows_apps() -> Vec<AppEntry> {
 /// `shell:AppsFolder\<AppID>`，交给 `explorer.exe` 解析。
 #[cfg(windows)]
 fn discover_apps_folder() -> Vec<AppEntry> {
-    use windows::Win32::System::Com::{CoInitializeEx, IBindCtx, COINIT_APARTMENTTHREADED};
+    use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, IBindCtx};
     use windows::Win32::UI::Shell::{
         BHID_EnumItems, IEnumShellItems, IShellItem, SHCreateItemFromParsingName,
         SIGDN_DESKTOPABSOLUTEPARSING, SIGDN_NORMALDISPLAY,
@@ -334,7 +360,8 @@ fn discover_apps_folder() -> Vec<AppEntry> {
         ) else {
             return Vec::new();
         };
-        let Ok(items) = folder.BindToHandler::<_, IEnumShellItems>(None::<&IBindCtx>, &BHID_EnumItems)
+        let Ok(items) =
+            folder.BindToHandler::<_, IEnumShellItems>(None::<&IBindCtx>, &BHID_EnumItems)
         else {
             return Vec::new();
         };

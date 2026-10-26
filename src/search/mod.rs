@@ -1,13 +1,5 @@
-//! rastflow 自研文件搜索核心：枚举 NTFS 主文件表建立常驻内存的索引，阻塞读 USN
-//! 日志维持增量。不依赖第三方索引服务，也不依赖数据库。
-//!
-//! **打开卷句柄要 `GENERIC_WRITE`（管理员）**，所以真正碰 MFT/USN 的代码跑在一个
-//! 提权的子进程（[`helper_main`]）里，本进程只通过命名管道收记录与事件
-//! （[`helper`]）。索引、快照与搜索始终留在主进程，子进程不持有索引。
-//!
-//! `unsafe` 只允许出现在 [`win`] 里。
-//!
-//! 模块划分、索引布局、生命周期与并发约束见 `docs/search-engine.md`。
+//! Windows 文件搜索核心。桌面持有索引、快照和查询；SCM 服务提供 MFT/USN 元数据。
+//! 纯数据结构、协议和排序可独立测试，Windows 后端仅在 Windows 目标编译。
 
 #[cfg(windows)]
 pub mod engine;
@@ -17,14 +9,14 @@ pub mod helper;
 pub mod helper_main;
 pub mod index;
 pub mod lifecycle;
-pub mod model;
-pub mod protocol;
-pub mod ranking;
 pub mod matcher;
+pub mod model;
 #[cfg(windows)]
 pub mod monitor;
 pub mod pathutil;
 pub mod priority;
+pub mod protocol;
+pub mod ranking;
 mod scheduler;
 #[cfg(windows)]
 pub mod win;
@@ -51,10 +43,7 @@ pub enum CoreError {
         err: windows::core::Error,
     },
     /// 不是「本地固定盘 + NTFS」，无法用 MFT/USN 方式索引
-    UnsupportedDisk {
-        letter: char,
-        reason: String,
-    },
+    UnsupportedDisk { letter: char, reason: String },
     /// 参数不合法（如空关键字、超过长度上限）
     InvalidArgument(String),
     /// 用户在 UAC 提示上拒绝了提权（或提权被策略禁止）
@@ -70,6 +59,7 @@ impl CoreError {
     }
 
     /// 构造一个 `UnsupportedDisk` 错误
+    #[cfg(windows)]
     pub(crate) fn unsupported(letter: char, reason: impl Into<String>) -> Self {
         Self::UnsupportedDisk {
             letter,

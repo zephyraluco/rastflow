@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
+#[cfg(all(test, windows))]
 use std::time::Instant;
 
 use super::pathutil::{self, IgnoreRules};
@@ -57,9 +57,9 @@ pub const SNAPSHOT_VERSION: u32 = 3;
 /// 快照文件名（放在索引目录下，是**唯一**的索引文件）
 pub const SNAPSHOT_FILE: &str = "index.dat";
 
-/// 一条索引记录。定长 24 字节，无填充。
+/// 一条索引记录。内存大小 32 字节，持久化逐字段编码。
 ///
-/// `#[repr(C)]` + 全定长整数字段 ⇒ 可整体按 24 字节读写快照（有 `size_of` 断言）。
+/// 父目录保留完整 FRN，不能用记录号替代其代次。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Entry {
@@ -69,7 +69,7 @@ pub struct Entry {
     pub name_len: u16,
     /// [`FLAG_DEAD`] 与盘符编码
     pub flags: u16,
-    /// **父目录的 MFT 记录号**；[`NO_PARENT`] 表示这是盘根
+    /// 父目录的完整 FRN；[`NO_PARENT`] 表示这是盘根
     pub parent: u64,
     /// 后缀优先级；目录恒为 [`DIR_PRIORITY`]
     pub priority: i32,
@@ -319,9 +319,12 @@ impl FileIndex {
         let disk = disk.to_ascii_uppercase();
         let record = mft_index(frn) as u32;
         let same_link = |slot: u32| {
-            self.live_slot_of(slot, disk)
-                .is_some_and(|entry| entry.frn == frn && parent.is_none_or(|parent| entry.parent == parent || (is_root(parent) && is_root(entry.parent))))
-                && self.name_bytes(slot) == Some(name.as_bytes())
+            self.live_slot_of(slot, disk).is_some_and(|entry| {
+                entry.frn == frn
+                    && parent.is_none_or(|parent| {
+                        entry.parent == parent || (is_root(parent) && is_root(entry.parent))
+                    })
+            }) && self.name_bytes(slot) == Some(name.as_bytes())
         };
         if let Some(slot) = self.slot_of(disk, record).filter(|slot| same_link(*slot)) {
             return Some(slot);
@@ -343,7 +346,8 @@ impl FileIndex {
     pub fn parent_of(&self, entry: &Entry) -> Option<u32> {
         let slot = self.lookup(entry.disk(), entry.parent)?;
         let parent = self.entries.get(slot as usize)?;
-        (parent.is_live() && parent.disk() == entry.disk() && parent.priority == DIR_PRIORITY).then_some(slot)
+        (parent.is_live() && parent.disk() == entry.disk() && parent.priority == DIR_PRIORITY)
+            .then_some(slot)
     }
 
     /// 建出（或取出）盘根条目。根的名字就是 `C:` 这种形式，所以拼路径不需要特殊分支。
@@ -370,14 +374,22 @@ impl FileIndex {
 
     /// 单卷快照恢复时更新挂载盘符，文件身份仍由快照文件对应的卷 GUID 决定。
     pub fn remap_disk(&mut self, old: char, new: char) {
-        if old == new { return; }
-        let Some(table) = self.tables.remove(&old) else { return };
+        if old == new {
+            return;
+        }
+        let Some(table) = self.tables.remove(&old) else {
+            return;
+        };
         for entry in &mut self.entries {
-            if entry.disk() != old { continue; }
-            entry.flags = (entry.flags & !(DISK_MASK << DISK_SHIFT)) | (disk_code(new) << DISK_SHIFT);
-            if entry.parent == NO_PARENT {
-                if let Some(first) = self.names.get_mut(entry.name_off as usize) { *first = new as u8; }
+            if entry.disk() != old {
+                continue;
             }
+            entry.flags =
+                (entry.flags & !(DISK_MASK << DISK_SHIFT)) | (disk_code(new) << DISK_SHIFT);
+            if entry.parent == NO_PARENT
+                && let Some(first) = self.names.get_mut(entry.name_off as usize) {
+                    *first = new as u8;
+                }
         }
         self.tables.insert(new, table);
     }
@@ -598,7 +610,8 @@ impl FileIndex {
     }
 
     pub fn remove_link_at(&mut self, disk: char, frn: u64, parent: u64, name: &str) -> bool {
-        self.lookup_link_at(disk, frn, parent, name).is_some_and(|slot| self.free_slot(slot))
+        self.lookup_link_at(disk, frn, parent, name)
+            .is_some_and(|slot| self.free_slot(slot))
     }
 
     /// 删除一条记录（按槽位）。
@@ -683,9 +696,17 @@ impl FileIndex {
 
     /// 遍历所有存活条目：`(槽位, 条目)`
     /// 遍历所有存活条目：`(槽位, 条目)`
-    pub fn slot_count(&self) -> usize { self.entries.len() }
-    pub fn iter_live_range(&self, start: usize, end: usize) -> impl Iterator<Item=(u32, &Entry)> {
-        self.entries.iter().enumerate().skip(start).take(end.saturating_sub(start)).filter(|(_, entry)| entry.is_live()).map(|(slot,entry)| (slot as u32,entry))
+    pub fn slot_count(&self) -> usize {
+        self.entries.len()
+    }
+    pub fn iter_live_range(&self, start: usize, end: usize) -> impl Iterator<Item = (u32, &Entry)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(end.saturating_sub(start))
+            .filter(|(_, entry)| entry.is_live())
+            .map(|(slot, entry)| (slot as u32, entry))
     }
 
     pub fn iter_live(&self) -> impl Iterator<Item = (u32, &Entry)> {
@@ -938,9 +959,10 @@ impl FileIndex {
     /// 调用方按「没有快照」处理，重扫 MFT 即可，快照本来就只是加速手段。
     pub fn load(path: &Path) -> Result<Option<LoadedIndex>> {
         for candidate in [path.to_path_buf(), crate::storage::sibling(path, ".bak")] {
-            if let Ok(buf) = std::fs::read(candidate) {
-                if let Ok(loaded) = Self::decode(&buf) { return Ok(Some(loaded)); }
-            }
+            if let Ok(buf) = std::fs::read(candidate)
+                && let Ok(loaded) = Self::decode(&buf) {
+                    return Ok(Some(loaded));
+                }
         }
         Ok(None)
     }
@@ -948,7 +970,10 @@ impl FileIndex {
     fn decode(buf: &[u8]) -> Result<LoadedIndex> {
         let corrupt = || CoreError::InvalidArgument("索引快照已损坏".to_string());
 
-        if buf.len() < 16 || fnv1a(&buf[..buf.len()-8]) != u64::from_le_bytes(buf[buf.len()-8..].try_into().map_err(|_| corrupt())?) {
+        if buf.len() < 16
+            || fnv1a(&buf[..buf.len() - 8])
+                != u64::from_le_bytes(buf[buf.len() - 8..].try_into().map_err(|_| corrupt())?)
+        {
             return Err(corrupt());
         }
         let mut cursor = Cursor::new(buf);
@@ -962,13 +987,17 @@ impl FileIndex {
         let names_len = cursor.u32()? as usize;
 
         let disk_count = cursor.u32()? as usize;
-        if disk_count > 26 || entry_count > buf.len()/24 || names_len > buf.len() { return Err(corrupt()); }
+        if disk_count > 26 || entry_count > buf.len() / 24 || names_len > buf.len() {
+            return Err(corrupt());
+        }
         let mut raw_tables: Vec<(char, u32, Vec<u32>)> = Vec::with_capacity(disk_count);
         for _ in 0..disk_count {
             let letter = cursor.u8()? as char;
             let root = cursor.u32()?;
             let len = cursor.u32()? as usize;
-            if len > buf.len()/4 { return Err(corrupt()); }
+            if len > buf.len() / 4 {
+                return Err(corrupt());
+            }
             let mut slots = Vec::with_capacity(len);
             for _ in 0..len {
                 slots.push(cursor.u32()?);
@@ -990,7 +1019,9 @@ impl FileIndex {
         }
 
         let priority_count = cursor.u32()? as usize;
-        if priority_count > buf.len()/8 { return Err(corrupt()); }
+        if priority_count > buf.len() / 8 {
+            return Err(corrupt());
+        }
         let mut priorities = Vec::with_capacity(priority_count);
         for _ in 0..priority_count {
             let len = cursor.u32()? as usize;
@@ -1001,7 +1032,9 @@ impl FileIndex {
         }
 
         let mark_count = cursor.u32()? as usize;
-        if mark_count > 26 { return Err(corrupt()); }
+        if mark_count > 26 {
+            return Err(corrupt());
+        }
         let mut marks = HashMap::with_capacity(mark_count);
         for _ in 0..mark_count {
             let letter = cursor.u8()? as char;
@@ -1193,6 +1226,7 @@ impl<'a> Cursor<'a> {
 // ══════════════════════════════════════════════════════════════════════
 
 /// 每处理这么多条就回报一次进度
+#[cfg(windows)]
 const PROGRESS_INTERVAL: u64 = 100_000;
 
 /// 建索引的参数
@@ -1346,8 +1380,12 @@ pub trait ScanSink {
     fn on_start(&mut self, disk: char, mark: JournalMark);
     fn on_record(&mut self, record: &UsnRecord<'_>);
     fn on_progress(&mut self, progress: IndexProgress);
-    fn volume(&self) -> Option<&super::model::VolumeInfo> { None }
-    fn cancelled(&self) -> bool { false }
+    fn volume(&self) -> Option<&super::model::VolumeInfo> {
+        None
+    }
+    fn cancelled(&self) -> bool {
+        false
+    }
 }
 
 /// 一次扫描的结果
@@ -1362,13 +1400,16 @@ pub struct ScanOutcome {
 
 /// 枚举一个盘的整个 MFT，把每条记录交给 `sink`。
 ///
-/// 位点取的是**枚举开始时**的 `NextUsn`（同时用作 `MFT_ENUM_DATA_V0.HighUsn`）。
+/// 位点取枚举开始时的 `NextUsn`；枚举不以它限制 HighUsn，避免扫描期间修改过的已有文件被遗漏。
 /// 用扫描结束后重新查到的 `NextUsn` 当位点会跳过这期间的变更 —— 那些变更既不在
 /// 这次枚举里，也不会被重放。
 #[cfg(windows)]
 pub fn scan_disk(disk: char, sink: &mut dyn ScanSink) -> Result<ScanOutcome> {
     disk::ensure_supported(disk)?;
-    let volume = match sink.volume() { Some(volume) => Volume::open_identity(volume)?, None => Volume::open(disk)? };
+    let volume = match sink.volume() {
+        Some(volume) => Volume::open_identity(volume)?,
+        None => Volume::open(disk)?,
+    };
     // 必须确认是 NTFS，否则下面这些 IOCTL 都没有意义
     volume.verify_ntfs()?;
     let journal = volume.ensure_journal()?;
@@ -1383,15 +1424,23 @@ pub fn scan_disk(disk: char, sink: &mut dyn ScanSink) -> Result<ScanOutcome> {
     let mut cursor = 0;
     let mut buffer = Vec::new();
     loop {
-        if sink.cancelled() { return Err(CoreError::Helper("MFT 枚举已取消或客户端断开".into())); }
-        let (next, _) = volume.enum_usn_page(cursor, journal.NextUsn, &mut buffer, &mut |record| {
+        if sink.cancelled() {
+            return Err(CoreError::Helper("MFT 枚举已取消或客户端断开".into()));
+        }
+        let (next, _) = volume.enum_usn_page(cursor, i64::MAX, &mut buffer, &mut |record| {
             sink.on_record(&record);
             scanned += 1;
             if scanned.is_multiple_of(PROGRESS_INTERVAL) {
-                sink.on_progress(IndexProgress { disk, scanned, written: scanned });
+                sink.on_progress(IndexProgress {
+                    disk,
+                    scanned,
+                    written: scanned,
+                });
             }
         })?;
-        if next <= cursor { break; }
+        if next <= cursor {
+            break;
+        }
         cursor = next;
     }
     let records = scanned;
@@ -1404,7 +1453,7 @@ pub fn scan_disk(disk: char, sink: &mut dyn ScanSink) -> Result<ScanOutcome> {
 }
 
 /// 进程内扫描：边枚举边灌进 `FileIndex`
-#[cfg(test)]
+#[cfg(all(test, windows))]
 struct IndexSink<'a> {
     index: &'a mut FileIndex,
     priorities: &'a PriorityTable,
@@ -1413,7 +1462,7 @@ struct IndexSink<'a> {
     inserted: u64,
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 impl ScanSink for IndexSink<'_> {
     fn on_start(&mut self, disk: char, _mark: JournalMark) {
         self.disk = disk;
@@ -1579,28 +1628,45 @@ mod tests {
     #[test]
     fn identical_hardlink_names_in_different_directories_are_independent() {
         let mut index = sample_tree();
-        index.insert('C',frn(200),frn(10),"same.txt",false,0);
-        index.insert('C',frn(200),frn(20),"same.txt",false,0);
-        assert!(index.lookup_link_at('C',frn(200),frn(10),"same.txt").is_some());
-        assert!(index.lookup_link_at('C',frn(200),frn(20),"same.txt").is_some());
-        assert!(index.remove_link_at('C',frn(200),frn(10),"same.txt"));
-        assert!(index.lookup_link_at('C',frn(200),frn(20),"same.txt").is_some());
+        index.insert('C', frn(200), frn(10), "same.txt", false, 0);
+        index.insert('C', frn(200), frn(20), "same.txt", false, 0);
+        assert!(
+            index
+                .lookup_link_at('C', frn(200), frn(10), "same.txt")
+                .is_some()
+        );
+        assert!(
+            index
+                .lookup_link_at('C', frn(200), frn(20), "same.txt")
+                .is_some()
+        );
+        assert!(index.remove_link_at('C', frn(200), frn(10), "same.txt"));
+        assert!(
+            index
+                .lookup_link_at('C', frn(200), frn(20), "same.txt")
+                .is_some()
+        );
     }
     #[test]
     fn reused_parent_record_does_not_attach_old_children_to_new_directory() {
         let mut index = sample_tree();
-        index.remove('C',frn(10));
-        let replacement = (2u64<<48) | 10;
-        index.insert('C',replacement,ROOT,"replacement",true,DIR_PRIORITY);
-        assert!(index.path_of(index.lookup('C',frn(30)).unwrap()).is_none());
+        index.remove('C', frn(10));
+        let replacement = (2u64 << 48) | 10;
+        index.insert('C', replacement, ROOT, "replacement", true, DIR_PRIORITY);
+        assert!(index.path_of(index.lookup('C', frn(30)).unwrap()).is_none());
     }
 
     #[test]
     fn volume_remount_changes_paths_without_changing_file_ids() {
         let mut index = sample_tree();
-        index.remap_disk('C','D');
-        assert!(index.lookup('C',frn(30)).is_none());
-        assert_eq!(index.path_of(index.lookup('D',frn(30)).unwrap()).as_deref(),Some(r"D:\Windows\notepad.exe"));
+        index.remap_disk('C', 'D');
+        assert!(index.lookup('C', frn(30)).is_none());
+        assert_eq!(
+            index
+                .path_of(index.lookup('D', frn(30)).unwrap())
+                .as_deref(),
+            Some(r"D:\Windows\notepad.exe")
+        );
     }
 
     #[test]
@@ -1615,8 +1681,18 @@ mod tests {
         assert!(current.lookup('C', frn(30)).is_some());
         current.replace_disk('C', &staged);
         assert!(current.lookup('C', frn(30)).is_none());
-        assert_eq!(current.path_of(current.lookup('C', frn(90)).unwrap()).as_deref(), Some(r"C:\replacement.txt"));
-        assert_eq!(current.path_of(current.lookup('D', frn(80)).unwrap()).as_deref(), Some(r"D:\keep.txt"));
+        assert_eq!(
+            current
+                .path_of(current.lookup('C', frn(90)).unwrap())
+                .as_deref(),
+            Some(r"C:\replacement.txt")
+        );
+        assert_eq!(
+            current
+                .path_of(current.lookup('D', frn(80)).unwrap())
+                .as_deref(),
+            Some(r"D:\keep.txt")
+        );
     }
 
     #[test]
@@ -2033,8 +2109,15 @@ mod tests {
         let priorities = PriorityTable::with_builtin_defaults();
         index.save(&path, &priorities, &HashMap::new()).unwrap();
         index.save(&path, &priorities, &HashMap::new()).unwrap();
-        std::fs::write(&path,b"broken").unwrap();
-        assert!(FileIndex::load(&path).unwrap().unwrap().index.lookup('C',frn(30)).is_some());
+        std::fs::write(&path, b"broken").unwrap();
+        assert!(
+            FileIndex::load(&path)
+                .unwrap()
+                .unwrap()
+                .index
+                .lookup('C', frn(30))
+                .is_some()
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
