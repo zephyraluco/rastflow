@@ -296,6 +296,7 @@ fn main() {
                 if let Some(tray) = &tray {
                     while let Some(event) = tray.try_recv() {
                         if event == TrayEvent::Quit {
+                            layout::filesearch::shutdown();
                             cx.update(|cx| cx.quit());
                             return;
                         }

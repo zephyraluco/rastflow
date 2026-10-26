@@ -6,13 +6,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use super::Result;
 use super::helper::{self, Message, PipeReader, PipeWriter, Request};
 use super::index::{self, IndexProgress, JournalMark, MftEntry, ScanSink};
 use super::monitor::{self, EventSink, MonitorConfig, MonitorEvent, MonitorHandle};
 use super::win::pipe::{self, PipeHandle};
 use super::win::service;
 use super::win::usn::UsnRecord;
+use super::{CoreError, Result};
 
 /// 一批往主进程发多少条扫描记录。
 ///
@@ -105,8 +105,8 @@ fn serve_session(
             return Ok(()); // 主进程没了
         };
         match request {
-            Request::Scan { disks } => scan_all(writer, &disks, &mut known)?,
-            Request::CatchUp { marks } => catch_up_all(writer, &marks, &mut known)?,
+            Request::Scan { disks } => scan_all(writer, &disks, &mut known, service_stop)?,
+            Request::CatchUp { marks } => catch_up_all(writer, &marks, &mut known, service_stop)?,
             Request::Monitor => {
                 follow(writer, reader, &known, service_stop)?;
                 return Ok(());
@@ -123,6 +123,8 @@ struct PipeScanSink<'a> {
     writer: &'a PipeWriter,
     disk: char,
     batch: Vec<MftEntry>,
+    failed: bool,
+    stop: Option<&'a AtomicBool>,
 }
 
 impl PipeScanSink<'_> {
@@ -133,14 +135,17 @@ impl PipeScanSink<'_> {
         let batch = std::mem::take(&mut self.batch);
         // 发送失败（管道断开）不用在这里报错：扫描结束后发 `ScanFinished` 会失败，
         // 那条错误会把整轮扫描带出去
-        let _ = self.writer.send(&Message::Records(batch));
+        self.failed |= self.writer.send(&Message::Records(batch)).is_err();
     }
 }
 
 impl ScanSink for PipeScanSink<'_> {
     fn on_start(&mut self, disk: char, mark: JournalMark) {
         self.disk = disk;
-        let _ = self.writer.send(&Message::ScanStarted { disk, mark });
+        self.failed |= self
+            .writer
+            .send(&Message::ScanStarted { disk, mark })
+            .is_err();
     }
 
     fn on_record(&mut self, record: &UsnRecord<'_>) {
@@ -154,18 +159,28 @@ impl ScanSink for PipeScanSink<'_> {
 
     /// 进度按批走，不必每条都往主进程报
     fn on_progress(&mut self, _progress: IndexProgress) {}
+    fn cancelled(&self) -> bool {
+        self.failed || self.stop.is_some_and(|stop| stop.load(Ordering::SeqCst))
+    }
 }
 
 fn scan_all(
     writer: &PipeWriter,
     disks: &[char],
     known: &mut HashMap<char, JournalMark>,
+    stop: Option<&AtomicBool>,
 ) -> Result<()> {
     for disk in disks {
+        known.remove(disk);
+        if stop.is_some_and(|stop| stop.load(Ordering::SeqCst)) {
+            return Err(CoreError::Helper("服务正在停止".into()));
+        }
         let mut sink = PipeScanSink {
             writer,
             disk: *disk,
             batch: Vec::with_capacity(RECORD_BATCH),
+            failed: false,
+            stop,
         };
         match index::scan_disk(*disk, &mut sink) {
             Ok(outcome) => {
@@ -193,10 +208,14 @@ fn catch_up_all(
     writer: &PipeWriter,
     marks: &[(char, JournalMark)],
     known: &mut HashMap<char, JournalMark>,
+    stop: Option<&AtomicBool>,
 ) -> Result<()> {
     for (disk, mark) in marks {
         let outcome = monitor::replay_disk(*disk, *mark, &mut |_| {}, &mut |batch| {
-            let _ = writer.send(&Message::Events(batch.to_vec()));
+            if stop.is_some_and(|stop| stop.load(Ordering::SeqCst)) {
+                return Err(CoreError::Helper("服务正在停止".into()));
+            }
+            writer.send(&Message::Events(batch.to_vec()))
         });
         match outcome {
             Ok(monitor::ReplayOutcome::Replayed { events, mark }) => {

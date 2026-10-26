@@ -9,8 +9,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::search::engine::{CoreConfig, Engine, ScanStats};
@@ -63,7 +63,13 @@ pub enum SearchStatus {
 impl SearchStatus {
     /// 是否属于「需要管理员权限」这一类（界面据此决定要不要给出提权按钮）
     pub fn needs_admin(&self) -> bool {
-        matches!(self, Self::Unavailable { needs_admin: true, .. })
+        matches!(
+            self,
+            Self::Unavailable {
+                needs_admin: true,
+                ..
+            }
+        )
     }
 }
 
@@ -108,6 +114,10 @@ struct Inner {
     last_cancel: Mutex<Option<Arc<AtomicBool>>>,
     /// 防止并发引导（启动 / 重试 / 装完服务）
     bootstrapping: AtomicBool,
+    stopping: AtomicBool,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    worker_id: AtomicU32,
+    reconnect: (Mutex<bool>, Condvar),
 }
 
 impl Inner {
@@ -117,6 +127,10 @@ impl Inner {
             status: Mutex::new(SearchStatus::Uninitialized),
             last_cancel: Mutex::new(None),
             bootstrapping: AtomicBool::new(false),
+            stopping: AtomicBool::new(false),
+            worker: Mutex::new(None),
+            worker_id: AtomicU32::new(0),
+            reconnect: (Mutex::new(false), Condvar::new()),
         }
     }
 
@@ -185,31 +199,84 @@ pub fn start() {
 /// 跑一次引导（幂等）。装完索引服务后也走这里。
 fn bootstrap(inner: Arc<Inner>) {
     if inner.bootstrapping.swap(true, Ordering::SeqCst) {
-        return; // 已经有一条在跑
+        let (requested, wake) = &inner.reconnect;
+        *requested.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        wake.notify_one();
+        return; // 唤醒现有写入线程，不能再启动第二个泵线程。
     }
     // 起不来也不影响后续调用：搜索会报 NotReady / Unavailable
     let worker = Arc::clone(&inner);
     let spawned = std::thread::Builder::new()
         .name("rastflow-index-bootstrap".to_string())
         .spawn(move || {
-            // 重试时先把上一轮的失败态清掉，否则界面会一直停在旧错误上
-            if matches!(
-                worker.status(),
-                SearchStatus::Unavailable { .. } | SearchStatus::Uninitialized
-            ) {
-                worker.set_status(SearchStatus::Uninitialized);
+            worker
+                .worker_id
+                .store(crate::search::win::current_thread_id(), Ordering::SeqCst);
+            let mut delay = Duration::from_secs(1);
+            while !worker.stopping.load(Ordering::SeqCst) {
+                if let Err(err) = bootstrap_engine(&worker) {
+                    fail(&worker, err);
+                }
+                if let Some(engine) = worker.engine() {
+                    engine.abort_scans();
+                    save_snapshot(&engine);
+                    if engine.is_indexed() {
+                        worker.set_status(SearchStatus::Ready { monitoring: false });
+                    }
+                }
+                if worker.stopping.load(Ordering::SeqCst) {
+                    break;
+                }
+                let (requested, wake) = &worker.reconnect;
+                let guard = requested.lock().unwrap_or_else(|e| e.into_inner());
+                let (mut guard, _) = wake
+                    .wait_timeout_while(guard, delay, |requested| {
+                        !*requested && !worker.stopping.load(Ordering::SeqCst)
+                    })
+                    .unwrap_or_else(|e| e.into_inner());
+                if *guard {
+                    delay = Duration::from_secs(1);
+                } else {
+                    delay = (delay * 2).min(Duration::from_secs(30));
+                }
+                *guard = false;
             }
-            if let Err(err) = bootstrap_engine(&worker) {
-                eprintln!("[rastflow] 文件索引初始化失败：{err}");
-                worker.set_status(SearchStatus::Unavailable {
-                    reason: err.to_string(),
-                    needs_admin: needs_admin_hint(&err),
-                });
-            }
+            worker.worker_id.store(0, Ordering::SeqCst);
             worker.bootstrapping.store(false, Ordering::SeqCst);
         });
-    if spawned.is_err() {
-        inner.bootstrapping.store(false, Ordering::SeqCst);
+    match spawned {
+        Ok(worker) => *inner.worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(worker),
+        Err(_) => {
+            inner.bootstrapping.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+/// 请求写入线程保存检查点并断开连接，不停止 Windows 服务。
+pub fn shutdown() {
+    if let Some(inner) = STATE.get() {
+        inner.stopping.store(true, Ordering::SeqCst);
+        inner.reconnect.1.notify_all();
+        if let Some(worker) = inner
+            .worker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !worker.is_finished() && std::time::Instant::now() < deadline {
+                let id = inner.worker_id.load(Ordering::SeqCst);
+                if id != 0 {
+                    let _ = crate::search::win::cancel_synchronous_io(id);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            if worker.is_finished() {
+                let _ = worker.join();
+            } else {
+                eprintln!("[rastflow] 索引线程未及时退出，将在下次启动恢复最近检查点");
+            }
+        }
     }
 }
 
@@ -245,7 +312,9 @@ pub fn install_index_service() {
                     eprintln!("[rastflow] 索引服务已安装并启动");
                     bootstrap(inner);
                 }
-                Ok(()) => eprintln!("[rastflow] 索引服务已安装，但没有在 {SERVICE_START_TIMEOUT:?} 内启动"),
+                Ok(()) => eprintln!(
+                    "[rastflow] 索引服务已安装，但没有在 {SERVICE_START_TIMEOUT:?} 内启动"
+                ),
                 Err(err) => {
                     // 用户点了「否」或提权被策略禁止：状态保持不变，可以再点一次
                     eprintln!("[rastflow] 安装索引服务失败：{err}");
@@ -295,7 +364,10 @@ pub fn search(query: &str) -> Result<Vec<FileResult>, SearchError> {
 
     // 体积与修改时间不在索引里（索引只存名字与父子关系），展示时补一次 stat。
     // 放在这里而不是渲染路径上：200 次 stat 在本地盘是几毫秒，但绝不能每帧做。
-    Ok(paths.iter().map(|path| FileResult::from_path(path)).collect())
+    Ok(paths
+        .iter()
+        .map(|path| FileResult::from_path(path))
+        .collect())
 }
 
 impl FileResult {
@@ -354,7 +426,10 @@ pub fn open_result(result: &FileResult) -> std::io::Result<()> {
 ///
 /// 本函数**不阻塞**等索引建完：界面靠轮询 [`status`] 看进度。
 fn bootstrap_engine(inner: &Arc<Inner>) -> crate::search::Result<()> {
-    let engine = Arc::new(Engine::open(CoreConfig::new(index_dir()))?);
+    let engine = match inner.engine() {
+        Some(engine) => engine,
+        None => Arc::new(Engine::open(CoreConfig::new(index_dir()))?),
+    };
     // 引擎先装好：即使最终状态不可用，搜索侧的报错也能更具体
     inner.set_engine(Arc::clone(&engine));
 
@@ -382,13 +457,8 @@ fn bootstrap_engine(inner: &Arc<Inner>) -> crate::search::Result<()> {
         }
     };
 
-    let pump_engine = Arc::clone(&engine);
-    let pump_inner = Arc::clone(inner);
-    std::thread::Builder::new()
-        .name("rastflow-index-pump".to_string())
-        .spawn(move || run_pump(pump_inner, pump_engine, session))
-        .map(|_| ())
-        .map_err(crate::search::CoreError::Io)
+    run_pump(Arc::clone(inner), engine, session);
+    Ok(())
 }
 
 /// 泵线程的累计状态
@@ -416,14 +486,28 @@ fn run_pump(inner: Arc<Inner>, engine: Arc<Engine>, session: HelperSession) {
     let marked: HashSet<char> = marks.keys().copied().collect();
     engine.abort_scans();
     let plan = plan_start(engine.disks(), &marked);
-    inner.set_status(SearchStatus::Indexing { disk: None, written: 0 });
+    inner.set_status(SearchStatus::Indexing {
+        disk: None,
+        written: 0,
+    });
     let mut requests = Vec::new();
     if !plan.catch_up.is_empty() {
-        requests.push(Request::CatchUp { marks: plan.catch_up.iter().filter_map(|disk| marks.get(disk).map(|mark| (*disk, *mark))).collect() });
+        requests.push(Request::CatchUp {
+            marks: plan
+                .catch_up
+                .iter()
+                .filter_map(|disk| marks.get(disk).map(|mark| (*disk, *mark)))
+                .collect(),
+        });
     }
-    if !plan.scan.is_empty() { requests.push(Request::Scan { disks: plan.scan }); }
+    if !plan.scan.is_empty() {
+        requests.push(Request::Scan { disks: plan.scan });
+    }
     for request in requests {
-        if let Err(err) = session.send(&request) { fail(&inner, err); return; }
+        if let Err(err) = session.send(&request) {
+            fail(&inner, err);
+            return;
+        }
     }
 
     let mut state = PumpState {
@@ -434,6 +518,9 @@ fn run_pump(inner: Arc<Inner>, engine: Arc<Engine>, session: HelperSession) {
     let mut ready = false;
 
     loop {
+        if inner.stopping.load(Ordering::SeqCst) {
+            break;
+        }
         let message = match session.recv() {
             Ok(Some(message)) => message,
             Ok(None) => {
@@ -469,23 +556,24 @@ fn run_pump(inner: Arc<Inner>, engine: Arc<Engine>, session: HelperSession) {
             Message::ScanFinished { disk, records } => {
                 if let Some(mark) = state.scan_marks.get(&disk).copied() {
                     eprintln!("[rastflow] {disk}: 枚举 {records} 条，开始补读扫描期间变更");
-                    if let Err(err) = session.send(&Request::CatchUp { marks: vec![(disk, mark)] }) {
-                        fail(&inner, err); return;
+                    if let Err(err) = session.send(&Request::CatchUp {
+                        marks: vec![(disk, mark)],
+                    }) {
+                        fail(&inner, err);
+                        return;
                     }
                 }
             }
-            Message::CatchUpFinished {
-                disk,
-                events,
-                mark,
-            } => {
+            Message::CatchUpFinished { disk, events, mark } => {
                 if events > 0 {
                     eprintln!("[rastflow] {disk}: 从 USN 日志补齐了 {events} 条变更");
                 }
                 if state.scan_marks.remove(&disk).is_some() {
                     let stats = engine.finish_scan(disk, mark);
                     log_scan(disk, stats.written, stats);
-                } else { engine.set_mark(disk, mark); }
+                } else {
+                    engine.set_mark(disk, mark);
+                }
                 state.pending.remove(&disk);
             }
             Message::NeedsRebuild { disk } => {
@@ -512,8 +600,10 @@ fn run_pump(inner: Arc<Inner>, engine: Arc<Engine>, session: HelperSession) {
                             eprintln!("[rastflow] {disk}: 文件监控警告：{message}");
                         }
                         MonitorEvent::DiskStopped(disk) => {
-                            eprintln!("[rastflow] {disk}: 文件监控已停止");
+                            eprintln!("[rastflow] {disk}: 文件监控已停止，重新同步");
+                            return;
                         }
+                        MonitorEvent::Checkpoint { disk, mark } => engine.set_mark(*disk, *mark),
                         _ => match engine.apply_event(event) {
                             Ok(true) => state.applied_since_save += 1,
                             Ok(false) => {}
@@ -694,7 +784,10 @@ mod tests {
     fn format_time_to_minute() {
         // 2024-01-01 00:00:00 UTC = 19723 天
         assert_eq!(format_unix_time(1_704_067_200), "2024-01-01 00:00");
-        assert_eq!(format_unix_time(1_704_067_200 + 3_600 + 60 * 7), "2024-01-01 01:07");
+        assert_eq!(
+            format_unix_time(1_704_067_200 + 3_600 + 60 * 7),
+            "2024-01-01 01:07"
+        );
         // 1970 起点
         assert_eq!(format_unix_time(0), "1970-01-01 00:00");
     }
@@ -746,7 +839,11 @@ mod tests {
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
         let result = FileResult::from_path(&manifest.to_string_lossy());
         assert_eq!(result.name, "Cargo.toml");
-        assert!(result.size.ends_with("B"), "应给出体积，实际 {}", result.size);
+        assert!(
+            result.size.ends_with("B"),
+            "应给出体积，实际 {}",
+            result.size
+        );
         assert_ne!(result.modified, "-");
         assert_ne!(result.path, PathBuf::new());
     }
@@ -792,16 +889,20 @@ mod tests {
             needs_admin: true,
         };
         assert!(need.needs_admin());
-        assert!(!SearchStatus::Unavailable {
-            reason: "没有找到可用于索引的本地 NTFS 磁盘".into(),
-            needs_admin: false,
-        }
-        .needs_admin());
+        assert!(
+            !SearchStatus::Unavailable {
+                reason: "没有找到可用于索引的本地 NTFS 磁盘".into(),
+                needs_admin: false,
+            }
+            .needs_admin()
+        );
         assert!(!SearchStatus::Ready { monitoring: true }.needs_admin());
-        assert!(!SearchStatus::Indexing {
-            disk: Some('C'),
-            written: 1
-        }
-        .needs_admin());
+        assert!(
+            !SearchStatus::Indexing {
+                disk: Some('C'),
+                written: 1
+            }
+            .needs_admin()
+        );
     }
 }

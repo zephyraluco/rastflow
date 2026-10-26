@@ -1333,6 +1333,7 @@ pub trait ScanSink {
     fn on_start(&mut self, disk: char, mark: JournalMark);
     fn on_record(&mut self, record: &UsnRecord<'_>);
     fn on_progress(&mut self, progress: IndexProgress);
+    fn cancelled(&self) -> bool { false }
 }
 
 /// 一次扫描的结果
@@ -1365,17 +1366,21 @@ pub fn scan_disk(disk: char, sink: &mut dyn ScanSink) -> Result<ScanOutcome> {
     sink.on_start(disk, mark);
 
     let mut scanned = 0u64;
-    let records = volume.enum_usn_records(journal.NextUsn, |record| {
-        sink.on_record(&record);
-        scanned += 1;
-        if scanned.is_multiple_of(PROGRESS_INTERVAL) {
-            sink.on_progress(IndexProgress {
-                disk,
-                scanned,
-                written: scanned,
-            });
-        }
-    })?;
+    let mut cursor = 0;
+    let mut buffer = Vec::new();
+    loop {
+        if sink.cancelled() { return Err(CoreError::Helper("MFT 枚举已取消或客户端断开".into())); }
+        let (next, _) = volume.enum_usn_page(cursor, journal.NextUsn, &mut buffer, &mut |record| {
+            sink.on_record(&record);
+            scanned += 1;
+            if scanned.is_multiple_of(PROGRESS_INTERVAL) {
+                sink.on_progress(IndexProgress { disk, scanned, written: scanned });
+            }
+        })?;
+        if next <= cursor { break; }
+        cursor = next;
+    }
+    let records = scanned;
 
     Ok(ScanOutcome {
         disk,

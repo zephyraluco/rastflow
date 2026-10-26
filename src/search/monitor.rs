@@ -28,38 +28,7 @@ use super::{CoreError, Result};
 /// 跟随线程会据此退出。
 pub type EventSink = Arc<dyn Fn(&[MonitorEvent]) -> Result<()> + Send + Sync>;
 
-/// 监控线程抛出的事件。内容结构化（见模块文档），落到索引上是幂等 upsert。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MonitorEvent {
-    /// 新增，或重命名/移动之后的**新样子**
-    Added {
-        disk: char,
-        /// 文件引用号 `(序列号 << 48) | 记录号`
-        frn: u64,
-        /// 父目录的 FRN
-        parent: u64,
-        /// 文件名（不含路径）
-        name: String,
-        is_dir: bool,
-        /// 是重命名/移动（同一 FRN 换了名字），而不是新建或新增硬链接。
-        /// 索引据此决定「就地改名」还是「再加一条链接」。
-        renamed: bool,
-    },
-    /// 已删除（或已移出本盘）。
-    ///
-    /// 带 `name` 是必须的：NTFS 硬链接的同一个 FRN 有多个名字，删除事件删掉的
-    /// 只是其中一个名字，不带名字会把同一文件的其它链接一起删掉。
-    Removed {
-        disk: char,
-        frn: u64,
-        /// 被删掉的那个名字；空串表示事件里没有名字（调用方退化成按 FRN 删）
-        name: String,
-    },
-    /// 某个盘出问题（打不开卷、日志不可用等），线程会继续重试
-    DiskWarning { disk: char, message: String },
-    /// 某个盘的跟随线程已退出
-    DiskStopped(char),
-}
+pub use super::model::MonitorEvent;
 
 // ---------- 重放 ----------
 
@@ -80,7 +49,7 @@ pub fn replay_disk(
     disk: char,
     mark: JournalMark,
     on_progress: &mut dyn FnMut(u64),
-    on_batch: &mut dyn FnMut(&[MonitorEvent]),
+    on_batch: &mut dyn FnMut(&[MonitorEvent]) -> Result<()>,
 ) -> Result<ReplayOutcome> {
     let volume = Volume::open(disk)?;
     let journal = volume.query_journal()?;
@@ -90,7 +59,7 @@ pub fn replay_disk(
         return Ok(ReplayOutcome::NeedsRebuild);
     }
     // 日志已经跑满一圈、把位点覆盖掉了 → 中间的变更找不回来了
-    if mark.last_usn < journal.FirstUsn {
+    if mark.last_usn < journal.FirstUsn || mark.last_usn > journal.NextUsn {
         return Ok(ReplayOutcome::NeedsRebuild);
     }
 
@@ -101,24 +70,18 @@ pub fn replay_disk(
     // 一批一批读：内存不会因为「积了半年的变更」而爆掉
     while cursor < target {
         let mut batch: Vec<MonitorEvent> = Vec::new();
-        let (next, count) = volume.read_usn_records(
-            journal.UsnJournalID,
-            cursor,
-            false,
-            |record| {
+        let (next, count) =
+            volume.read_usn_records(journal.UsnJournalID, cursor, false, |record| {
                 if let Some(event) = record_to_event(disk, &record) {
                     batch.push(event);
                 }
-            },
-        )?;
+            })?;
         // 没有前进就说明读完了（或日志在这一刻被清空），防死循环
         if next <= cursor {
-            break;
+            return Ok(ReplayOutcome::NeedsRebuild);
         }
         cursor = next;
-        if !batch.is_empty() {
-            on_batch(&batch);
-        }
+        on_batch(&batch)?;
         seen += u64::from(count);
         on_progress(seen);
     }
@@ -270,11 +233,26 @@ fn follow_volume(
     thread_ids: &Mutex<Vec<u32>>,
     sink: &EventSink,
 ) {
-    let mut journal_id = journal.UsnJournalID;
+    let journal_id = journal.UsnJournalID;
     // 有有效位点就接着读；位点失效（日志被重建）则只能从现在开始
     let mut last_usn = match start {
-        Some(mark) if mark.journal_id == journal.UsnJournalID => mark.last_usn.max(journal.FirstUsn),
-        _ => journal.NextUsn,
+        Some(mark)
+            if mark.journal_id == journal.UsnJournalID
+                && mark.last_usn >= journal.FirstUsn
+                && mark.last_usn <= journal.NextUsn =>
+        {
+            mark.last_usn
+        }
+        _ => {
+            let _ = sink(&[
+                MonitorEvent::DiskWarning {
+                    disk,
+                    message: "USN 位点失效，需要重新同步".into(),
+                },
+                MonitorEvent::DiskStopped(disk),
+            ]);
+            return;
+        }
     };
 
     // 先登记线程 id，再复查停止标志，最后才进入可能阻塞的循环
@@ -301,7 +279,14 @@ fn follow_volume(
                 if next > last_usn {
                     last_usn = next;
                 }
-                if !batch.is_empty() && sink(&batch).is_err() {
+                batch.push(MonitorEvent::Checkpoint {
+                    disk,
+                    mark: JournalMark {
+                        journal_id,
+                        last_usn,
+                    },
+                });
+                if sink(&batch).is_err() {
                     break; // 下游没了（管道断开），没必要继续读
                 }
             }
@@ -319,9 +304,11 @@ fn follow_volume(
                 // 日志可能被重建（别的程序重建了、或卷被 remount），重新取一次
                 match volume.ensure_journal() {
                     Ok(refreshed) => {
-                        journal_id = refreshed.UsnJournalID;
-                        if refreshed.NextUsn < last_usn {
-                            last_usn = refreshed.NextUsn;
+                        if refreshed.UsnJournalID != journal_id
+                            || last_usn < refreshed.FirstUsn
+                            || last_usn > refreshed.NextUsn
+                        {
+                            break; // 由客户端从检查点重新补读，失效时重建，不能跳到日志末尾。
                         }
                     }
                     Err(inner) => {
@@ -471,10 +458,7 @@ mod tests {
         // 新名：报一条 Added，而且带的是新名字、并标明是重命名
         match event_of(USN_REASON_RENAME_NEW_NAME | USN_REASON_CLOSE, "new.txt") {
             Some(MonitorEvent::Added {
-                name,
-                frn,
-                renamed,
-                ..
+                name, frn, renamed, ..
             }) => {
                 assert_eq!(name, "new.txt");
                 assert_eq!(frn, 42, "重命名前后 FRN 不变");
@@ -486,7 +470,10 @@ mod tests {
 
     #[test]
     fn nameless_record_is_dropped() {
-        assert_eq!(event_of(USN_REASON_FILE_CREATE | USN_REASON_CLOSE, ""), None);
+        assert_eq!(
+            event_of(USN_REASON_FILE_CREATE | USN_REASON_CLOSE, ""),
+            None
+        );
     }
 
     #[test]

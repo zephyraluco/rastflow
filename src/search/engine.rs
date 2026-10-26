@@ -25,7 +25,6 @@ use super::pathutil::{self, IgnoreRules};
 use super::priority::{DIR_PRIORITY, PriorityTable};
 use super::scheduler::LatestWorker;
 use super::win::disk;
-use super::win::usn::is_root;
 use super::{DEFAULT_MAX_RESULTS, MAX_SEARCH_TEXT_LEN, Result};
 
 #[derive(Clone, Debug)]
@@ -256,6 +255,7 @@ impl Engine {
                 for event in batch {
                     apply_to_index(&mut index, event, &self.ignore, &priorities);
                 }
+                Ok(())
             },
         )?;
 
@@ -278,7 +278,9 @@ impl Engine {
         lock(&self.staging).insert(disk, index);
     }
 
-    pub fn abort_scan(&self, disk: char) { lock(&self.staging).remove(&disk); }
+    pub fn abort_scan(&self, disk: char) {
+        lock(&self.staging).remove(&disk);
+    }
 
     pub fn abort_scans(&self) {
         lock(&self.staging).clear();
@@ -352,7 +354,8 @@ impl Engine {
             MonitorEvent::Added { disk, .. }
             | MonitorEvent::Removed { disk, .. }
             | MonitorEvent::DiskWarning { disk, .. }
-            | MonitorEvent::DiskStopped(disk) => *disk,
+            | MonitorEvent::DiskStopped(disk)
+            | MonitorEvent::Checkpoint { disk, .. } => *disk,
         };
         let mut staging = lock(&self.staging);
         if let Some(index) = staging.get_mut(&disk) {
@@ -580,7 +583,9 @@ fn apply_to_index(
             }
         }
         // 这两种只是通知，不涉及索引内容
-        MonitorEvent::DiskWarning { .. } | MonitorEvent::DiskStopped(_) => false,
+        MonitorEvent::DiskWarning { .. }
+        | MonitorEvent::DiskStopped(_)
+        | MonitorEvent::Checkpoint { .. } => false,
     }
 }
 
@@ -1076,7 +1081,7 @@ mod tests {
     }
 
     #[test]
-    fn event_with_unknown_parent_is_rejected() {
+    fn event_with_unknown_parent_waits_for_parent() {
         let data_dir = temp_dir("orphan-event");
         let engine = open_in_memory(test_config(&data_dir), vec!['C']);
         write(&engine.index).ensure_root('C');
@@ -1084,11 +1089,25 @@ mod tests {
         // 父目录从没建过 → 这条插进去也搜不到，直接拒
         let unknown_parent = synthetic_frn(r"C:\never-created");
         assert!(
-            !engine
+            engine
                 .apply_event(&added('C', 9001, unknown_parent, "orphan.txt", false))
                 .unwrap()
         );
-        assert!(read(&engine.index).lookup('C', 9001).is_none());
+        let slot = read(&engine.index).lookup('C', 9001).unwrap();
+        assert!(read(&engine.index).path_of(slot).is_none());
+        engine
+            .apply_event(&added(
+                'C',
+                unknown_parent,
+                ROOT_MFT_INDEX,
+                "never-created",
+                true,
+            ))
+            .unwrap();
+        assert_eq!(
+            read(&engine.index).path_of(slot).as_deref(),
+            Some(r"C:\never-created\orphan.txt")
+        );
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 

@@ -17,6 +17,8 @@ pub mod helper;
 pub mod helper_main;
 pub mod index;
 pub mod lifecycle;
+pub mod model;
+pub mod protocol;
 pub mod matcher;
 #[cfg(windows)]
 pub mod monitor;

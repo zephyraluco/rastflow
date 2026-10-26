@@ -182,8 +182,9 @@ impl Volume {
             )
         };
         // 失败即枚举结束（正常的结束是 ERROR_HANDLE_EOF），不是错误
-        if result.is_err() {
-            return Ok((start_frn, 0));
+        if let Err(err) = result {
+            if super::pipe::win32_code(&err) == 38 { return Ok((start_frn, 0)); } // ERROR_HANDLE_EOF
+            return Err(CoreError::win32("DeviceIoControl(FSCTL_ENUM_USN_DATA)", err));
         }
         let filled = filled as usize;
         if filled < usn::LEADING_USN_LEN {
