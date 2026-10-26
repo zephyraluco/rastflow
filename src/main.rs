@@ -10,6 +10,7 @@ mod icons;
 mod app_icon;
 mod search;
 mod tray;
+mod updater;
 
 use gpui::*;
 use gpui_kit::component::*;
@@ -136,6 +137,7 @@ fn main() {
     gpui_kit::application().with_assets(Assets).run(move |cx| {
         gpui_kit::init(cx);
         cx.set_global(AppSettings::default());
+        let updater = updater::create(cx);
         // 从 settings.json 加载持久化设置（主题、语言等）
         {
             let persisted = settings::load_settings();
@@ -298,6 +300,10 @@ fn main() {
                         if event == TrayEvent::Quit {
                             cx.update(|cx| cx.quit());
                             return;
+                        }
+
+                        if event == TrayEvent::CheckForUpdates {
+                            updater.update(cx, |updater, cx| updater.check(cx));
                         }
 
                         // 左键单击总是唤出；菜单项则是显示/隐藏切换

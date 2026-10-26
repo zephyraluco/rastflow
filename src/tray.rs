@@ -23,6 +23,8 @@ pub enum TrayEvent {
     LeftClick,
     /// 菜单：「显示 / 隐藏」
     ToggleWindow,
+    /// 菜单：「检查更新」
+    CheckForUpdates,
     Quit,
 }
 
@@ -65,7 +67,8 @@ mod imp {
 
     /// 菜单项 id（`TPM_RETURNCMD` 会把选中的 id 作为 `TrackPopupMenu` 的返回值）。
     const MENU_TOGGLE: i32 = 1;
-    const MENU_QUIT: i32 = 2;
+    const MENU_UPDATE: i32 = 2;
+    const MENU_QUIT: i32 = 3;
 
     /// 托盘自身窗口的类名。用 `w!` 拿到 `'static` 的宽字符串字面量，
     /// 省掉自己维护缓冲区生命周期的麻烦。
@@ -91,6 +94,8 @@ mod imp {
 
         let appended = unsafe {
             AppendMenuW(menu, MF_STRING, MENU_TOGGLE as usize, w!("显示 / 隐藏"))
+                .and_then(|()| AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()))
+                .and_then(|()| AppendMenuW(menu, MF_STRING, MENU_UPDATE as usize, w!("检查更新")))
                 .and_then(|()| AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()))
                 .and_then(|()| AppendMenuW(menu, MF_STRING, MENU_QUIT as usize, w!("退出")))
         };
@@ -161,6 +166,9 @@ mod imp {
                 match chosen.0 {
                     MENU_TOGGLE => {
                         let _ = self.events.send(TrayEvent::ToggleWindow);
+                    }
+                    MENU_UPDATE => {
+                        let _ = self.events.send(TrayEvent::CheckForUpdates);
                     }
                     MENU_QUIT => {
                         let _ = self.events.send(TrayEvent::Quit);
@@ -401,13 +409,13 @@ mod tests {
 
     use super::imp::{build_menu, load_app_icon, TrayIcon};
 
-    /// 菜单能建出来、且三个条目（显示/隐藏、分隔线、退出）都在。
+    /// 菜单能建出来、且五个条目（显示/隐藏、分隔线、检查更新、分隔线、退出）都在。
     #[test]
     fn menu_has_expected_entries() {
         let menu = build_menu().expect("构建右键菜单失败");
 
         let count = unsafe { GetMenuItemCount(Some(menu)) };
-        assert_eq!(count, 3, "菜单应有 3 个条目（含分隔线），实际 {count}");
+        assert_eq!(count, 5, "菜单应有 5 个条目（含 2 条分隔线），实际 {count}");
 
         unsafe {
             let _ = DestroyMenu(menu);
