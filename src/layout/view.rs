@@ -7,16 +7,12 @@ use gpui_kit::component::{
     list::{List, ListDelegate, ListItem, ListState},
     *,
 };
-use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const FILE_SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
 
 /// 每批从后台取回的图标数量。分批是为了让首屏先拿到图标、其余陆续补齐；
 /// 一次全提完再回填的话，列表要等很久才能显示图标。
-const ICON_PREFETCH_BATCH: usize = 32;
 
 use crate::components::{
     file_search::{index_status_panel, no_results, result_header, result_row, searching_row},
@@ -138,7 +134,6 @@ pub struct LauncherView {
     file_searching: bool,
     file_error: Option<String>,
     /// 是否已有一个图标预取任务在跑（避免重复开链）
-    icon_prefetch_running: Arc<AtomicBool>,
     _subscriptions: Vec<Subscription>,
     /// watcher 轮询任务（detach 后独立运行，不随订阅管理）
     _watcher_task: Option<Task<()>>,
@@ -189,7 +184,6 @@ impl LauncherView {
                             state.scroll_to_selected_item(window, cx);
                         });
                         // 过滤后可能出现尚未提取过图标的条目
-                        this.prefetch_icons(cx);
                     }
                 }
                 InputEvent::PressEnter { secondary, .. } => {
@@ -235,9 +229,9 @@ impl LauncherView {
                         list.scroll_to_selected_item(window, cx);
                     });
                     // 重载后可能多了新条目（例如新安装的程序）
-                    this.prefetch_icons(cx);
                 }
             } else {
+                super::filesearch::cancel_search();
                 hide_window(window);
             }
         });
@@ -269,7 +263,6 @@ impl LauncherView {
                             list.delegate_mut().replace_entries(entries, &query);
                             cx.notify();
                         });
-                        let _ = this.update(cx, |this, cx| this.prefetch_icons(cx));
                     }).is_err() { break; }
                     // 通知去抖；每五分钟低频校准以补偿丢失的目录通知。
                     let changed = watcher.changed();
@@ -294,79 +287,12 @@ impl LauncherView {
             file_search_generation: 0,
             file_searching: false,
             file_error: None,
-            icon_prefetch_running: Arc::new(AtomicBool::new(false)),
             _subscriptions: vec![input_sub, bounds_sub, activation_sub, settings_sub],
             _watcher_task: watcher_task,
             _index_task: None,
         };
         input_state.update(cx, |input, cx| input.focus(window, cx));
-        view.prefetch_icons(cx);
         view
-    }
-
-    /// 向列表代理讨下一批待提取图标的启动目标。
-    fn take_icon_requests(&self, cx: &mut App) -> Vec<String> {
-        self.list_state.update(cx, |state, _| {
-            state.delegate_mut().take_icon_requests(ICON_PREFETCH_BATCH)
-        })
-    }
-
-    /// 后台预取应用图标。
-    ///
-    /// 每轮取一小批交给后台线程（Shell / GDI 调用），回填后通知列表重绘，再取下一批，
-    /// 所以图标是「先到先显示、其余陆续补齐」。
-    ///
-    /// `icon_prefetch_running` 只省重复开链，不承担正确性：目标是否已请求由
-    /// [`IconCache::request`] 去重，重复调用最多是多开一个立刻结束的任务。
-    fn prefetch_icons(&self, cx: &mut App) {
-        if self.icon_prefetch_running.load(Ordering::Relaxed) {
-            return;
-        }
-        let first = self.take_icon_requests(cx);
-        if first.is_empty() {
-            return;
-        }
-        self.icon_prefetch_running.store(true, Ordering::Relaxed);
-
-        // 用弱引用：任务可能比视图活得久（例如窗口关闭后），
-        // 直接持强引用会阻止实体销毁，而 `update` 在这里不会 panic。
-        let list_state = self.list_state.downgrade();
-        let running = self.icon_prefetch_running.clone();
-        cx.spawn(async move |cx: &mut gpui::AsyncApp| {
-            let mut batch = first;
-            loop {
-                let loaded = cx
-                    .background_executor()
-                    .spawn(async move {
-                        batch
-                            .into_iter()
-                            .map(|target| {
-                                let icon = crate::app_icon::load(Path::new(&target));
-                                (target, icon)
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .await;
-
-                let next = cx.update(|app| {
-                    list_state.update(app, |state, cx| {
-                        let delegate = state.delegate_mut();
-                        delegate.insert_icons(loaded);
-                        let next = delegate.take_icon_requests(ICON_PREFETCH_BATCH);
-                        cx.notify();
-                        next
-                    })
-                });
-
-                match next {
-                    Ok(next) if !next.is_empty() => batch = next,
-                    // 取完或实体已释放
-                    _ => break,
-                }
-            }
-            running.store(false, Ordering::Relaxed);
-        })
-        .detach();
     }
 
     /// 启动文件搜索并跟踪索引状态。

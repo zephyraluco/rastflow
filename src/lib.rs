@@ -4,3 +4,5 @@ pub mod search;
 pub mod catalog;
 
 pub mod storage;
+
+pub mod cache;

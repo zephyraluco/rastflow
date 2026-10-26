@@ -59,23 +59,6 @@ impl LauncherDelegate {
         self.icons.get(launch_target)
     }
 
-    /// 按列表顺序挑出下一批待提取图标的启动目标；无启动目标或已请求过的跳过。
-    pub fn take_icon_requests(&mut self, limit: usize) -> Vec<String> {
-        let mut requests = Vec::new();
-        for entry in &self.filtered {
-            if requests.len() >= limit {
-                break;
-            }
-            let Some(target) = entry.launch_target.as_deref() else {
-                continue;
-            };
-            if self.icons.request(target) {
-                requests.push(target.to_string());
-            }
-        }
-        requests
-    }
-
     /// 回填后台提取好的图标（`None` 表示取不到，同样会被缓存）。
     pub fn insert_icons(&mut self, loaded: Vec<(String, Option<Arc<RenderImage>>)>) {
         self.icons.insert(loaded);
@@ -86,6 +69,7 @@ impl LauncherDelegate {
     }
 
     pub fn replace_entries(&mut self, entries: Vec<AppEntry>, query: &str) {
+        self.icons.invalidate();
         self.all_entries = entries;
         self.filter(query);
     }
@@ -183,6 +167,15 @@ impl ListDelegate for LauncherDelegate {
         };
         let selected = Some(ix) == self.selected_index;
         let icon = self.icon(launch_target.as_deref());
+        if let Some(target) = launch_target.filter(|target| self.icons.request(target)) {
+            cx.spawn(async move |this, cx| {
+                let icon = crate::app_icon::load_async(target.clone()).await;
+                let _ = this.update(cx, |state, cx| {
+                    state.delegate_mut().insert_icons(vec![(target,icon)]);
+                    cx.notify();
+                });
+            }).detach();
+        }
 
         Some(
             ListItem::new(ix.row)

@@ -337,6 +337,12 @@ pub fn install_index_service() {
 
 // ---------- 搜索 ----------
 
+pub fn cancel_search() {
+    if let Some(inner) = STATE.get() {
+        if let Some(cancel) = inner.last_cancel.lock().unwrap_or_else(|e| e.into_inner()).take() { cancel.store(true, Ordering::Relaxed); }
+    }
+}
+
 /// 按关键字搜索。
 ///
 /// 解析规则与自研核心一致：关键字按 `;` 分隔、全部命中才算匹配（AND）、

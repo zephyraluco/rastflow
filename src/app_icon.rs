@@ -33,6 +33,23 @@ pub fn load(target: &Path) -> Option<Arc<RenderImage>> {
     Some(Arc::new(RenderImage::new(vec![image::Frame::new(image)])))
 }
 
+/// 所有常规图标提取都由同一个 OS/COM 线程完成，队列有界。
+pub async fn load_async(target: String) -> Option<Arc<RenderImage>> {
+    type Request = (String, async_channel::Sender<Option<Arc<RenderImage>>>);
+    static WORKER: std::sync::OnceLock<Option<async_channel::Sender<Request>>> = std::sync::OnceLock::new();
+    let worker = WORKER.get_or_init(|| {
+        let (sender, receiver) = async_channel::bounded::<Request>(32);
+        std::thread::Builder::new().name("rastflow-shell-icons".into()).spawn(move || {
+            while let Ok((target,reply)) = receiver.recv_blocking() {
+                if !reply.is_closed() { let _ = reply.try_send(load(Path::new(&target))); }
+            }
+        }).ok().map(|_| sender)
+    }).as_ref()?;
+    let (reply, result) = async_channel::bounded(1);
+    worker.send((target,reply)).await.ok()?;
+    result.recv().await.ok().flatten()
+}
+
 /// 裁掉图标四周的全透明区域；整张图全透明时返回 `None`（视为没取到图标）。
 ///
 /// 有些程序（绿色版、带自更新器的程序）只在 exe 里塞了小尺寸图标，Shell 会把它

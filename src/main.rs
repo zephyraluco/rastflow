@@ -359,3 +359,5 @@ fn main() {
 mod catalog;
 
 mod storage;
+
+mod cache;
