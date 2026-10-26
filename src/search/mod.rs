@@ -17,6 +17,7 @@ pub mod matcher;
 pub mod monitor;
 pub mod pathutil;
 pub mod priority;
+mod scheduler;
 pub mod win;
 
 pub type Result<T> = std::result::Result<T, CoreError>;

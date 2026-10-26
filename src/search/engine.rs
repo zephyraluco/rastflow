@@ -1,34 +1,30 @@
 //! 搜索调度与索引生命周期。
 //!
-//! 搜索分两阶段（优先目录预扫 → 顺序扫内存索引），结果按后缀优先级分档发布；
+//! 搜索只读内存索引，由单工作线程和一个待执行槽位限制并发；
 //! 生命周期是 open → catch_up → start_monitor → 定期 save_snapshot。
 //! 细节见 `docs/search-engine.md` §7、§8。
 //!
-//! ⚠️ 懒删除必须等**读锁释放之后**再拿写锁 —— `RwLock` 不可重入。
+//! 搜索不访问文件系统、不修改索引；变更仅由索引写入线程应用。
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{
-    Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
+    Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard,
 };
-use std::thread;
 use std::time::Duration;
 
-use super::index::{
-    self as index_mod, FileIndex, JournalMark, MftEntry, PathScratch, SaveStats,
-};
+use super::index::{self as index_mod, FileIndex, JournalMark, MftEntry, PathScratch, SaveStats};
 #[cfg(test)]
 use super::index::{IndexConfig, IndexProgress, IndexReport};
 use super::matcher::SearchQuery;
-use super::monitor::MonitorEvent;
 #[cfg(test)]
 use super::monitor;
+use super::monitor::MonitorEvent;
 use super::pathutil::{self, IgnoreRules};
 use super::priority::{DIR_PRIORITY, PriorityTable};
+use super::scheduler::LatestWorker;
 use super::win::disk;
-use super::win::known_folder;
-use super::win::path_exists;
 use super::win::usn::is_root;
 use super::{DEFAULT_MAX_RESULTS, MAX_SEARCH_TEXT_LEN, Result};
 
@@ -40,10 +36,6 @@ pub struct CoreConfig {
     /// 忽略的目录（整棵子树）
     pub ignore_paths: Vec<String>,
     pub max_results: usize,
-    /// 除开始菜单/桌面之外，额外优先预扫的目录
-    pub priority_folders: Vec<PathBuf>,
-    pub scan_depth: usize,
-    pub scan_shortcuts: bool,
 }
 
 impl CoreConfig {
@@ -56,9 +48,6 @@ impl CoreConfig {
                 r"C:\$Recycle.Bin".to_string(),
             ],
             max_results: DEFAULT_MAX_RESULTS,
-            priority_folders: Vec::new(),
-            scan_depth: 4,
-            scan_shortcuts: true,
         }
     }
 }
@@ -98,6 +87,7 @@ pub struct Engine {
     /// 每个盘已经处理到的 USN 位点（随快照落盘）
     marks: Mutex<HashMap<char, JournalMark>>,
     snapshot: PathBuf,
+    queries: OnceLock<std::io::Result<LatestWorker<(SearchQuery, Arc<SessionState>)>>>,
     /// 预编译的忽略规则
     ignore: IgnoreRules,
 }
@@ -154,6 +144,7 @@ impl Engine {
             priorities: RwLock::new(priorities),
             marks: Mutex::new(marks),
             snapshot,
+            queries: OnceLock::new(),
             ignore,
         })
     }
@@ -175,8 +166,8 @@ impl Engine {
         &self,
         progress: Option<&mut dyn FnMut(IndexProgress)>,
     ) -> Result<IndexReport> {
-        let index_config =
-            IndexConfig::new(self.disks.clone()).with_ignore_paths(self.config.ignore_paths.clone());
+        let index_config = IndexConfig::new(self.disks.clone())
+            .with_ignore_paths(self.config.ignore_paths.clone());
         let mut noop = |_: IndexProgress| {};
         let progress: &mut dyn FnMut(IndexProgress) = match progress {
             Some(callback) => callback,
@@ -352,17 +343,28 @@ impl Engine {
     /// 发起一次搜索，立即返回（结果在后台线程里渐进式填充）
     pub fn search(self: &Arc<Self>, query: SearchQuery) -> SearchSession {
         let state = Arc::new(SessionState::default());
-        let engine = Arc::clone(self);
-        let worker_state = Arc::clone(&state);
-        // 发射后不管：结果由 `state` 渐进式发布，取消靠 `state.cancelled`。
-        // 不保留 JoinHandle —— 会话销毁时 Drop 会置取消位，扫描线程很快自行退出，
-        // 没有任何调用方需要 join 它。
-        let _ = thread::Builder::new()
-            .name("rastflow-core-search".to_string())
-            .spawn(move || {
-                engine.run_search(&query, &worker_state);
-                worker_state.finish();
-            });
+        let worker = self.queries.get_or_init(|| {
+            let engine = Arc::downgrade(self);
+            LatestWorker::new(
+                "rastflow-core-search",
+                move |(query, state): (SearchQuery, Arc<SessionState>)| {
+                    if let Some(engine) = engine.upgrade() {
+                        if !state.should_stop() {
+                            engine.run_search(&query, &state);
+                        }
+                    }
+                    state.finish();
+                },
+            )
+        });
+        let Ok(worker) = worker else {
+            state.finish();
+            return SearchSession { state };
+        };
+        if let Some((_, replaced)) = worker.submit((query, Arc::clone(&state))) {
+            replaced.cancelled.store(true, Ordering::Relaxed);
+            replaced.finish();
+        }
 
         SearchSession { state }
     }
@@ -374,31 +376,8 @@ impl Engine {
         if query.is_empty() || query.search_text.len() > MAX_SEARCH_TEXT_LEN {
             return;
         }
-        let max = self.config.max_results;
-
-        // ── 第一阶段：预扫「几乎一定要用」的目录 ───────────────────────
-        for root in self.preset_roots() {
-            if state.should_stop() || state.len() >= max {
-                return;
-            }
-            self.scan_folder(&root, query, state, 0);
-        }
-
-        // ── 第二阶段：扫内存索引 ──────────────────────────────────────
-        let mut ghosts: Vec<u32> = Vec::new();
-        {
-            let index = read(&self.index);
-            self.scan_index(&index, query, state, &mut ghosts);
-        }
-
-        // 懒删除：命中了但文件已经不在 → 从索引里摘掉。
-        // 必须等读锁释放后再拿写锁 —— `RwLock` 不可重入。
-        if !ghosts.is_empty() {
-            let mut index = write(&self.index);
-            for slot in ghosts {
-                index.discard(slot);
-            }
-        }
+        let index = read(&self.index);
+        self.scan_index(&index, query, state);
     }
 
     /// 结果分档顺序：文件按后缀优先级降序，最后才是目录
@@ -408,13 +387,7 @@ impl Engine {
         tiers
     }
 
-    fn scan_index(
-        &self,
-        index: &FileIndex,
-        query: &SearchQuery,
-        state: &SessionState,
-        ghosts: &mut Vec<u32>,
-    ) {
+    fn scan_index(&self, index: &FileIndex, query: &SearchQuery, state: &SessionState) {
         let max = self.config.max_results;
         let tiers = self.priority_tiers();
         let last_tier = tiers.len() - 1;
@@ -473,55 +446,7 @@ impl Engine {
                 if !index.path_into(*slot, &mut scratch, &mut path) {
                     continue; // 链条断了（孤儿），跳过
                 }
-                // `Some(false)` 才是「确实不在了」；权限不足、长路径判断不了时
-                // （`None`）宁可把结果留下，也不能把条目从索引里摘掉。
-                match path_exists(&path) {
-                    Some(false) => ghosts.push(*slot),
-                    _ => state.push(&path),
-                }
-            }
-        }
-    }
-
-    /// 预扫目录：优先文件夹 + 开始菜单/桌面
-    fn preset_roots(&self) -> Vec<PathBuf> {
-        let mut roots = self.config.priority_folders.clone();
-        if self.config.scan_shortcuts {
-            roots.extend(known_folder::shortcut_roots());
-        }
-        roots
-    }
-
-    /// 直接遍历目录（不查索引）。预扫用，深度受 `scan_depth` 限制
-    fn scan_folder(&self, root: &Path, query: &SearchQuery, state: &SessionState, depth: usize) {
-        if depth > self.config.scan_depth {
-            return;
-        }
-        let Ok(entries) = std::fs::read_dir(root) else {
-            return; // 没权限或目录不存在都直接跳过
-        };
-        for entry in entries.flatten() {
-            if state.should_stop() {
-                return;
-            }
-            // 用 file_type 而不是 metadata：不跟随链接，也更快
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if file_type.is_symlink() {
-                continue; // 避免目录联接造成的环
-            }
-            let is_dir = file_type.is_dir();
-            let path = entry.path();
-            let Some(text) = path.to_str() else { continue };
-            if query.matches(text) {
-                state.push(text);
-                if state.len() >= self.config.max_results {
-                    return;
-                }
-            }
-            if is_dir {
-                self.scan_folder(&path, query, state, depth + 1);
+                state.push(&path);
             }
         }
     }
@@ -636,7 +561,8 @@ fn read<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
 }
 
 fn write<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
-    lock.write().unwrap_or_else(|poisoned| poisoned.into_inner())
+    lock.write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -745,8 +671,8 @@ impl Drop for SearchSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::search::win::usn::ROOT_MFT_INDEX;
     use crate::search::priority::DEFAULT_PRIORITY;
+    use crate::search::win::usn::ROOT_MFT_INDEX;
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -763,9 +689,7 @@ mod tests {
 
     /// 预扫开始菜单/桌面会让单测变慢且结果不可控，统一关掉
     fn test_config(data_dir: &Path) -> CoreConfig {
-        let mut config = CoreConfig::new(data_dir);
-        config.scan_shortcuts = false;
-        config
+        CoreConfig::new(data_dir)
     }
 
     /// 走真实的 `Engine::open`（会读写快照）打开一个只索引指定盘的引擎。
@@ -787,6 +711,7 @@ mod tests {
             priorities: RwLock::new(PriorityTable::with_builtin_defaults()),
             marks: Mutex::new(HashMap::new()),
             snapshot,
+            queries: OnceLock::new(),
             ignore,
         })
     }
@@ -852,8 +777,6 @@ mod tests {
     fn default_config_values() {
         let config = CoreConfig::new(r"D:\idx");
         assert_eq!(config.max_results, DEFAULT_MAX_RESULTS);
-        assert!(config.scan_shortcuts);
-        assert_eq!(config.scan_depth, 4);
         assert!(config.disks.is_empty());
         // 默认忽略回收站
         assert!(
@@ -893,8 +816,14 @@ mod tests {
         index_path(&engine, &txt.to_string_lossy(), 0);
 
         let hits = search(&engine, "rastflow-notepad");
-        assert!(hits.contains(&exe.to_string_lossy().to_string()), "命中 exe");
-        assert!(hits.contains(&txt.to_string_lossy().to_string()), "命中 txt");
+        assert!(
+            hits.contains(&exe.to_string_lossy().to_string()),
+            "命中 exe"
+        );
+        assert!(
+            hits.contains(&txt.to_string_lossy().to_string()),
+            "命中 txt"
+        );
         // 高优先级的 exe 排在前面
         assert_eq!(hits[0], exe.to_string_lossy().to_string());
 
@@ -903,16 +832,26 @@ mod tests {
     }
 
     #[test]
-    fn lazy_delete_removes_records_that_no_longer_exist() {
+    fn search_keeps_unavailable_paths_and_never_mutates_index() {
         let data_dir = temp_dir("lazy-data");
         let ghost = r"C:\rastflow-ghost-notepad.exe";
         let engine = open_in_memory(test_config(&data_dir), vec!['C']);
         index_path(&engine, ghost, 30);
-        assert_eq!(read(&engine.index).iter_live().count(), 2, "盘根 + 幽灵文件");
+        assert_eq!(
+            read(&engine.index).iter_live().count(),
+            2,
+            "盘根 + 幽灵文件"
+        );
 
-        // 文件并不存在 → 不该返回，而且会被摘掉
-        assert!(search(&engine, "rastflow-ghost-notepad").is_empty());
-        assert_eq!(read(&engine.index).iter_live().count(), 1, "幽灵被摘掉，只剩盘根");
+        assert_eq!(
+            search(&engine, "rastflow-ghost-notepad"),
+            vec![ghost.to_string()]
+        );
+        assert_eq!(
+            read(&engine.index).iter_live().count(),
+            2,
+            "搜索不能修改索引"
+        );
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
@@ -920,11 +859,14 @@ mod tests {
     fn results_are_capped_by_limit() {
         let data_dir = temp_dir("limit-data");
         let files_dir = temp_dir("limit-files");
-        let engine = open_in_memory({
-            let mut config = test_config(&data_dir);
-            config.max_results = 3;
-            config
-        }, vec!['C']);
+        let engine = open_in_memory(
+            {
+                let mut config = test_config(&data_dir);
+                config.max_results = 3;
+                config
+            },
+            vec!['C'],
+        );
         for index in 0..10 {
             let file = files_dir.join(format!("rastflow-limit-{index}.exe"));
             std::fs::write(&file, b"x").unwrap();
@@ -982,31 +924,6 @@ mod tests {
         let long = "a".repeat(MAX_SEARCH_TEXT_LEN + 1);
         assert!(search(&engine, &long).is_empty());
         let _ = std::fs::remove_dir_all(&data_dir);
-    }
-
-    #[test]
-    fn priority_folder_files_found_without_index() {
-        let data_dir = temp_dir("prio-data");
-        let folder = temp_dir("prio-folder");
-        let nested = folder.join("sub");
-        std::fs::create_dir_all(&nested).unwrap();
-        let deep = nested.join("rastflow-priority.txt");
-        std::fs::write(&deep, b"x").unwrap();
-
-        let engine = open_in_memory(
-            {
-                let mut config = test_config(&data_dir);
-                config.priority_folders = vec![folder.clone()];
-                config
-            },
-            vec!['C'],
-        );
-
-        // 索引里什么都不放，只靠目录预扫就应该能命中
-        assert_eq!(search(&engine, "rastflow-priority"), vec![deep.to_string_lossy().to_string()]);
-
-        let _ = std::fs::remove_dir_all(&data_dir);
-        let _ = std::fs::remove_dir_all(&folder);
     }
 
     #[test]
@@ -1080,14 +997,18 @@ mod tests {
         std::fs::write(&file, b"x").unwrap();
         let file_text = file.to_string_lossy().to_string();
         let file_frn = synthetic_frn(&file_text);
-        assert!(engine
-            .apply_event(&added('C', file_frn, dir_frn, "rastflow-event.exe", false))
-            .unwrap());
+        assert!(
+            engine
+                .apply_event(&added('C', file_frn, dir_frn, "rastflow-event.exe", false))
+                .unwrap()
+        );
         // 同一条重复上报是幂等的：就地更新，不该多出一条记录
         let before = read(&engine.index).iter_live().count();
-        assert!(engine
-            .apply_event(&added('C', file_frn, dir_frn, "rastflow-event.exe", false))
-            .unwrap());
+        assert!(
+            engine
+                .apply_event(&added('C', file_frn, dir_frn, "rastflow-event.exe", false))
+                .unwrap()
+        );
         assert_eq!(
             read(&engine.index).iter_live().count(),
             before,
@@ -1096,23 +1017,29 @@ mod tests {
         assert_eq!(search(&engine, "rastflow-event"), vec![file_text.clone()]);
 
         // 删除
-        assert!(engine
-            .apply_event(&removed('C', file_frn, "rastflow-event.exe"))
-            .unwrap());
+        assert!(
+            engine
+                .apply_event(&removed('C', file_frn, "rastflow-event.exe"))
+                .unwrap()
+        );
         assert!(read(&engine.index).lookup('C', file_frn).is_none());
         assert!(search(&engine, "rastflow-event").is_empty());
         // 再删一次就「没改动」
-        assert!(!engine
-            .apply_event(&removed('C', file_frn, "rastflow-event.exe"))
-            .unwrap());
+        assert!(
+            !engine
+                .apply_event(&removed('C', file_frn, "rastflow-event.exe"))
+                .unwrap()
+        );
 
         // DiskWarning / DiskStopped 不涉及索引内容
-        assert!(!engine
-            .apply_event(&MonitorEvent::DiskWarning {
-                disk: 'C',
-                message: "x".into()
-            })
-            .unwrap());
+        assert!(
+            !engine
+                .apply_event(&MonitorEvent::DiskWarning {
+                    disk: 'C',
+                    message: "x".into()
+                })
+                .unwrap()
+        );
         assert!(!engine.apply_event(&MonitorEvent::DiskStopped('C')).unwrap());
 
         let _ = std::fs::remove_dir_all(&data_dir);
@@ -1127,9 +1054,11 @@ mod tests {
 
         // 父目录从没建过 → 这条插进去也搜不到，直接拒
         let unknown_parent = synthetic_frn(r"C:\never-created");
-        assert!(!engine
-            .apply_event(&added('C', 9001, unknown_parent, "orphan.txt", false))
-            .unwrap());
+        assert!(
+            !engine
+                .apply_event(&added('C', 9001, unknown_parent, "orphan.txt", false))
+                .unwrap()
+        );
         assert!(read(&engine.index).lookup('C', 9001).is_none());
         let _ = std::fs::remove_dir_all(&data_dir);
     }
@@ -1154,12 +1083,16 @@ mod tests {
 
         // 同一 FRN、两个名字 —— 与 MFT 枚举出来的两条记录一致
         let shared_frn = synthetic_frn(&origin.to_string_lossy());
-        assert!(engine
-            .apply_event(&added('C', shared_frn, dir_frn, "origin.mui", false))
-            .unwrap());
-        assert!(engine
-            .apply_event(&added('C', shared_frn, dir_frn, "linked.mui", false))
-            .unwrap());
+        assert!(
+            engine
+                .apply_event(&added('C', shared_frn, dir_frn, "origin.mui", false))
+                .unwrap()
+        );
+        assert!(
+            engine
+                .apply_event(&added('C', shared_frn, dir_frn, "linked.mui", false))
+                .unwrap()
+        );
 
         let origin_text = origin.to_string_lossy().to_string();
         let linked_text = linked.to_string_lossy().to_string();
@@ -1168,9 +1101,11 @@ mod tests {
 
         // 删掉一条链接：另一条仍然搜得到
         std::fs::remove_file(&linked).unwrap();
-        assert!(engine
-            .apply_event(&removed('C', shared_frn, "linked.mui"))
-            .unwrap());
+        assert!(
+            engine
+                .apply_event(&removed('C', shared_frn, "linked.mui"))
+                .unwrap()
+        );
         assert!(search(&engine, "linked.mui").is_empty());
         assert_eq!(search(&engine, "origin.mui"), vec![origin_text]);
 
@@ -1198,9 +1133,11 @@ mod tests {
         );
 
         // 目录改名：只更新目录那一条
-        assert!(engine
-            .apply_event(&renamed('C', dir_frn, ROOT_MFT_INDEX, "new-dir", true))
-            .unwrap());
+        assert!(
+            engine
+                .apply_event(&renamed('C', dir_frn, ROOT_MFT_INDEX, "new-dir", true))
+                .unwrap()
+        );
 
         // 子文件的路径自动变成新名字，**不需要**逐条更新
         let index = read(&engine.index);
@@ -1223,6 +1160,7 @@ mod tests {
             priorities: RwLock::new(PriorityTable::with_builtin_defaults()),
             marks: Mutex::new(HashMap::new()),
             snapshot: PathBuf::new(),
+            queries: OnceLock::new(),
             ignore: IgnoreRules::new(&[r"C:\$Recycle.Bin".to_string(), r"C:\skipme".to_string()]),
         });
         write(&engine.index).ensure_root('C');
@@ -1230,7 +1168,13 @@ mod tests {
         // 回收站下的新增：先插进去拼出路径，再被回收站规则摘掉
         let recycle_frn = synthetic_frn(r"C:\$Recycle.Bin");
         engine
-            .apply_event(&added('C', recycle_frn, ROOT_MFT_INDEX, "$Recycle.Bin", true))
+            .apply_event(&added(
+                'C',
+                recycle_frn,
+                ROOT_MFT_INDEX,
+                "$Recycle.Bin",
+                true,
+            ))
             .unwrap();
         let index = read(&engine.index);
         assert!(
@@ -1240,14 +1184,30 @@ mod tests {
         drop(index);
 
         // 忽略目录同理
-        assert!(!engine
-            .apply_event(&added('C', synthetic_frn(r"C:\skipme"), ROOT_MFT_INDEX, "skipme", true))
-            .unwrap());
+        assert!(
+            !engine
+                .apply_event(&added(
+                    'C',
+                    synthetic_frn(r"C:\skipme"),
+                    ROOT_MFT_INDEX,
+                    "skipme",
+                    true
+                ))
+                .unwrap()
+        );
 
         // 不在忽略列表里的正常目录能进去
-        assert!(engine
-            .apply_event(&added('C', synthetic_frn(r"C:\keepme"), ROOT_MFT_INDEX, "keepme", true))
-            .unwrap());
+        assert!(
+            engine
+                .apply_event(&added(
+                    'C',
+                    synthetic_frn(r"C:\keepme"),
+                    ROOT_MFT_INDEX,
+                    "keepme",
+                    true
+                ))
+                .unwrap()
+        );
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }
@@ -1414,10 +1374,12 @@ mod tests {
         let engine = Arc::new({
             let mut config = CoreConfig::new(&data_dir);
             config.disks = vec![disk];
-            config.scan_shortcuts = false;
             Engine::open(config).expect("打开引擎失败（多半是没有管理员权限）")
         });
-        println!("已打开引擎，盘：{}", engine.disks().iter().collect::<String>());
+        println!(
+            "已打开引擎，盘：{}",
+            engine.disks().iter().collect::<String>()
+        );
 
         let started = std::time::Instant::now();
         let report = engine.build_index(None).expect("建索引失败");
@@ -1444,11 +1406,14 @@ mod tests {
 
         // 快照往返：重新打开应当直接可用，不用再扫 MFT
         let snapshot = index_mod::snapshot_path(&data_dir);
-        println!("快照：{}（{} 字节）", snapshot.display(), std::fs::metadata(&snapshot).map(|m| m.len()).unwrap_or(0));
+        println!(
+            "快照：{}（{} 字节）",
+            snapshot.display(),
+            std::fs::metadata(&snapshot).map(|m| m.len()).unwrap_or(0)
+        );
         let reopened = {
             let mut config = CoreConfig::new(&data_dir);
             config.disks = vec![disk];
-            config.scan_shortcuts = false;
             Engine::open(config).expect("重新打开失败")
         };
         assert!(reopened.is_indexed(), "重新打开应当直接从快照恢复");
