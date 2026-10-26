@@ -305,6 +305,7 @@ fn main() {
                 if let application::Event::Tray(event) = event {
                         if event == TrayEvent::Quit {
                             layout::filesearch::shutdown();
+                            app_list::flush();
                             cx.update(|cx| cx.quit());
                             return;
                         }
@@ -352,3 +353,5 @@ fn main() {
         .detach();
     });
 }
+
+mod catalog;

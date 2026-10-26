@@ -8,7 +8,7 @@ use gpui_kit::component::{
 use std::sync::Arc;
 
 use crate::app_list::{
-    load_or_discover_entries, save_entries,
+    record_launch,
     sort_entries_by_launch, AppEntry,
 };
 use crate::components::app_list_item::app_row;
@@ -44,7 +44,7 @@ pub struct LauncherDelegate {
 
 impl LauncherDelegate {
     pub fn new() -> Self {
-        let all_entries = load_or_discover_entries();
+        let all_entries = Vec::new();
         let filtered = all_entries.clone();
         Self {
             all_entries,
@@ -82,7 +82,11 @@ impl LauncherDelegate {
     }
 
     pub fn reload(&mut self, query: &str) {
-        self.all_entries = load_or_discover_entries();
+        self.filter(query);
+    }
+
+    pub fn replace_entries(&mut self, entries: Vec<AppEntry>, query: &str) {
+        self.all_entries = entries;
         self.filter(query);
     }
 
@@ -134,7 +138,7 @@ impl LauncherDelegate {
             Some(IndexPath::default())
         };
 
-        save_entries(&self.all_entries);
+        record_launch(launched.id.as_ref());
     }
 
     /// 计算下一个选中 index（纯函数，不修改自身状态）

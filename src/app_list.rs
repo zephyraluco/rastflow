@@ -1,9 +1,6 @@
 //! 启动器应用列表：数据模型、SQLite 持久化、系统程序发现
 
 use gpui::SharedString;
-use rusqlite::{Connection, params};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
@@ -49,78 +46,47 @@ impl AppEntry {
 
     /// 从 name + launch_target 计算稳定 ID（用于主键与身份识别）
     fn compute_id(name: &str, launch_target: Option<&str>) -> String {
-        let mut hasher = DefaultHasher::new();
-        name.to_lowercase().hash(&mut hasher);
-        launch_target.unwrap_or("").to_lowercase().hash(&mut hasher);
-        format!("{:016x}", hasher.finish())
+        crate::catalog::entry_id(name, launch_target)
     }
 }
 
-// ---------- 数据库连接（单连接，互斥保护）----------
+// ---------- 数据库工作线程 ----------
 
-static DB: OnceLock<Mutex<Option<Connection>>> = OnceLock::new();
-
-fn db() -> &'static Mutex<Option<Connection>> {
+enum DbCommand {
+    Load(std::sync::mpsc::Sender<Vec<AppEntry>>),
+    Save(Vec<crate::catalog::Record>),
+    Launch(String),
+    Flush(std::sync::mpsc::Sender<()>),
+}
+static DB: OnceLock<std::sync::mpsc::Sender<DbCommand>> = OnceLock::new();
+fn db() -> &'static std::sync::mpsc::Sender<DbCommand> {
     DB.get_or_init(|| {
-        let conn = match Connection::open(db_path()) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("[rastflow] 无法打开 SQLite 数据库: {e}");
-                return Mutex::new(None);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::Builder::new().name("rastflow-catalog-store".into()).spawn(move || {
+            let mut store = match crate::catalog::Store::open(&db_path()) {
+                Ok(store) => store,
+                Err(error) => { eprintln!("[rastflow] 打开应用目录失败：{error}"); return; }
+            };
+            for command in receiver {
+                match command {
+                    DbCommand::Load(reply) => { let records = store.load().unwrap_or_else(|error| { eprintln!("[rastflow] 读取应用目录失败：{error}"); Vec::new() });
+                        let _ = reply.send(records.into_iter().map(|record| AppEntry { id: record.id.into(),name: record.name.into(),category: record.category.into(),launch_target: record.target,launch_count: record.launches }).collect()); }
+                    DbCommand::Save(entries) => if let Err(error) = store.save(&entries) { eprintln!("[rastflow] 保存应用目录失败：{error}"); },
+                    DbCommand::Launch(id) => if let Err(error) = store.record_launch(&id) { eprintln!("[rastflow] 保存启动次数失败：{error}"); },
+                    DbCommand::Flush(reply) => { let _ = reply.send(()); }
+                }
             }
-        };
-        if let Err(e) = init_schema(&conn) {
-            eprintln!("[rastflow] 无法初始化数据库表: {e}");
-            return Mutex::new(None);
-        }
-        Mutex::new(Some(conn))
+        }).expect("cannot start catalog store");
+        sender
     })
 }
+pub fn record_launch(id: &str) { let _ = db().send(DbCommand::Launch(id.into())); }
 
-fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
-    // 检查旧表是否存在但没有 id 列（从 sqlx 版本迁移）
-    let has_id: bool = conn
-        .prepare("PRAGMA table_info(app_entries)")?
-        .query_map([], |row| row.get::<_, String>(1))?
-        .any(|name| name.as_deref() == Ok("id"));
-
-    if !has_id {
-        // 旧表结构：备份数据，重建表
-        conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS app_entries_new (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                category TEXT NOT NULL DEFAULT '',
-                launch_target TEXT,
-                launch_count INTEGER NOT NULL DEFAULT 0
-            );
-            INSERT OR IGNORE INTO app_entries_new (id, name, category, launch_target, launch_count)
-                SELECT
-                    lower(hex(randomblob(8))),
-                    name,
-                    category,
-                    launch_target,
-                    launch_count
-                FROM app_entries;
-            DROP TABLE IF EXISTS app_entries;
-            ALTER TABLE app_entries_new RENAME TO app_entries;
-            ",
-        )?;
-    } else {
-        conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS app_entries (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                category TEXT NOT NULL DEFAULT '',
-                launch_target TEXT,
-                launch_count INTEGER NOT NULL DEFAULT 0
-            );
-            ",
-        )?;
+pub fn flush() {
+    if let Some(db) = DB.get() {
+        let (reply, done) = std::sync::mpsc::channel();
+        if db.send(DbCommand::Flush(reply)).is_ok() { let _ = done.recv_timeout(std::time::Duration::from_secs(5)); }
     }
-    Ok(())
 }
 
 // ---------- 路径 ----------
@@ -133,111 +99,21 @@ pub fn db_path() -> PathBuf {
 /// 从系统发现的条目里筛出来。两边引用同一个常量，改文案时不会漏改一处。
 pub const CUSTOM_APP_CATEGORY: &str = "自定义程序";
 
-// ---------- 回退数据（仅 debug 构建）----------
-
-#[cfg(debug_assertions)]
-fn fallback_entries() -> Vec<AppEntry> {
-    vec![
-        AppEntry::new("Visual Studio Code", "开发工具"),
-        AppEntry::new("Firefox", "浏览器"),
-        AppEntry::new("Chrome", "浏览器"),
-        AppEntry::new("Terminal", "系统"),
-        AppEntry::new("Finder", "系统"),
-        AppEntry::new("Spotify", "娱乐"),
-        AppEntry::new("Slack", "通讯"),
-        AppEntry::new("Notion", "效率"),
-        AppEntry::new("Figma", "设计"),
-        AppEntry::new("Postman", "开发工具"),
-        AppEntry::new("Docker", "开发工具"),
-        AppEntry::new("iTerm2", "系统"),
-        AppEntry::new("Obsidian", "效率"),
-        AppEntry::new("Discord", "通讯"),
-        AppEntry::new("Xcode", "开发工具"),
-    ]
-}
-
 // ---------- 数据库读写 ----------
 
 fn load_all_from_db() -> Vec<AppEntry> {
-    let guard = match db().lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    let conn = match guard.as_ref() {
-        Some(c) => c,
-        None => return Vec::new(),
-    };
-
-    let mut stmt = match conn.prepare(
-        "SELECT id, name, category, launch_target, launch_count FROM app_entries",
-    ) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-
-    let rows = stmt.query_map([], |row| {
-        Ok(AppEntry {
-            id: row.get::<_, String>(0)?.into(),
-            name: row.get::<_, String>(1)?.into(),
-            category: row.get::<_, String>(2)?.into(),
-            launch_target: row.get(3)?,
-            launch_count: row.get::<_, i64>(4)? as u64,
-        })
-    });
-
-    match rows {
-        Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
-        Err(_) => Vec::new(),
-    }
+    let (reply, result) = std::sync::mpsc::channel();
+    if db().send(DbCommand::Load(reply)).is_err() { return Vec::new(); }
+    result.recv().unwrap_or_default()
 }
 
-/// 全量写回条目。写失败只记日志、不 panic：列表已在内存里可用，下次启动会再写一遗；
-/// 数据库被另一个实例占用时尤其容易失败。
+/// UI 只投递保存命令；数据库连接由专用线程独占。
 pub fn save_entries(entries: &[AppEntry]) {
-    let guard = match db().lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    let conn = match guard.as_ref() {
-        Some(c) => c,
-        None => return,
-    };
-
-    let result = conn.execute_batch("BEGIN");
-    if let Err(e) = result {
-        eprintln!("[rastflow] 保存应用列表失败（BEGIN）: {e}");
-        return;
-    }
-
-    let mut stmt = match conn.prepare(
-        "INSERT OR REPLACE INTO app_entries (id, name, category, launch_target, launch_count)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[rastflow] 保存应用列表失败（prepare）: {e}");
-            let _ = conn.execute_batch("ROLLBACK");
-            return;
-        }
-    };
-
-    for e in entries {
-        if let Err(err) = stmt.execute(params![
-            e.id.as_ref(),
-            e.name.as_ref(),
-            e.category.as_ref(),
-            e.launch_target.as_deref(),
-            e.launch_count as i64,
-        ]) {
-            eprintln!("[rastflow] 保存应用列表失败（insert）: {err}");
-            let _ = conn.execute_batch("ROLLBACK");
-            return;
-        }
-    }
-
-    if let Err(e) = conn.execute_batch("COMMIT") {
-        eprintln!("[rastflow] 保存应用列表失败（COMMIT）: {e}");
-    }
+    let records = entries.iter().map(|entry| crate::catalog::Record {
+        id: entry.id.to_string(),name: entry.name.to_string(),category: entry.category.to_string(),
+        target: entry.launch_target.clone(),launches: entry.launch_count,
+    }).collect();
+    let _ = db().send(DbCommand::Save(records));
 }
 
 pub fn upsert_custom_entry(
@@ -297,6 +173,7 @@ pub fn upsert_custom_entry(
 
     sort_entries_by_launch(&mut entries);
     save_entries(&entries);
+    watcher::invalidate();
     Ok(())
 }
 
@@ -380,7 +257,7 @@ fn scan_windows_apps() -> Vec<AppEntry> {
                 }
                 // 按名字去重：用户开始菜单与公共开始菜单里经常有同一个程序的
                 // 两份快捷方式（目标完全一样），收两条只会得到重影。
-                let key = name.to_lowercase();
+                let key = crate::catalog::target_key(&path.to_string_lossy());
                 if seen.insert(key) {
                     out.push(AppEntry::with_launch_target(
                         name,
@@ -417,11 +294,8 @@ fn scan_windows_apps() -> Vec<AppEntry> {
     // 开始菜单目录里没有 .lnk 的程序（UWP / Microsoft Store 应用等）从
     // shell:AppsFolder 补上。这里按**显示名**与快捷方式比对：同一个程序的两个
     // 入口只保留快捷方式那条，免得列表里出现两条同名项。
-    let mut names: HashSet<String> = out.iter().map(|e| e.name.to_lowercase()).collect();
     for entry in discover_apps_folder() {
-        if names.insert(entry.name.to_lowercase()) {
-            out.push(entry);
-        }
+        if seen.insert(entry_key(&entry)) { out.push(entry); }
     }
 
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -540,7 +414,7 @@ const SYSTEM_APP_CATEGORY: &str = "系统程序";
 #[cfg(windows)]
 fn entry_key(entry: &AppEntry) -> String {
     match entry.launch_target.as_deref() {
-        Some(target) => target.to_lowercase(),
+        Some(target) => crate::catalog::target_key(target),
         None => format!("\0name:{}", entry.name.to_lowercase()),
     }
 }
@@ -551,16 +425,21 @@ fn entry_key(entry: &AppEntry) -> String {
 fn merge_discovered(stored: Vec<AppEntry>, discovered: Vec<AppEntry>) -> Vec<AppEntry> {
     use std::collections::{HashMap, HashSet};
 
-    let mut counts: HashMap<String, u64> = HashMap::new();
+    let mut counts: HashMap<String, AppEntry> = HashMap::new();
     for entry in &stored {
-        counts.insert(entry_key(entry), entry.launch_count);
+        counts.insert(entry_key(entry), entry.clone());
     }
 
     let mut merged: Vec<AppEntry> = discovered
         .into_iter()
         .map(|mut entry| {
-            if let Some(count) = counts.get(&entry_key(&entry)) {
-                entry.launch_count = *count;
+            if let Some(previous) = counts.get(&entry_key(&entry)) {
+                entry.id = previous.id.clone();
+                entry.launch_count = previous.launch_count;
+                if previous.category.as_ref() != SYSTEM_APP_CATEGORY {
+                    entry.name = previous.name.clone();
+                    entry.category = previous.category.clone();
+                }
             }
             entry
         })
@@ -696,10 +575,6 @@ pub fn load_or_discover_entries() -> Vec<AppEntry> {
     let mut entries = stored;
 
     // 一个程序都没扫到（非 Windows，或系统里确实没有）：退回内置示例，保证列表非空
-    #[cfg(debug_assertions)]
-    if entries.is_empty() {
-        entries = fallback_entries();
-    }
 
     sort_entries_by_launch(&mut entries);
 

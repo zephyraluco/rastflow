@@ -254,30 +254,32 @@ impl LauncherView {
             }
         });
 
-        // 启动开始菜单 watcher：新装/卸载程序时自动刷新列表
-        let watcher_dirty = crate::app_list::watcher::start();
-        let watcher_task = if let Some(dirty) = watcher_dirty {
+        let watcher = crate::app_list::watcher::start();
+        let watcher_task = {
             let list_state = list_state.clone();
-            Some(cx.spawn_in(window, async move |_, cx| {
+            let input_state = input_state.clone();
+            Some(cx.spawn_in(window, async move |this, cx| {
                 loop {
-                    // 每 500ms 检查一次 watcher 标记
-                    cx.background_executor()
-                        .timer(std::time::Duration::from_millis(500))
-                        .await;
-                    if dirty.swap(false, std::sync::atomic::Ordering::Relaxed) {
-                        // 使发现缓存失效，下次 reload 时重新扫描
-                        crate::app_list::discovery_cache::invalidate();
-                        let _ = cx.update(|_, cx| {
-                            list_state.update(cx, |list, cx| {
-                                list.delegate_mut().reload("");
-                                cx.notify();
-                            });
+                    let entries = cx.background_executor().spawn(async {
+                        crate::app_list::load_or_discover_entries()
+                    }).await;
+                    if cx.update(|_, cx| {
+                        let query = input_state.read(cx).value().to_string();
+                        list_state.update(cx, |list, cx| {
+                            list.delegate_mut().replace_entries(entries, &query);
+                            cx.notify();
                         });
-                    }
+                        let _ = this.update(cx, |this, cx| this.prefetch_icons(cx));
+                    }).is_err() { break; }
+                    // 通知去抖；每五分钟低频校准以补偿丢失的目录通知。
+                    let changed = watcher.changed();
+                    let timer = cx.background_executor().timer(Duration::from_secs(300));
+                    let _ = futures_lite::future::race(async { changed.await; }, async { timer.await; }).await;
+                    cx.background_executor().timer(Duration::from_millis(250)).await;
+                    watcher.drain();
+                    crate::app_list::discovery_cache::invalidate();
                 }
             }))
-        } else {
-            None
         };
 
         let view = Self {

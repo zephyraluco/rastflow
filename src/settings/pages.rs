@@ -213,10 +213,9 @@ pub fn build_settings_pages(lang: &str) -> Vec<SettingPage> {
                                     .spawn(async move { rx.recv().ok().flatten() })
                                     .await;
                                 if let Some(path) = picked {
+                                    let result = async_cx.background_executor().spawn(async move { upsert_custom_entry("", "", &path) }).await;
+                                    if let Err(error) = result { eprintln!("添加程序失败：{error}"); }
                                     async_cx.update(|cx| {
-                                        if let Err(e) = upsert_custom_entry("", "", &path) {
-                                            eprintln!("添加程序失败: {e}");
-                                        }
                                         cx.global_mut::<AppSettings>()
                                             .custom_programs_version += 1;
                                     });

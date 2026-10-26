@@ -1,93 +1,36 @@
-//! 开始菜单目录监听：新装/卸载程序时使发现缓存失效
-
+//! 原生目录通知驱动应用目录刷新；接收方拥有 watcher，关闭时自动释放。
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::OnceLock;
 
-/// 共享标记：watcher 发现变化时设为 true，UI 线程消费后设为 false
-pub type DirtyFlag = Arc<AtomicBool>;
+static CHANGES: OnceLock<(async_channel::Sender<()>, async_channel::Receiver<()>)> = OnceLock::new();
+fn changes() -> &'static (async_channel::Sender<()>, async_channel::Receiver<()>) {
+    CHANGES.get_or_init(|| async_channel::bounded(1))
+}
+pub fn invalidate() { let _ = changes().0.try_send(()); }
 
-/// 启动后台 watcher，监听开始菜单目录变化。
-///
-/// 返回 `DirtyFlag`：每次检测到有效变化时会被设为 `true`。
-/// watcher 本身在后台线程中运行，是常驻的。
-#[cfg(windows)]
-pub fn start() -> Option<DirtyFlag> {
-    let roots = start_menu_roots();
-    if roots.is_empty() {
-        return None;
-    }
-
-    let dirty = Arc::new(AtomicBool::new(false));
-    let dirty_clone = dirty.clone();
-
-    let mut watcher = RecommendedWatcher::new(
-        move |res: Result<notify::Event, notify::Error>| {
-            let Ok(event) = res else { return };
-            // 只关心会改变程序列表的事件
-            let dominated = matches!(
-                event.kind,
-                EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(
-                    notify::event::ModifyKind::Name(_)
-                )
-            );
-            if !dominated {
-                return;
-            }
-            // 只关心 .lnk / .url 文件
-            let dominated = event.paths.iter().any(|p| {
-                p.extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| {
-                        let e = e.to_ascii_lowercase();
-                        e == "lnk" || e == "url"
-                    })
-                    .unwrap_or(false)
-            });
-            if !dominated {
-                return;
-            }
-            dirty_clone.store(true, Ordering::Relaxed);
-        },
-        Config::default().with_poll_interval(Duration::from_millis(200)),
-    )
-    .ok()?;
-
-    for root in &roots {
-        if watcher.watch(root, RecursiveMode::Recursive).is_err() {
-            eprintln!("[rastflow] 无法监听目录: {}", root.display());
+pub struct CatalogWatcher {
+    _watcher: Option<RecommendedWatcher>,
+    changes: async_channel::Receiver<()>,
+}
+impl CatalogWatcher {
+    pub async fn changed(&self) -> bool { self.changes.recv().await.is_ok() }
+    pub fn drain(&self) { while self.changes.try_recv().is_ok() {} }
+}
+pub fn start() -> CatalogWatcher {
+    let watcher = RecommendedWatcher::new(|result: Result<notify::Event, notify::Error>| {
+        match result {
+            Ok(event) if matches!(event.kind, EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(_)) => invalidate(),
+            Err(error) => { eprintln!("[rastflow] 应用目录通知失败：{error}"); invalidate(); }
+            _ => {}
         }
-    }
-
-    // 把 watcher 泄漏到静态生命周期，让它常驻后台
-    // 这是合理的：watcher 一旦启动就应该活到进程结束
-    Box::leak(Box::new(watcher));
-
-    Some(dirty)
-}
-
-#[cfg(not(windows))]
-pub fn start() -> Option<DirtyFlag> {
-    None
-}
-
-/// 开始菜单的两个根目录（公共 + 用户）
-#[cfg(windows)]
-fn start_menu_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    if let Ok(program_data) = std::env::var("ProgramData") {
-        roots.push(
-            PathBuf::from(program_data)
-                .join("Microsoft\\Windows\\Start Menu\\Programs"),
-        );
-    }
-    if let Ok(app_data) = std::env::var("APPDATA") {
-        roots.push(
-            PathBuf::from(app_data)
-                .join("Microsoft\\Windows\\Start Menu\\Programs"),
-        );
-    }
-    roots
+    }, Config::default());
+    let watcher = watcher.ok().map(|mut watcher| {
+        for root in [crate::search::win::known_folder::start_menu(), crate::search::win::known_folder::common_start_menu()].into_iter().flatten() {
+            if root.exists() && watcher.watch(&root, RecursiveMode::Recursive).is_err() {
+                eprintln!("[rastflow] 无法监听目录：{}", root.display());
+            }
+        }
+        watcher
+    });
+    CatalogWatcher { _watcher: watcher, changes: changes().1.clone() }
 }

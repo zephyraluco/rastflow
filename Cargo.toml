@@ -64,8 +64,12 @@ languages = ["zh-CN"]
 # 不允许用旧版本覆盖已装的新版本，避免降级后数据不兼容
 allowDowngrades = false
 
+[dependencies]
+rusqlite = { version = "0.40", features = ["bundled"] }
+
 [target.'cfg(windows)'.dependencies]
 async-channel = "2"
+futures-lite = "2"
 gpui = { version = "0.3", package = "gpui-pre" }
 gpui-kit = { git = "https://github.com/longbridge/gpui-kit", default-features = false, features = ["component"] }
 # 没有用 tray-icon：系统托盘与右键菜单由 src/tray.rs 直连 Win32 实现
@@ -77,7 +81,6 @@ anyhow = "1"
 gpui-updater = { git = "https://github.com/AprilNEA/gpui-updater", package = "gpui-updater-pre" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rusqlite = { version = "0.40", features = ["bundled"] }
 notify = "8"
 # 注意：这里**没有** sqlx / tokio。应用列表数据（applist.db）用 rusqlite 同步读写，
 # 不需要异步 runtime；自研搜索核心的索引是常驻内存的（src/search/index.rs），
