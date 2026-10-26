@@ -32,7 +32,6 @@ pub enum TrayEvent {
 mod imp {
     use std::ffi::c_void;
     use std::mem::size_of;
-    use std::sync::mpsc::{self, Receiver, Sender};
 
     use windows::core::{w, PCWSTR};
     use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
@@ -76,7 +75,6 @@ mod imp {
 
     /// 挂在窗口 `GWLP_USERDATA` 上的上下文。
     struct TrayContext {
-        events: Sender<TrayEvent>,
         /// 当前登记的图标句柄，需自行销毁
         icon: HICON,
         /// `TaskbarCreated` 消息 id；explorer 重启后用它重新登记图标
@@ -165,13 +163,13 @@ mod imp {
 
                 match chosen.0 {
                     MENU_TOGGLE => {
-                        let _ = self.events.send(TrayEvent::ToggleWindow);
+                        crate::application::send(crate::application::Event::Tray(TrayEvent::ToggleWindow));
                     }
                     MENU_UPDATE => {
-                        let _ = self.events.send(TrayEvent::CheckForUpdates);
+                        crate::application::send(crate::application::Event::Tray(TrayEvent::CheckForUpdates));
                     }
                     MENU_QUIT => {
-                        let _ = self.events.send(TrayEvent::Quit);
+                        crate::application::send(crate::application::Event::Tray(TrayEvent::Quit));
                     }
                     // 0 = 用户点了菜单外面，取消
                     _ => {}
@@ -223,7 +221,7 @@ mod imp {
         }
 
         if message == crate::platform::instance::ACTIVATE_MESSAGE {
-            let _ = context.events.send(TrayEvent::LeftClick);
+            crate::application::send(crate::application::Event::Tray(TrayEvent::LeftClick));
             return LRESULT(0);
         }
         match message {
@@ -234,7 +232,7 @@ mod imp {
                 // 为了少一个可能悄悄失效的状态，这里跟随最经典、最稳的旧协议。
                 match lparam.0 as u32 {
                     WM_LBUTTONUP => {
-                        let _ = context.events.send(TrayEvent::LeftClick);
+                        crate::application::send(crate::application::Event::Tray(TrayEvent::LeftClick));
                     }
                     WM_RBUTTONUP => unsafe { context.show_menu(hwnd) },
                     _ => {}
@@ -280,7 +278,6 @@ mod imp {
     pub struct TrayIcon {
         hwnd: HWND,
         context: *mut TrayContext,
-        events: Receiver<TrayEvent>,
     }
 
     impl TrayIcon {
@@ -297,10 +294,8 @@ mod imp {
                 .map_err(|err| format!("取模块句柄失败: {err}"))?;
             let instance = HINSTANCE(instance.0);
 
-            let (events_tx, events_rx) = mpsc::channel();
 
             let context = Box::into_raw(Box::new(TrayContext {
-                events: events_tx,
                 icon,
                 taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
                 tooltip: wide_tooltip(tooltip),
@@ -350,7 +345,6 @@ mod imp {
             let tray = Self {
                 hwnd,
                 context,
-                events: events_rx,
             };
 
             // 登记图标。explorer 尚未就绪时可能失败，此时留着窗口等 TaskbarCreated
@@ -362,10 +356,7 @@ mod imp {
             Ok(tray)
         }
 
-        /// 取出一个待处理的交互事件（非阻塞）。
-        pub fn try_recv(&self) -> Option<TrayEvent> {
-            self.events.try_recv().ok()
-        }
+
     }
 
     impl Drop for TrayIcon {
@@ -379,28 +370,6 @@ mod imp {
 
             // 收回上下文；其 Drop 会一并 DestroyIcon
             drop(unsafe { Box::from_raw(self.context) });
-        }
-    }
-}
-
-#[cfg(not(windows))]
-mod imp {
-    use std::sync::mpsc::Receiver;
-
-    use super::TrayEvent;
-
-    /// 非 Windows 平台没有系统托盘，创建直接失败。
-    pub struct TrayIcon {
-        events: Receiver<TrayEvent>,
-    }
-
-    impl TrayIcon {
-        pub fn new(_tooltip: &str, _size: u32) -> Result<Self, String> {
-            Err("当前平台尚未实现系统托盘".to_string())
-        }
-
-        pub fn try_recv(&self) -> Option<TrayEvent> {
-            self.events.try_recv().ok()
         }
     }
 }

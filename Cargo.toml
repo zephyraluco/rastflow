@@ -65,6 +65,7 @@ languages = ["zh-CN"]
 allowDowngrades = false
 
 [target.'cfg(windows)'.dependencies]
+async-channel = "2"
 gpui = { version = "0.3", package = "gpui-pre" }
 gpui-kit = { git = "https://github.com/longbridge/gpui-kit", default-features = false, features = ["component"] }
 # 没有用 tray-icon：系统托盘与右键菜单由 src/tray.rs 直连 Win32 实现

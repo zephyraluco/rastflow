@@ -110,6 +110,7 @@ struct Inner {
     /// 用 `Mutex<Option<..>>` 而不是 `OnceLock`：装完索引服务要能重新引导一次。
     engine: Mutex<Option<Arc<Engine>>>,
     status: Mutex<SearchStatus>,
+    subscribers: Mutex<Vec<async_channel::Sender<()>>>,
     /// 上一次搜索的取消句柄：新的搜索到来时先把旧的取消掉
     last_cancel: Mutex<Option<Arc<AtomicBool>>>,
     /// 防止并发引导（启动 / 重试 / 装完服务）
@@ -125,6 +126,7 @@ impl Inner {
         Self {
             engine: Mutex::new(None),
             status: Mutex::new(SearchStatus::Uninitialized),
+            subscribers: Mutex::new(Vec::new()),
             last_cancel: Mutex::new(None),
             bootstrapping: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
@@ -156,21 +158,20 @@ impl Inner {
     }
 
     fn set_status(&self, status: SearchStatus) {
-        *self
-            .status
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = status;
+        let mut current = self.status.lock().unwrap_or_else(|e| e.into_inner());
+        if *current == status { return; }
+        *current = status;
+        drop(current);
+        self.subscribers.lock().unwrap_or_else(|e| e.into_inner()).retain(|sender| {
+            !matches!(sender.try_send(()), Err(async_channel::TrySendError::Closed(_)))
+        });
     }
 
     /// 增量监控已停止（监控线程全部退出）：把「监控中」降级。
     /// 不覆盖「正在建索引」「不可用」这些状态。
     fn mark_monitoring_stopped(&self) {
-        let mut status = self
-            .status
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let SearchStatus::Ready { monitoring } = &mut *status {
-            *monitoring = false;
+        if matches!(self.status(), SearchStatus::Ready { .. }) {
+            self.set_status(SearchStatus::Ready { monitoring: false });
         }
     }
 }
@@ -278,6 +279,14 @@ pub fn shutdown() {
             }
         }
     }
+}
+
+pub fn subscribe_status() -> async_channel::Receiver<()> {
+    start();
+    let (sender, receiver) = async_channel::bounded(1);
+    STATE.get().unwrap().subscribers.lock().unwrap_or_else(|e| e.into_inner()).push(sender.clone());
+    let _ = sender.try_send(());
+    receiver
 }
 
 pub fn status() -> SearchStatus {

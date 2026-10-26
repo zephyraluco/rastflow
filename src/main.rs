@@ -12,6 +12,7 @@ mod search;
 mod tray;
 mod updater;
 mod platform;
+mod application;
 
 use gpui::*;
 use gpui_kit::component::*;
@@ -136,10 +137,13 @@ fn main() {
         Err(err) => { eprintln!("[rastflow] 创建桌面单例失败：{err}"); return; }
     };
 
+    let events = application::initialize();
+    GlobalHotKeyEvent::set_event_handler(Some(|event| application::send(application::Event::Hotkey(event))));
     gpui_kit::application().with_assets(Assets).run(move |cx| {
         gpui_kit::init(cx);
         cx.set_global(AppSettings::default());
         let updater = updater::create(cx);
+        cx.observe(&updater, |_, _| application::send(application::Event::UpdaterChanged)).detach();
         // 从 settings.json 加载持久化设置（主题、语言等）
         {
             let persisted = settings::load_settings();
@@ -150,6 +154,7 @@ fn main() {
         // 设置变更时自动写入 settings.json
         cx.observe_global::<AppSettings>(|cx| {
             settings::save_settings(cx.global::<AppSettings>());
+            application::send(application::Event::SettingsChanged);
         }).detach();
         // 启动时从注册表读取实际自启状态并同步到设置，确保开关显示正确
         cx.global_mut::<AppSettings>().auto_launch = auto_launch_is_enabled();
@@ -196,7 +201,7 @@ fn main() {
             // ── 系统托盘 ─────────────────────────────────────────────────
             // 必须在主线程（也就是拥有消息循环的线程）创建：托盘窗口靠该线程的
             // 消息循环接收交互，而 gpui 的 spawn 任务正是跑在主线程上。
-            let tray = match crate::tray::TrayIcon::new("rastflow", tray_icon_size()) {
+            let _tray = match crate::tray::TrayIcon::new("rastflow", tray_icon_size()) {
                 Ok(tray) => Some(tray),
                 Err(err) => {
                     // 托盘不可用时仍可靠全局快捷键工作，所以只告警、不退出
@@ -245,7 +250,7 @@ fn main() {
             let mut reporter = updater::Reporter::new();
 
             // ── 托盘事件轮询循环 ─────────────────────────────────────────
-            loop {
+            while let Ok(event) = events.recv().await {
                 // 检测 auto_launch 设置变化，同步到注册表
                 let new_auto_launch: bool =
                     cx.update(|cx| cx.global::<AppSettings>().auto_launch);
@@ -276,7 +281,7 @@ fn main() {
                 }
 
                 // 处理全局快捷键事件 → 切换窗口显示/隐藏
-                while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
+                if let application::Event::Hotkey(event) = &event {
                     if event.state == HotKeyState::Pressed
                         && registered_hotkey_id == Some(event.id)
                     {
@@ -297,8 +302,7 @@ fn main() {
                 }
 
                 // 处理托盘交互（左键单击、右键菜单项）
-                if let Some(tray) = &tray {
-                    while let Some(event) = tray.try_recv() {
+                if let application::Event::Tray(event) = event {
                         if event == TrayEvent::Quit {
                             layout::filesearch::shutdown();
                             cx.update(|cx| cx.quit());
@@ -329,7 +333,6 @@ fn main() {
                                 })
                                 .ok();
                         });
-                    }
                 }
 
                 // ── 更新结果 → 原生提示框（不唤出主界面）───────────────────
@@ -344,8 +347,6 @@ fn main() {
                     updater.update(cx, |updater, cx| updater.download_and_install(cx));
                 }
 
-                // 每 50ms 轮询一次
-                bg.timer(std::time::Duration::from_millis(50)).await;
             }
         })
         .detach();

@@ -142,6 +142,7 @@ pub struct LauncherView {
     _subscriptions: Vec<Subscription>,
     /// watcher 轮询任务（detach 后独立运行，不随订阅管理）
     _watcher_task: Option<Task<()>>,
+    _index_task: Option<Task<()>>,
 }
 
 impl LauncherView {
@@ -294,6 +295,7 @@ impl LauncherView {
             icon_prefetch_running: Arc::new(AtomicBool::new(false)),
             _subscriptions: vec![input_sub, bounds_sub, activation_sub, settings_sub],
             _watcher_task: watcher_task,
+            _index_task: None,
         };
         input_state.update(cx, |input, cx| input.focus(window, cx));
         view.prefetch_icons(cx);
@@ -377,35 +379,22 @@ impl LauncherView {
     /// 建索引可能要几十秒，期间靠这个循环刷新进度；每次重新开始建索引都要订阅一次。
     fn watch_file_search(&mut self, cx: &mut Context<Self>) {
         let entity = cx.entity().downgrade();
-        cx.spawn(async move |_this, cx: &mut gpui::AsyncApp| {
-            loop {
+        let changes = super::filesearch::subscribe_status();
+        self._index_task = Some(cx.spawn(async move |_this, cx: &mut gpui::AsyncApp| {
+            while changes.recv().await.is_ok() {
                 let status = super::filesearch::status();
-                let settled = matches!(
-                    status,
-                    SearchStatus::Ready { .. } | SearchStatus::Unavailable { .. }
-                );
-                let _ = cx.update(|app| {
-                    let _ = entity.update(app, |this, cx| {
-                        let first_ready = !matches!(this.file_status, SearchStatus::Ready { .. })
-                            && matches!(status, SearchStatus::Ready { .. });
-                        this.file_status = status.clone();
-                        if first_ready {
-                            // 索引就绪后把当前输入立即搜一遍
-                            let query = this.input_state.read(cx).value().to_string();
-                            this.search_files(query, cx);
-                        }
-                        cx.notify();
-                    });
-                });
-                if settled {
-                    break;
-                }
-                cx.background_executor()
-                    .timer(Duration::from_millis(400))
-                    .await;
+                let alive = cx.update(|app| entity.update(app, |this, cx| {
+                    let first_ready = !matches!(this.file_status, SearchStatus::Ready { .. }) && matches!(status, SearchStatus::Ready { .. });
+                    this.file_status = status;
+                    if first_ready {
+                        let query = this.input_state.read(cx).value().to_string();
+                        this.search_files(query, cx);
+                    }
+                    cx.notify();
+                }));
+                if alive.is_err() { break; }
             }
-        })
-        .detach();
+        }));
     }
 
     fn search_files(&mut self, query: String, cx: &mut Context<Self>) {

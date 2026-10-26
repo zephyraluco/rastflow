@@ -5511,6 +5511,7 @@ name = "rastflow"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-channel",
  "global-hotkey",
  "gpui-kit",
  "gpui-pre",

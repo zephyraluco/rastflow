@@ -12,7 +12,7 @@ pub mod known_folder;
 pub mod pipe;
 pub mod process;
 pub mod service;
-pub mod usn;
+pub use super::usn;
 pub mod volume;
 
 use windows::Win32::Foundation::{

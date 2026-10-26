@@ -134,6 +134,7 @@ impl Reporter {
                 if ask_install && result == IDYES {
                     // 主线程可能已经退出，发不出去也无所谓
                     let _ = sender.send(Choice::Install);
+                    crate::application::send(crate::application::Event::UpdaterChanged);
                 }
             });
         if let Err(err) = spawned {
