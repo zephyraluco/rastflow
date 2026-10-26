@@ -168,6 +168,14 @@ impl HelperSession {
         })
     }
 
+    pub fn volumes(&self) -> Result<Vec<super::model::VolumeInfo>> {
+        self.send(&Request::ListVolumes)?;
+        match self.recv()? {
+            Some(Message::Volumes(volumes)) => Ok(volumes),
+            _ => Err(CoreError::Helper("服务未返回卷列表".into())),
+        }
+    }
+
     /// 会话对端的进程 id（服务会话时是服务的 pid）
     pub fn child_pid(&self) -> u32 {
         self.pid

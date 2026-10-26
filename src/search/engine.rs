@@ -79,7 +79,8 @@ pub struct ScanStats {
 /// 搜索核心。需要放进 `Arc` 才能发起搜索（[`Engine::search`] 会起后台线程）。
 pub struct Engine {
     config: CoreConfig,
-    disks: Vec<char>,
+    disks: RwLock<Vec<char>>,
+    volumes: RwLock<HashMap<char, super::model::VolumeInfo>>,
     /// 常驻内存的索引。搜索持读锁，增量更新持写锁
     index: RwLock<FileIndex>,
     priorities: RwLock<PriorityTable>,
@@ -116,19 +117,26 @@ impl Engine {
         let snapshot = index_mod::snapshot_path(&config.data_dir);
         let ignore = IgnoreRules::new(&config.ignore_paths);
 
-        let (mut index, mut priorities, marks) = match FileIndex::load(&snapshot)? {
-            Some(loaded) => (loaded.index, loaded.priorities, loaded.marks),
-            None => (
-                FileIndex::new(),
-                PriorityTable::with_builtin_defaults(),
-                HashMap::new(),
-            ),
-        };
-
-        // 快照里可能有这次不再索引的盘（用户改了配置），把它们的条目清掉
-        for disk in index.disks().collect::<Vec<char>>() {
-            if !disks.contains(&disk) {
-                index.clear_disk(disk);
+        let volumes: HashMap<_, _> = disks
+            .iter()
+            .filter_map(|disk| disk::volume_info(*disk).map(|volume| (*disk, volume)))
+            .collect();
+        let mut index = FileIndex::new();
+        let mut priorities = PriorityTable::with_builtin_defaults();
+        let mut marks = HashMap::new();
+        for volume in volumes.values() {
+            if let Some(mut loaded) =
+                FileIndex::load(&config.data_dir.join(volume.snapshot_name()))?
+            {
+                let old = loaded.index.disks().next();
+                if let Some(old) = old {
+                    loaded.index.remap_disk(old, volume.disk);
+                    index.replace_disk(volume.disk, &loaded.index);
+                    if let Some(mark) = loaded.marks.get(&old) {
+                        marks.insert(volume.disk, *mark);
+                    }
+                    priorities = loaded.priorities;
+                }
             }
         }
         if priorities.is_empty() {
@@ -139,7 +147,8 @@ impl Engine {
 
         Ok(Self {
             config,
-            disks,
+            disks: RwLock::new(disks),
+            volumes: RwLock::new(volumes),
             index: RwLock::new(index),
             priorities: RwLock::new(priorities),
             marks: Mutex::new(marks),
@@ -150,8 +159,41 @@ impl Engine {
         })
     }
 
-    pub fn disks(&self) -> &[char] {
-        &self.disks
+    pub fn disks(&self) -> Vec<char> {
+        read(&self.disks).clone()
+    }
+
+    pub fn configure_volumes(&self, volumes: Vec<super::model::VolumeInfo>) -> Result<()> {
+        let previous = read(&self.volumes).clone();
+        let current: HashMap<_, _> = volumes
+            .into_iter()
+            .map(|volume| (volume.disk, volume))
+            .collect();
+        for volume in current.values() {
+            for old in previous.values().filter(|old| old.guid == volume.guid && old.disk != volume.disk) {
+                write(&self.index).clear_disk(old.disk);
+                lock(&self.marks).remove(&old.disk);
+            }
+            if previous.get(&volume.disk) != Some(volume) {
+                write(&self.index).clear_disk(volume.disk);
+                lock(&self.marks).remove(&volume.disk);
+                if let Some(mut loaded) =
+                    FileIndex::load(&self.config.data_dir.join(volume.snapshot_name()))?
+                {
+                    let old = loaded.index.disks().next();
+                    if let Some(old) = old {
+                        loaded.index.remap_disk(old, volume.disk);
+                        write(&self.index).replace_disk(volume.disk, &loaded.index);
+                        if let Some(mark) = loaded.marks.get(&old) {
+                            self.set_mark(volume.disk, *mark);
+                        }
+                    }
+                }
+            }
+        }
+        *write(&self.disks) = current.keys().copied().collect();
+        *write(&self.volumes) = current;
+        Ok(())
     }
 
     pub fn is_indexed(&self) -> bool {
@@ -167,8 +209,8 @@ impl Engine {
         &self,
         progress: Option<&mut dyn FnMut(IndexProgress)>,
     ) -> Result<IndexReport> {
-        let index_config = IndexConfig::new(self.disks.clone())
-            .with_ignore_paths(self.config.ignore_paths.clone());
+        let index_config =
+            IndexConfig::new(self.disks()).with_ignore_paths(self.config.ignore_paths.clone());
         let mut noop = |_: IndexProgress| {};
         let progress: &mut dyn FnMut(IndexProgress) = match progress {
             Some(callback) => callback,
@@ -201,7 +243,27 @@ impl Engine {
         let priorities = read(&self.priorities).clone();
         let marks = lock(&self.marks).clone();
         let mut index = write(&self.index);
-        index.save(&self.snapshot, &priorities, &marks)
+        let volumes = read(&self.volumes);
+        if volumes.is_empty() {
+            return index.save(&self.snapshot, &priorities, &marks);
+        }
+        let mut stats = SaveStats::default();
+        for volume in volumes.values() {
+            let Some(mark) = marks.get(&volume.disk) else {
+                continue;
+            };
+            let mut single = FileIndex::new();
+            single.replace_disk(volume.disk, &index);
+            let saved = single.save(
+                &self.config.data_dir.join(volume.snapshot_name()),
+                &priorities,
+                &HashMap::from([(volume.disk, *mark)]),
+            )?;
+            stats.entries += saved.entries;
+            stats.names_bytes += saved.names_bytes;
+            stats.file_bytes += saved.file_bytes;
+        }
+        Ok(stats)
     }
 
     /// 启动时的「补课」：从快照里记的位点把日志重放到当前末尾。
@@ -217,7 +279,7 @@ impl Engine {
         }
 
         let mut replayed = 0u64;
-        for disk in self.disks.clone() {
+        for disk in self.disks() {
             let Some(mark) = marks.get(&disk).copied() else {
                 continue;
             };
@@ -241,6 +303,7 @@ impl Engine {
         let outcome = monitor::replay_disk(
             disk,
             mark,
+            None,
             &mut |seen| {
                 progress(IndexProgress {
                     disk,
@@ -738,7 +801,8 @@ mod tests {
         config.disks = disks.clone();
         Arc::new(Engine {
             config,
-            disks,
+            disks: RwLock::new(disks),
+            volumes: RwLock::new(HashMap::new()),
             index: RwLock::new(FileIndex::new()),
             priorities: RwLock::new(PriorityTable::with_builtin_defaults()),
             marks: Mutex::new(HashMap::new()),
@@ -1202,7 +1266,8 @@ mod tests {
                 config.disks = vec!['C'];
                 config
             },
-            disks: vec!['C'],
+            disks: RwLock::new(vec!['C']),
+            volumes: RwLock::new(HashMap::new()),
             index: RwLock::new(FileIndex::new()),
             priorities: RwLock::new(PriorityTable::with_builtin_defaults()),
             marks: Mutex::new(HashMap::new()),

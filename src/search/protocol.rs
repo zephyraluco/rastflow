@@ -1,18 +1,23 @@
 //! 有界二进制协议。纯编解码不依赖 Windows API。
 use super::index::{JournalMark, MftEntry};
-use super::model::MonitorEvent;
+use super::model::{MonitorEvent, VolumeInfo};
 use super::{CoreError, Result};
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 // ---------- 消息类型 ----------
 
 /// 主进程 → 子进程
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
+    ListVolumes,
     /// 全量枚举这些盘（先清掉这些盘的旧条目）
-    Scan { disks: Vec<char> },
+    Scan {
+        disks: Vec<char>,
+    },
     /// 从这些位点把日志重放到当前末尾
-    CatchUp { marks: Vec<(char, JournalMark)> },
+    CatchUp {
+        marks: Vec<(char, JournalMark)>,
+    },
     /// 开始实时跟随（从子进程记下的位点接上）
     Monitor,
     /// 退出
@@ -22,6 +27,7 @@ pub enum Request {
 /// 子进程 → 主进程
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
+    Volumes(Vec<VolumeInfo>),
     /// 握手：协议版本
     Ready {
         version: u32,
@@ -154,6 +160,15 @@ fn put_event(buf: &mut Vec<u8>, event: &MonitorEvent) {
 pub(crate) fn encode_payload(message: &Message) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64);
     match message {
+        Message::Volumes(volumes) => {
+            put_u8(&mut buf, 13);
+            put_u8(&mut buf, volumes.len() as u8);
+            for volume in volumes {
+                put_u8(&mut buf, volume.disk as u8);
+                put_str(&mut buf, &volume.guid);
+                put_u32(&mut buf, volume.serial);
+            }
+        }
         Message::Ready { version } => {
             put_u8(&mut buf, 1);
             put_u32(&mut buf, *version);
@@ -218,6 +233,7 @@ pub(crate) fn encode_payload(message: &Message) -> Vec<u8> {
 pub(crate) fn encode_request(request: &Request) -> Vec<u8> {
     let mut buf = Vec::with_capacity(32);
     match request {
+        Request::ListVolumes => put_u8(&mut buf, 24),
         Request::Scan { disks } => {
             put_u8(&mut buf, 20);
             put_u8(&mut buf, disks.len() as u8);
@@ -419,6 +435,21 @@ pub(crate) fn decode_message(payload: &[u8]) -> Result<Message> {
         },
         11 => Message::Fatal(decoder.text()?),
         12 => Message::Bye,
+        13 => {
+            let count = decoder.u8()? as usize;
+            if count > 26 {
+                return Err(corrupt());
+            }
+            let mut volumes = Vec::with_capacity(count);
+            for _ in 0..count {
+                volumes.push(VolumeInfo {
+                    disk: decoder.disk()?,
+                    guid: decoder.text()?,
+                    serial: decoder.u32()?,
+                });
+            }
+            Message::Volumes(volumes)
+        }
         _ => return Err(corrupt()),
     };
     if decoder.pos != payload.len() {
@@ -448,6 +479,7 @@ pub(crate) fn decode_request(payload: &[u8]) -> Result<Request> {
         }
         22 => Request::Monitor,
         23 => Request::Stop,
+        24 => Request::ListVolumes,
         _ => return Err(corrupt()),
     };
     if decoder.pos != payload.len() {
@@ -566,6 +598,13 @@ mod tests {
         let framed = frame(&payload);
         assert_eq!(&framed[..4], &(payload.len() as u32).to_le_bytes());
         assert_eq!(&framed[4..], payload.as_slice());
+    }
+
+    #[test]
+    fn volume_identity_roundtrip() {
+        let volumes = Message::Volumes(vec![VolumeInfo { disk: 'C', guid: r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\".into(), serial: 42 }]);
+        assert_eq!(roundtrip(&volumes), volumes);
+        assert_eq!(decode_request(&encode_request(&Request::ListVolumes)).unwrap(), Request::ListVolumes);
     }
 
     #[test]

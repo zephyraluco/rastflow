@@ -35,3 +35,21 @@ pub enum MonitorEvent {
     /// 同批事件成功应用后才能推进到此位点。
     Checkpoint { disk: char, mark: JournalMark },
 }
+
+/// 卷身份独立于盘符，序列号用于识别格式化后的新文件系统。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VolumeInfo {
+    pub disk: char,
+    pub guid: String,
+    pub serial: u32,
+}
+impl VolumeInfo {
+    pub fn snapshot_name(&self) -> String {
+        let identity: String = self
+            .guid
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect();
+        format!("volume-{identity}-{:08x}.dat", self.serial)
+    }
+}

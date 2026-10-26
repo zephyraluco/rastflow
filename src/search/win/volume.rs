@@ -17,8 +17,8 @@ use windows::Win32::Storage::FileSystem::{
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::{
     CREATE_USN_JOURNAL_DATA, FSCTL_CREATE_USN_JOURNAL, FSCTL_ENUM_USN_DATA,
-    FSCTL_GET_NTFS_VOLUME_DATA, FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL,
-    MFT_ENUM_DATA_V0, NTFS_VOLUME_DATA_BUFFER, READ_USN_JOURNAL_DATA_V0, USN_JOURNAL_DATA_V0,
+    FSCTL_GET_NTFS_VOLUME_DATA, FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL, MFT_ENUM_DATA_V0,
+    NTFS_VOLUME_DATA_BUFFER, READ_USN_JOURNAL_DATA_V0, USN_JOURNAL_DATA_V0,
 };
 use windows::core::PCWSTR;
 
@@ -41,6 +41,19 @@ impl Volume {
     pub fn open(letter: char) -> Result<Self> {
         let letter = letter.to_ascii_uppercase();
         let device = format!(r"\\.\{letter}:");
+        Self::open_path(&device)
+    }
+
+    pub fn open_identity(volume: &super::super::model::VolumeInfo) -> Result<Self> {
+        if super::disk::volume_info(volume.disk).as_ref() != Some(volume) {
+            return Err(CoreError::Helper(
+                "卷挂载或文件系统身份已变化，请重新发现卷".into(),
+            ));
+        }
+        Self::open_path(volume.guid.trim_end_matches('\\'))
+    }
+
+    fn open_path(device: &str) -> Result<Self> {
         let wide = to_wide(&device);
         let handle = unsafe {
             CreateFileW(
@@ -183,8 +196,13 @@ impl Volume {
         };
         // 失败即枚举结束（正常的结束是 ERROR_HANDLE_EOF），不是错误
         if let Err(err) = result {
-            if super::pipe::win32_code(&err) == 38 { return Ok((start_frn, 0)); } // ERROR_HANDLE_EOF
-            return Err(CoreError::win32("DeviceIoControl(FSCTL_ENUM_USN_DATA)", err));
+            if super::pipe::win32_code(&err) == 38 {
+                return Ok((start_frn, 0));
+            } // ERROR_HANDLE_EOF
+            return Err(CoreError::win32(
+                "DeviceIoControl(FSCTL_ENUM_USN_DATA)",
+                err,
+            ));
         }
         let filled = filled as usize;
         if filled < usn::LEADING_USN_LEN {
@@ -198,7 +216,9 @@ impl Volume {
             on_record(record);
         }
         // 位模式与 DWORDLONG 相同，直接按 u64 用
-        let next = usn::leading_usn(chunk).map(|v| v as u64).unwrap_or(start_frn);
+        let next = usn::leading_usn(chunk)
+            .map(|v| v as u64)
+            .unwrap_or(start_frn);
         Ok((next, count))
     }
 

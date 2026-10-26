@@ -99,16 +99,32 @@ fn serve_session(
 
     // 每个盘「已经读到哪」：扫描与重放都会更新它，实时跟随从这里接着读
     let mut known: HashMap<char, JournalMark> = HashMap::new();
+    let mut volumes = HashMap::new();
 
     loop {
         let Some(request) = reader.recv_request()? else {
             return Ok(()); // 主进程没了
         };
         match request {
-            Request::Scan { disks } => scan_all(writer, &disks, &mut known, service_stop)?,
-            Request::CatchUp { marks } => catch_up_all(writer, &marks, &mut known, service_stop)?,
+            Request::ListVolumes => {
+                let discovered: Vec<super::model::VolumeInfo> = super::win::disk::available_disks()
+                    .into_iter()
+                    .filter_map(super::win::disk::volume_info)
+                    .collect();
+                volumes = discovered
+                    .iter()
+                    .map(|volume| (volume.disk, volume.clone()))
+                    .collect();
+                writer.send(&Message::Volumes(discovered))?;
+            }
+            Request::Scan { disks } => {
+                scan_all(writer, &disks, &mut known, &volumes, service_stop)?
+            }
+            Request::CatchUp { marks } => {
+                catch_up_all(writer, &marks, &mut known, &volumes, service_stop)?
+            }
             Request::Monitor => {
-                follow(writer, reader, &known, service_stop)?;
+                follow(writer, reader, &known, &volumes, service_stop)?;
                 return Ok(());
             }
             Request::Stop => return Ok(()),
@@ -125,6 +141,7 @@ struct PipeScanSink<'a> {
     batch: Vec<MftEntry>,
     failed: bool,
     stop: Option<&'a AtomicBool>,
+    volume: Option<&'a super::model::VolumeInfo>,
 }
 
 impl PipeScanSink<'_> {
@@ -159,6 +176,9 @@ impl ScanSink for PipeScanSink<'_> {
 
     /// 进度按批走，不必每条都往主进程报
     fn on_progress(&mut self, _progress: IndexProgress) {}
+    fn volume(&self) -> Option<&super::model::VolumeInfo> {
+        self.volume
+    }
     fn cancelled(&self) -> bool {
         self.failed || self.stop.is_some_and(|stop| stop.load(Ordering::SeqCst))
     }
@@ -168,10 +188,18 @@ fn scan_all(
     writer: &PipeWriter,
     disks: &[char],
     known: &mut HashMap<char, JournalMark>,
+    volumes: &HashMap<char, super::model::VolumeInfo>,
     stop: Option<&AtomicBool>,
 ) -> Result<()> {
     for disk in disks {
         known.remove(disk);
+        if !volumes.contains_key(disk) {
+            writer.send(&Message::Unavailable {
+                disk: *disk,
+                reason: "未发现的卷".into(),
+            })?;
+            continue;
+        }
         if stop.is_some_and(|stop| stop.load(Ordering::SeqCst)) {
             return Err(CoreError::Helper("服务正在停止".into()));
         }
@@ -181,6 +209,7 @@ fn scan_all(
             batch: Vec::with_capacity(RECORD_BATCH),
             failed: false,
             stop,
+            volume: volumes.get(disk),
         };
         match index::scan_disk(*disk, &mut sink) {
             Ok(outcome) => {
@@ -208,15 +237,18 @@ fn catch_up_all(
     writer: &PipeWriter,
     marks: &[(char, JournalMark)],
     known: &mut HashMap<char, JournalMark>,
+    volumes: &HashMap<char, super::model::VolumeInfo>,
     stop: Option<&AtomicBool>,
 ) -> Result<()> {
     for (disk, mark) in marks {
-        let outcome = monitor::replay_disk(*disk, *mark, &mut |_| {}, &mut |batch| {
-            if stop.is_some_and(|stop| stop.load(Ordering::SeqCst)) {
-                return Err(CoreError::Helper("服务正在停止".into()));
-            }
-            writer.send(&Message::Events(batch.to_vec()))
-        });
+        if !volumes.contains_key(disk) { writer.send(&Message::Unavailable { disk: *disk, reason: "未发现的卷".into() })?; continue; }
+        let outcome =
+            monitor::replay_disk(*disk, *mark, volumes.get(disk), &mut |_| {}, &mut |batch| {
+                if stop.is_some_and(|stop| stop.load(Ordering::SeqCst)) {
+                    return Err(CoreError::Helper("服务正在停止".into()));
+                }
+                writer.send(&Message::Events(batch.to_vec()))
+            });
         match outcome {
             Ok(monitor::ReplayOutcome::Replayed { events, mark }) => {
                 known.insert(*disk, mark);
@@ -246,6 +278,7 @@ fn follow(
     writer: &Arc<PipeWriter>,
     reader: &PipeReader,
     known: &HashMap<char, JournalMark>,
+    volumes: &HashMap<char, super::model::VolumeInfo>,
     service_stop: Option<&AtomicBool>,
 ) -> Result<()> {
     let sink_writer = Arc::clone(writer);
@@ -253,7 +286,8 @@ fn follow(
         Arc::new(move |batch: &[MonitorEvent]| sink_writer.send(&Message::Events(batch.to_vec())));
 
     let disks: Vec<char> = known.keys().copied().collect();
-    let config = MonitorConfig::new(disks).with_start(known.clone());
+    let mut config = MonitorConfig::new(disks).with_start(known.clone());
+    config.volumes = volumes.clone();
     let (handle, live) = MonitorHandle::start(&config, sink)?;
     writer.send(&Message::Monitoring {
         monitoring: live > 0,

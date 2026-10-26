@@ -48,10 +48,14 @@ pub enum ReplayOutcome {
 pub fn replay_disk(
     disk: char,
     mark: JournalMark,
+    identity: Option<&super::model::VolumeInfo>,
     on_progress: &mut dyn FnMut(u64),
     on_batch: &mut dyn FnMut(&[MonitorEvent]) -> Result<()>,
 ) -> Result<ReplayOutcome> {
-    let volume = Volume::open(disk)?;
+    let volume = match identity {
+        Some(identity) => Volume::open_identity(identity)?,
+        None => Volume::open(disk)?,
+    };
     let journal = volume.query_journal()?;
 
     // 日志被重建过 → 位点对新日志没有意义
@@ -101,6 +105,7 @@ pub fn replay_disk(
 /// 跟随参数
 #[derive(Debug, Clone, Default)]
 pub struct MonitorConfig {
+    pub volumes: HashMap<char, super::model::VolumeInfo>,
     pub disks: Vec<char>,
     /// 起始位点。
     ///
@@ -113,6 +118,7 @@ impl MonitorConfig {
     pub fn new(disks: Vec<char>) -> Self {
         Self {
             disks,
+            volumes: HashMap::new(),
             start: HashMap::new(),
         }
     }
@@ -145,8 +151,11 @@ impl MonitorHandle {
         for disk in &config.disks {
             let disk = disk.to_ascii_uppercase();
             // 在起线程之前就把卷打开：这样「跟不跟得上」是确定的，不用等线程回报
-            let opened = Volume::open(disk)
-                .and_then(|volume| volume.ensure_journal().map(|journal| (volume, journal)));
+            let opened = match config.volumes.get(&disk) {
+                Some(identity) => Volume::open_identity(identity),
+                None => Volume::open(disk),
+            }
+            .and_then(|volume| volume.ensure_journal().map(|journal| (volume, journal)));
             let (volume, journal) = match opened {
                 Ok(pair) => pair,
                 Err(err) => {

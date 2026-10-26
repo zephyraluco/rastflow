@@ -432,14 +432,6 @@ fn bootstrap_engine(inner: &Arc<Inner>) -> crate::search::Result<()> {
     // 引擎先装好：即使最终状态不可用，搜索侧的报错也能更具体
     inner.set_engine(Arc::clone(&engine));
 
-    if engine.disks().is_empty() {
-        inner.set_status(SearchStatus::Unavailable {
-            reason: "没有找到可用于索引的本地 NTFS 磁盘".to_string(),
-            needs_admin: false,
-        });
-        return Ok(());
-    }
-
     let session = match HelperSession::connect_running_service() {
         Ok(session) => session,
         Err(err) => {
@@ -456,6 +448,8 @@ fn bootstrap_engine(inner: &Arc<Inner>) -> crate::search::Result<()> {
         }
     };
 
+    engine.configure_volumes(session.volumes()?)?;
+    if engine.disks().is_empty() { return Err(crate::search::CoreError::Helper("没有可用于索引的本地 NTFS 卷".into())); }
     run_pump(Arc::clone(inner), engine, session);
     Ok(())
 }
@@ -484,7 +478,7 @@ fn run_pump(inner: Arc<Inner>, engine: Arc<Engine>, session: HelperSession) {
     let marks = engine.marks();
     let marked: HashSet<char> = marks.keys().copied().collect();
     engine.abort_scans();
-    let plan = plan_start(engine.disks(), &marked);
+    let plan = plan_start(&engine.disks(), &marked);
     inner.set_status(SearchStatus::Indexing {
         disk: None,
         written: 0,
@@ -640,6 +634,7 @@ fn run_pump(inner: Arc<Inner>, engine: Arc<Engine>, session: HelperSession) {
                 return;
             }
             Message::Bye | Message::Ready { .. } => {}
+            Message::Volumes(_) => { fail(&inner, crate::search::CoreError::Helper("意外的卷列表消息".into())); return; }
         }
 
         // 所有盘都报完了，才让子进程开始实时跟随：

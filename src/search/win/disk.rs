@@ -1,7 +1,7 @@
 //! 盘类型判断：只有「本地固定盘 + NTFS」能用 MFT/USN 索引。
 
 use windows::Win32::Storage::FileSystem::{
-    GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
+    GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW, GetVolumeNameForVolumeMountPointW,
 };
 use windows::core::PCWSTR;
 
@@ -120,6 +120,29 @@ pub fn available_disks() -> Vec<char> {
         .filter(|letter| !matches!(letter, 'A' | 'B'))
         .filter(|letter| is_supported(*letter))
         .collect()
+}
+
+pub fn volume_info(disk: char) -> Option<super::super::model::VolumeInfo> {
+    let root = to_wide(&root_of(disk));
+    let mut guid = [0u16; 64];
+    let mut serial = 0;
+    unsafe {
+        GetVolumeNameForVolumeMountPointW(PCWSTR(root.as_ptr()), &mut guid).ok()?;
+        GetVolumeInformationW(
+            PCWSTR(root.as_ptr()),
+            None,
+            Some(&mut serial),
+            None,
+            None,
+            None,
+        )
+        .ok()?;
+    }
+    Some(super::super::model::VolumeInfo {
+        disk,
+        guid: super::from_wide_lossy(&guid),
+        serial,
+    })
 }
 
 #[cfg(test)]

@@ -370,6 +370,20 @@ impl FileIndex {
         slot
     }
 
+    /// 单卷快照恢复时更新挂载盘符，文件身份仍由快照文件对应的卷 GUID 决定。
+    pub fn remap_disk(&mut self, old: char, new: char) {
+        if old == new { return; }
+        let Some(table) = self.tables.remove(&old) else { return };
+        for entry in &mut self.entries {
+            if entry.disk() != old { continue; }
+            entry.flags = (entry.flags & !(DISK_MASK << DISK_SHIFT)) | (disk_code(new) << DISK_SHIFT);
+            if entry.parent == NO_PARENT {
+                if let Some(first) = self.names.get_mut(entry.name_off as usize) { *first = new as u8; }
+            }
+        }
+        self.tables.insert(new, table);
+    }
+
     /// 将已完成的新代次发布到一个卷；其它卷保持原样。
     pub fn replace_disk(&mut self, disk: char, source: &Self) {
         self.clear_disk(disk);
@@ -1330,6 +1344,7 @@ pub trait ScanSink {
     fn on_start(&mut self, disk: char, mark: JournalMark);
     fn on_record(&mut self, record: &UsnRecord<'_>);
     fn on_progress(&mut self, progress: IndexProgress);
+    fn volume(&self) -> Option<&super::model::VolumeInfo> { None }
     fn cancelled(&self) -> bool { false }
 }
 
@@ -1351,7 +1366,7 @@ pub struct ScanOutcome {
 #[cfg(windows)]
 pub fn scan_disk(disk: char, sink: &mut dyn ScanSink) -> Result<ScanOutcome> {
     disk::ensure_supported(disk)?;
-    let volume = Volume::open(disk)?;
+    let volume = match sink.volume() { Some(volume) => Volume::open_identity(volume)?, None => Volume::open(disk)? };
     // 必须确认是 NTFS，否则下面这些 IOCTL 都没有意义
     volume.verify_ntfs()?;
     let journal = volume.ensure_journal()?;
@@ -1557,6 +1572,14 @@ mod tests {
         index.insert('C', frn(30), frn(10), "notepad.exe", false, 30);
         index.insert('C', frn(40), frn(20), "ntfs.sys", false, 0);
         index
+    }
+
+    #[test]
+    fn volume_remount_changes_paths_without_changing_file_ids() {
+        let mut index = sample_tree();
+        index.remap_disk('C','D');
+        assert!(index.lookup('C',frn(30)).is_none());
+        assert_eq!(index.path_of(index.lookup('D',frn(30)).unwrap()).as_deref(),Some(r"D:\Windows\notepad.exe"));
     }
 
     #[test]
