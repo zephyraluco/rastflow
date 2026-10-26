@@ -683,6 +683,11 @@ impl FileIndex {
 
     /// 遍历所有存活条目：`(槽位, 条目)`
     /// 遍历所有存活条目：`(槽位, 条目)`
+    pub fn slot_count(&self) -> usize { self.entries.len() }
+    pub fn iter_live_range(&self, start: usize, end: usize) -> impl Iterator<Item=(u32, &Entry)> {
+        self.entries.iter().enumerate().skip(start).take(end.saturating_sub(start)).filter(|(_, entry)| entry.is_live()).map(|(slot,entry)| (slot as u32,entry))
+    }
+
     pub fn iter_live(&self) -> impl Iterator<Item = (u32, &Entry)> {
         self.entries
             .iter()

@@ -24,6 +24,7 @@ use super::monitor::MonitorEvent;
 use super::pathutil::{self, IgnoreRules};
 use super::priority::{DIR_PRIORITY, PriorityTable};
 use super::scheduler::LatestWorker;
+use super::ranking::TopResults;
 use super::win::disk;
 use super::{DEFAULT_MAX_RESULTS, MAX_SEARCH_TEXT_LEN, Result};
 
@@ -474,8 +475,7 @@ impl Engine {
         if query.is_empty() || query.search_text.len() > MAX_SEARCH_TEXT_LEN {
             return;
         }
-        let index = read(&self.index);
-        self.scan_index(&index, query, state);
+        self.scan_index(query, state);
     }
 
     /// 结果分档顺序：文件按后缀优先级降序，最后才是目录
@@ -485,69 +485,35 @@ impl Engine {
         tiers
     }
 
-    fn scan_index(&self, index: &FileIndex, query: &SearchQuery, state: &SessionState) {
-        let max = self.config.max_results;
-        let tiers = self.priority_tiers();
-        let last_tier = tiers.len() - 1;
+    fn scan_index(&self, query: &SearchQuery, state: &SessionState) {
+        let mut results = TopResults::new(self.config.max_results);
+        let total = read(&self.index).slot_count();
         let needs_dir = query.needs_dir_for_match();
-
-        // 一档一个桶，每档最多收 max 条
-        let mut buckets: Vec<Vec<u32>> = tiers.iter().map(|_| Vec::new()).collect();
-
         let mut scratch = PathScratch::new();
-        let mut dir_buf = String::new();
-
-        for (slot, entry) in index.iter_live() {
-            if state.should_stop() {
-                return;
-            }
-            let Some(name_bytes) = index.name_bytes(slot) else {
-                continue;
-            };
-
-            if needs_dir {
-                // 路径关键字要拼出完整路径才能判，实测比纯文件名关键字慢 16 倍
-                // （120 万条：25ms → 400ms），所以别拿它扫整个索引。
-                let Some(parent) = index.parent_of(entry) else {
-                    continue;
-                };
-                dir_buf.clear();
-                if !index.path_into(parent, &mut scratch, &mut dir_buf) {
-                    continue;
+        let mut dir = String::new();
+        for start in (0..total).step_by(4096) {
+            if state.should_stop() { return; }
+            let index = read(&self.index);
+            for (slot, entry) in index.iter_live_range(start, start+4096) {
+                if state.should_stop() { return; }
+                let Some(name) = index.name_bytes(slot).and_then(|name| std::str::from_utf8(name).ok()) else { continue };
+                if needs_dir {
+                    let Some(parent) = index.parent_of(entry) else { continue };
+                    dir.clear();
+                    if !index.path_into(parent, &mut scratch, &mut dir) || !query.matches_parts(name, &dir) { continue; }
+                } else if !query.matches_name(name.as_bytes()) { continue; }
+                let mut path = String::new();
+                if index.path_into(slot, &mut scratch, &mut path) {
+                    results.insert(query.name_rank(name), entry.priority, path);
                 }
-                let name = std::str::from_utf8(name_bytes).unwrap_or("");
-                if !query.matches_parts(name, &dir_buf) {
-                    continue;
-                }
-            } else if !query.matches_name(name_bytes) {
-                continue;
-            }
-
-            // 表里没有的优先级（用户改过设置但没重算索引）落到最后一档：
-            // 排得靠后可以，漏结果不行
-            let tier = tiers
-                .iter()
-                .position(|value| *value == entry.priority)
-                .unwrap_or(last_tier);
-            if buckets[tier].len() < max {
-                buckets[tier].push(slot);
             }
         }
-
-        // ── 按档发布 ──
-        for bucket in &buckets {
-            for slot in bucket {
-                if state.should_stop() || state.len() >= max {
-                    return;
-                }
-                let mut path = String::new();
-                if !index.path_into(*slot, &mut scratch, &mut path) {
-                    continue; // 链条断了（孤儿），跳过
-                }
-                state.push(&path);
-            }
+        for path in results.into_paths() {
+            if state.should_stop() { return; }
+            state.push(&path);
         }
     }
+
 }
 
 /// 清掉旧版索引（SQLite 分表）留下的库文件。只删认识的那几个名字，不做通配匹配。

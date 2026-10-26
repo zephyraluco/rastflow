@@ -98,6 +98,21 @@ impl SearchQuery {
         }
     }
 
+    /// 已匹配候选的质量，精确优先，其次前缀，最后子串；路径过滤不改变名称质量。
+    pub fn name_rank(&self, name: &str) -> u8 {
+        let name = name.to_lowercase();
+        let mut count = 0;
+        let mut exact = false;
+        let mut prefix = true;
+        for (keyword, path) in self.keywords_lower.iter().zip(&self.is_keyword_path) {
+            if *path { continue; }
+            count += 1;
+            exact = name == *keyword;
+            prefix &= name.starts_with(keyword.as_str());
+        }
+        if count == 1 && exact { 0 } else if count > 0 && prefix { 1 } else { 2 }
+    }
+
     /// 判断一个候选是否命中（候选以完整路径给出）
     ///
     /// 需要完整路径；能用 [`SearchQuery::matches_name`] 时应当优先用它。

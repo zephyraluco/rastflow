@@ -19,6 +19,7 @@ pub mod index;
 pub mod lifecycle;
 pub mod model;
 pub mod protocol;
+pub mod ranking;
 pub mod matcher;
 #[cfg(windows)]
 pub mod monitor;
