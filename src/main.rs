@@ -239,6 +239,9 @@ fn main() {
             })
             .detach();
 
+            // 更新结果提示器：托盘点「检查更新」后由它负责弹原生消息框
+            let mut reporter = updater::Reporter::new();
+
             // ── 托盘事件轮询循环 ─────────────────────────────────────────
             loop {
                 // 检测 auto_launch 设置变化，同步到注册表
@@ -303,7 +306,11 @@ fn main() {
                         }
 
                         if event == TrayEvent::CheckForUpdates {
+                            // 只发起后台检查，然后**跳出本轮托盘处理**：
+                            // 下面的代码是"唤出/隐藏主窗口"，绝不能让它顺带执行。
+                            reporter.begin();
                             updater.update(cx, |updater, cx| updater.check(cx));
+                            continue;
                         }
 
                         // 左键单击总是唤出；菜单项则是显示/隐藏切换
@@ -323,6 +330,18 @@ fn main() {
                                 .ok();
                         });
                     }
+                }
+
+                // ── 更新结果 → 原生提示框（不唤出主界面）───────────────────
+                // 状态由后台的任务推进，这里只负责在落定时弹一次框。
+                cx.update(|cx| {
+                    let status = updater.read(cx).status().clone();
+                    reporter.poll(&status, cx);
+                });
+                if reporter.take_choice() == Some(updater::Choice::Install) {
+                    // 用户点了「是」：接着跟踪下载/安装的结果
+                    reporter.begin();
+                    updater.update(cx, |updater, cx| updater.download_and_install(cx));
                 }
 
                 // 每 50ms 轮询一次

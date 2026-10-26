@@ -24,6 +24,28 @@ pub fn scanning_detail(disk: char, written: u64, cx: &App) -> String {
     }
 }
 
+/// 「发现新版本」提示框正文：两者版本号都要露出来，语序随语言变化。
+pub fn update_available(new: &str, current: &str, cx: &App) -> String {
+    let lang = cx.global::<AppSettings>().language.clone();
+    match lang.as_ref() {
+        "en" => format!(
+            "Version {new} is available.\nYou are running {current}.\n\nDownload and install it now?"
+        ),
+        _ => format!(
+            "发现新版本 {new}。\n当前版本 {current}。\n\n是否立即下载并安装？"
+        ),
+    }
+}
+
+/// 「更新已安装」提示框正文：新版已就位，重启后生效。
+pub fn update_staged(version: &str, cx: &App) -> String {
+    let lang = cx.global::<AppSettings>().language.clone();
+    match lang.as_ref() {
+        "en" => format!("Version {version} has been installed.\nIt takes effect after restarting rastflow."),
+        _ => format!("新版本 {version} 已下载并安装。\n重启 rastflow 后生效。"),
+    }
+}
+
 // ---------- 中文 ----------
 
 fn zh(key: &str) -> &'static str {
@@ -85,6 +107,11 @@ fn zh(key: &str) -> &'static str {
 
         // 设置窗口标题
         "settings.title"             => "设置",
+
+        // 检查更新（托盘菜单 → 原生提示框）
+        "update.title"               => "检查更新",
+        "update.up_to_date"          => "当前已是最新版本。",
+        "update.failed"              => "检测更新失败",
 
         _ => "",
     }
@@ -151,6 +178,11 @@ fn en(key: &str) -> &'static str {
 
         // Settings window title
         "settings.title"             => "Settings",
+
+        // Check for updates (tray menu → native message box)
+        "update.title"               => "Check for Updates",
+        "update.up_to_date"          => "You are running the latest version.",
+        "update.failed"              => "Failed to check for updates",
 
         _ => "",
     }
