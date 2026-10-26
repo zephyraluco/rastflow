@@ -386,37 +386,19 @@ fn bootstrap_engine(inner: &Arc<Inner>) -> crate::search::Result<()> {
         return Ok(());
     }
 
-    // 先**只连服务**：这条路径不提权，所以启动绝不会弹 UAC。
-    //
-    // 为什么不直接 HelperSession::start：它连不上服务时会回退到 `runas`，而服务是
-    // 单会话的 —— 只要托盘里已经有一个实例连上了服务，新实例 1.5 秒后就会「连不上」
-    // 并去提权，每次启动都弹 UAC。
     let session = match HelperSession::connect_running_service() {
         Ok(session) => session,
         Err(err) => {
-            if engine.is_indexed() {
-                // 已有快照：直接用，这轮只是拿不到离线补课与实时增量。
-                eprintln!(
-                    "[rastflow] 索引服务不可用（{err}）；本次启动不提权，先用已有索引搜索"
-                );
-                inner.set_status(SearchStatus::Ready { monitoring: false });
-                return Ok(());
-            }
-            // 没有快照就什么都搜不到，只能提权建库（整个启动路径里唯一会弹 UAC 的情况）
-            eprintln!("[rastflow] 索引服务不可用（{err}），且尚无索引，改为一次性提权子进程");
-            match HelperSession::spawn_elevated_session(engine.disks()) {
-                Ok(session) => session,
-                Err(err) if declined_elevation(&err) => {
-                    eprintln!("[rastflow] 未取得管理员权限，索引尚未建立：{err}");
-                    inner.set_status(SearchStatus::Unavailable {
-                        reason: "建立文件索引需要一次管理员权限；也可以安装索引服务，之后永久免提权"
-                            .to_string(),
-                        needs_admin: true,
-                    });
-                    return Ok(());
+            eprintln!("[rastflow] 索引服务不可用：{err}");
+            inner.set_status(if engine.is_indexed() {
+                SearchStatus::Ready { monitoring: false }
+            } else {
+                SearchStatus::Unavailable {
+                    reason: "索引服务不可用，请安装或启动索引服务".to_string(),
+                    needs_admin: !service::state().is_running(),
                 }
-                Err(err) => return Err(err),
-            }
+            });
+            return Ok(());
         }
     };
 
@@ -468,11 +450,7 @@ fn run_pump(inner: Arc<Inner>, engine: Arc<Engine>, session: HelperSession) {
     });
     eprintln!(
         "[rastflow] 索引会话：{}（pid {}）：{:?}",
-        if session.is_service() {
-            "索引服务"
-        } else {
-            "一次性提权子进程"
-        },
+        "索引服务",
         session.child_pid(),
         first
     );
@@ -663,14 +641,6 @@ fn save_snapshot(engine: &Arc<Engine>) {
         // 落盘失败不该影响搜索（索引还在内存里）
         Err(err) => eprintln!("[rastflow] 保存索引快照失败：{err}"),
     }
-}
-
-/// 是不是「用户拒绝了提权」
-///
-/// 只认 [`crate::search::CoreError::ElevationDenied`]：子进程连不上（被安全软件拦住等）
-/// 是另一类问题，应该如实报出来，而不是静默降级成「可搜但无增量」。
-fn declined_elevation(err: &crate::search::CoreError) -> bool {
-    matches!(err, crate::search::CoreError::ElevationDenied)
 }
 
 /// 这个错误是不是「需要管理员权限」——界面据此决定要不要给提权按钮

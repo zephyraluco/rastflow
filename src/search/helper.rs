@@ -1,30 +1,17 @@
-//! 主进程侧的索引子进程会话：协议编解码 + 拉起提权子进程 + 握手。
-//!
-//! 子进程只做 MFT/USN，**不持有索引**；索引、快照与搜索始终留在本进程。
-//! 这样打开卷句柄（要 `GENERIC_WRITE`，即管理员）这件事就被关进了一个小进程里，
-//! 主程序可以以普通用户身份常驻托盘。
-//!
-//! 协议是一串长度前缀（`u32`）+ 单字节标签 + 定点字段的消息；字符串是
-//! `u16` 长度 + UTF-8 字节。手写而不用 serde：消息都在热路径上（扫描时上百万条
-//! 记录），编码开销与格式演进都要自己控制。
+//! 索引服务协议与桌面客户端。服务只提供元数据，索引与查询留在桌面进程。
 
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use super::index::{JournalMark, MftEntry};
 use super::monitor::MonitorEvent;
 use super::win::pipe::{self, PipeHandle};
-use super::win::process::{self, ElevatedChild};
+use super::win::process;
 use super::win::service;
 use super::{CoreError, Result};
 
-/// 命令行开关：以「索引子进程」身份运行（同一个 exe，不需要额外的二进制）
-pub const HELPER_FLAG: &str = "--index-helper";
 /// 协议版本。字段一改就要加一，两边不一致时直接失败而不是读出垃圾。
 pub const PROTOCOL_VERSION: u32 = 1;
-
-/// 等子进程连上管道的上限。UAC 弹窗要用户点一下，给足时间。
-const ACCEPT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// 连常驻索引服务的超时。
 ///
@@ -51,12 +38,20 @@ pub enum Request {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
     /// 握手：协议版本
-    Ready { version: u32 },
+    Ready {
+        version: u32,
+    },
     /// 开始枚举某个盘；`mark` 是本次枚举覆盖到的日志位点
-    ScanStarted { disk: char, mark: JournalMark },
+    ScanStarted {
+        disk: char,
+        mark: JournalMark,
+    },
     /// 一批 MFT 记录
     Records(Vec<MftEntry>),
-    ScanFinished { disk: char, records: u64 },
+    ScanFinished {
+        disk: char,
+        records: u64,
+    },
     /// 重放完成；`mark` 是新的位点
     CatchUpFinished {
         disk: char,
@@ -64,14 +59,24 @@ pub enum Message {
         mark: JournalMark,
     },
     /// 位点已失效，这个盘只能全量重扫
-    NeedsRebuild { disk: char },
+    NeedsRebuild {
+        disk: char,
+    },
     /// 这个盘现在碰不了（多半没权限）
-    Unavailable { disk: char, reason: String },
+    Unavailable {
+        disk: char,
+        reason: String,
+    },
     /// 一批增量事件（重放与实时跟随共用）
     Events(Vec<MonitorEvent>),
-    Warning { disk: char, reason: String },
+    Warning {
+        disk: char,
+        reason: String,
+    },
     /// 所有盘的跟随线程已就位；`monitoring` 为假表示一个盘都盯不上
-    Monitoring { monitoring: bool },
+    Monitoring {
+        monitoring: bool,
+    },
     /// 子进程要退出了
     Fatal(String),
     Bye,
@@ -543,13 +548,10 @@ const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 
 // ---------- 主进程侧会话 ----------
 
-/// 一次索引会话。`Drop` 会礼貌地要求对端停下来；如果对端是一次性提权子进程，
-/// 还会兜底杀掉它（不留提权孤儿）。服务是长期存在的，**绝不能**杀。
+/// 桌面与常驻 Windows 服务的一次连接。不会创建或终止服务进程。
 pub struct HelperSession {
     reader: PipeReader,
     writer: PipeWriter,
-    /// 会话的另一端：`Some` = 我们拉起的一次性子进程；`None` = 常驻索引服务
-    child: Option<ElevatedChild>,
     pid: u32,
 }
 
@@ -566,13 +568,6 @@ impl HelperSession {
         Ok(session)
     }
 
-    /// 直接拉起一次性的提权子进程（会弹一次 UAC）。
-    ///
-    /// 只在「本地还没有索引快照、必须建库」时用：那时不提权就什么也搜不到。
-    pub fn spawn_elevated_session(disks: &[char]) -> Result<Self> {
-        Self::spawn_once(disks)
-    }
-
     /// 连常驻服务。管道名是固定的，所以必须确认对面真是以 `LocalSystem` 运行的服务。
     fn connect_service() -> Result<Self> {
         let handle = PipeHandle::connect(service::PIPE_NAME, SERVICE_CONNECT_TIMEOUT)?;
@@ -585,45 +580,10 @@ impl HelperSession {
                 "索引管道的服务端不是索引服务（pid {pid}）"
             )));
         }
-        Self::handshake(handle, None, pid)
+        Self::handshake(handle, pid)
     }
 
-    /// 拉起一次性的提权子进程（没有安装服务时的兜底路径，会弹一次 UAC）。
-    fn spawn_once(disks: &[char]) -> Result<Self> {
-        let name = pipe_name();
-        let server = PipeHandle::create_server(&name)?;
-
-        let parent_pid = process::current_pid();
-        // 管道名与 pid 里没有空格，不需要额外加引号
-        let parameters = format!("{HELPER_FLAG} --pipe {name} --parent-pid {parent_pid}");
-        let child = process::spawn_elevated(&parameters)?;
-
-        pipe::accept(&server, ACCEPT_TIMEOUT)?;
-
-        // 连上来的必须是我们刚拉起的那个子进程：否则可能是别的进程在灌假数据
-        if let Some(pid) = server.client_pid()
-            && pid != child.pid()
-        {
-            return Err(CoreError::Helper(format!(
-                "管道连接者不是索引子进程（期望 {}，实际 {pid}）",
-                child.pid()
-            )));
-        }
-
-        eprintln!(
-            "[rastflow] 索引子进程已就绪（pid {}），将索引盘：{}",
-            child.pid(),
-            disks.iter().collect::<String>()
-        );
-        let pid = child.pid();
-        Self::handshake(server, Some(child), pid)
-    }
-
-    fn handshake(
-        handle: Arc<PipeHandle>,
-        child: Option<ElevatedChild>,
-        pid: u32,
-    ) -> Result<Self> {
+    fn handshake(handle: Arc<PipeHandle>, pid: u32) -> Result<Self> {
         let reader = PipeReader::new(Arc::clone(&handle));
         let writer = PipeWriter::new(handle);
 
@@ -643,7 +603,6 @@ impl HelperSession {
         Ok(Self {
             reader,
             writer,
-            child,
             pid,
         })
     }
@@ -651,11 +610,6 @@ impl HelperSession {
     /// 会话对端的进程 id（服务会话时是服务的 pid）
     pub fn child_pid(&self) -> u32 {
         self.pid
-    }
-
-    /// 是不是在跟常驻服务说话
-    pub fn is_service(&self) -> bool {
-        self.child.is_none()
     }
 
     pub fn send(&self, request: &Request) -> Result<()> {
@@ -673,11 +627,6 @@ impl Drop for HelperSession {
         // 先好好说一声，让对端停掉跟随线程并结束会话。
         // 服务会回到 accept 继续等下一个客户端，所以这里不能杀它。
         let _ = self.send(&Request::Stop);
-        if self.child.is_some() {
-            // 一次性子进程多半正阻塞在 USN 读取上，等不到礼貌退出；
-            // `ElevatedChild` 的 Drop 会兜底杀掉它
-            std::thread::sleep(Duration::from_millis(50));
-        }
     }
 }
 
@@ -706,25 +655,20 @@ pub fn run_service_installer(install: bool) -> Result<()> {
     process::run_elevated_and_wait(flag)
 }
 
-/// `\\.\pipe\rastflow-index-<pid>-<熵>`
-///
-/// 带随机后缀，避免上次异常退出留下的同名管道被误连。
-fn pipe_name() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|value| value.as_nanos() as u64)
-        .unwrap_or(0);
-    let salt = (&nanos as *const u64 as usize) as u64;
-    format!(
-        r"\\.\pipe\rastflow-index-{}-{:x}",
-        process::current_pid(),
-        nanos ^ salt.rotate_left(17)
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pipe_name() -> String {
+        format!(
+            r"\\.\pipe\rastflow-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
 
     fn roundtrip(message: &Message) -> Message {
         let payload = encode_payload(message);
@@ -835,15 +779,6 @@ mod tests {
         assert_eq!(&framed[4..], payload.as_slice());
     }
 
-    #[test]
-    fn pipe_name_is_unique_and_current_process() {
-        let first = pipe_name();
-        let second = pipe_name();
-        assert!(first.starts_with(r"\\.\pipe\rastflow-index-"));
-        assert!(first.contains(&process::current_pid().to_string()));
-        assert_ne!(first, second, "两次会话不能共用一个管道名");
-    }
-
     /// 真的装一遍服务、连上它、再卸掉。
     ///
     /// ⚠️ 需要**管理员**，而且会**真的修改系统**（注册后立即删除一个 Windows 服务）。
@@ -869,7 +804,6 @@ mod tests {
 
         // 服务在跑，主进程连它不需要任何提权
         let session = HelperSession::connect_running_service().expect("应当能连上索引服务");
-        assert!(session.is_service(), "应当走服务而不是一次性子进程");
         drop(session);
 
         uninstall_service().expect("卸载服务失败");
@@ -892,8 +826,8 @@ mod tests {
 
         let client_name = name.clone();
         let client = std::thread::spawn(move || {
-            let handle = PipeHandle::connect(&client_name, Duration::from_secs(5))
-                .expect("连接服务端失败");
+            let handle =
+                PipeHandle::connect(&client_name, Duration::from_secs(5)).expect("连接服务端失败");
             let writer = PipeWriter::new(handle);
             let entries: Vec<MftEntry> = (0..2048)
                 .map(|n| MftEntry {

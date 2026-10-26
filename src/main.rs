@@ -129,11 +129,6 @@ fn main() {
         });
     }
 
-    // 一次性索引子进程（没有安装服务时的兜底）：只做 MFT/USN，绝不能初始化 GPUI。
-    if search::helper_main::is_invocation() {
-        std::process::exit(search::helper_main::run());
-    }
-
     gpui_kit::application().with_assets(Assets).run(move |cx| {
         gpui_kit::init(cx);
         cx.set_global(AppSettings::default());

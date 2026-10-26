@@ -1,25 +1,18 @@
-//! 提权索引子进程：**只做 MFT/USN**，不持有索引、不落地、不搜索。
-//!
-//! 主进程用同一个可执行文件 + `--index-helper` 把自己拉起来（`runas`），
-//! 通过命名管道下指令、收记录与事件。这样「打开卷句柄」这件需要管理员的事
-//! 被关进这个小进程里，主程序可以以普通用户身份常驻托盘 —— 和 Everything
-//! 用后台服务替 GUI 建库是同一个思路，只是这里不需要装服务。
-//!
-//! 三条退出路径都必须干净：主进程发 `Stop`、管道断开、父进程消失（[`watch_parent`]）。
+//! Windows 索引服务：只做 MFT/USN，通过命名管道批量返回元数据。
+//! 索引、快照与搜索由普通用户桌面进程持有；客户端断开后返回等待连接。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use super::helper::{self, Message, PipeReader, PipeWriter, Request, HELPER_FLAG};
+use super::Result;
+use super::helper::{self, Message, PipeReader, PipeWriter, Request};
 use super::index::{self, IndexProgress, JournalMark, MftEntry, ScanSink};
 use super::monitor::{self, EventSink, MonitorConfig, MonitorEvent, MonitorHandle};
 use super::win::pipe::{self, PipeHandle};
-use super::win::process;
 use super::win::service;
 use super::win::usn::UsnRecord;
-use super::{CoreError, Result};
 
 /// 一批往主进程发多少条扫描记录。
 ///
@@ -27,23 +20,17 @@ use super::{CoreError, Result};
 /// 一百多万文件也就几百条消息。
 const RECORD_BATCH: usize = 2048;
 
-/// 连接主进程管道的超时（主进程要先建好服务端）
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// 服务 accept 时每次轮询的时长。
 ///
 /// `ConnectNamedPipe` 没有超时参数，只能靠 `CancelSynchronousIo` 打断，所以用
 /// 短周期轮询来响应 SCM 的停止请求。服务空闲时每 2 秒一次，开销可以忽略。
 const ACCEPT_POLL: Duration = Duration::from_secs(2);
 
-/// 当前进程是不是被当成索引子进程拉起来的
-pub fn is_invocation() -> bool {
-    std::env::args().skip(1).any(|arg| arg == HELPER_FLAG)
-}
-
 /// 当前进程是不是被 SCM 当成索引服务拉起来的
 pub fn is_service_invocation() -> bool {
-    std::env::args().skip(1).any(|arg| arg == service::SERVICE_FLAG)
+    std::env::args()
+        .skip(1)
+        .any(|arg| arg == service::SERVICE_FLAG)
 }
 
 /// 当前进程是不是在执行「安装/卸载索引服务」
@@ -57,36 +44,6 @@ pub fn service_admin_action() -> Option<bool> {
         }
     }
     install
-}
-
-/// 子进程入口（`--index-helper`）。返回进程退出码。
-pub fn run() -> i32 {
-    match run_inner() {
-        Ok(()) => 0,
-        Err(err) => {
-            // 子进程没有控制台（windows_subsystem = "windows"），这条日志只在
-            // 从终端手动启动时看得到；主进程那边的现象是「管道断开」
-            eprintln!("[rastflow-index-helper] {err}");
-            1
-        }
-    }
-}
-
-fn run_inner() -> Result<()> {
-    let options = Options::parse()
-        .ok_or_else(|| CoreError::InvalidArgument("索引子进程参数不完整".to_string()))?;
-
-    // 父进程不管怎么退出（包括崩溃），都不能留下一个提权的孤儿进程
-    process::exit_with_parent(options.parent_pid);
-
-    let handle = PipeHandle::connect(&options.pipe, CONNECT_TIMEOUT)?;
-    let writer = Arc::new(PipeWriter::new(Arc::clone(&handle)));
-    let reader = PipeReader::new(handle);
-
-    serve_session(&reader, &writer, None)?;
-
-    // 一次性子进程：会话结束后整个进程退出。上面已经把 `Bye` 之类的收尾做完了。
-    Ok(())
 }
 
 /// 服务模式的主循环：反复接受主进程的连接，一次只服务一个会话。
@@ -238,14 +195,9 @@ fn catch_up_all(
     known: &mut HashMap<char, JournalMark>,
 ) -> Result<()> {
     for (disk, mark) in marks {
-        let outcome = monitor::replay_disk(
-            *disk,
-            *mark,
-            &mut |_| {},
-            &mut |batch| {
-                let _ = writer.send(&Message::Events(batch.to_vec()));
-            },
-        );
+        let outcome = monitor::replay_disk(*disk, *mark, &mut |_| {}, &mut |batch| {
+            let _ = writer.send(&Message::Events(batch.to_vec()));
+        });
         match outcome {
             Ok(monitor::ReplayOutcome::Replayed { events, mark }) => {
                 known.insert(*disk, mark);
@@ -278,14 +230,15 @@ fn follow(
     service_stop: Option<&AtomicBool>,
 ) -> Result<()> {
     let sink_writer = Arc::clone(writer);
-    let sink: EventSink = Arc::new(move |batch: &[MonitorEvent]| {
-        sink_writer.send(&Message::Events(batch.to_vec()))
-    });
+    let sink: EventSink =
+        Arc::new(move |batch: &[MonitorEvent]| sink_writer.send(&Message::Events(batch.to_vec())));
 
     let disks: Vec<char> = known.keys().copied().collect();
     let config = MonitorConfig::new(disks).with_start(known.clone());
     let (handle, live) = MonitorHandle::start(&config, sink)?;
-    writer.send(&Message::Monitoring { monitoring: live > 0 })?;
+    writer.send(&Message::Monitoring {
+        monitoring: live > 0,
+    })?;
 
     // 只有 `Stop`（或主进程断开、服务被停）能让它停下来。跟随线程自己跑在别的
     // 线程上，所以这里阻塞读不会影响它们。
@@ -306,32 +259,6 @@ fn follow(
     handle.join();
     let _ = writer.send(&Message::Bye);
     Ok(())
-}
-
-// ---------- 参数 ----------
-
-struct Options {
-    pipe: String,
-    parent_pid: u32,
-}
-
-impl Options {
-    fn parse() -> Option<Self> {
-        let mut pipe = None;
-        let mut parent_pid = None;
-        let mut args = std::env::args().skip(1);
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--pipe" => pipe = args.next(),
-                "--parent-pid" => parent_pid = args.next().and_then(|value| value.parse().ok()),
-                _ => {}
-            }
-        }
-        Some(Self {
-            pipe: pipe?,
-            parent_pid: parent_pid?,
-        })
-    }
 }
 
 #[cfg(test)]

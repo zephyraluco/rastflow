@@ -1,8 +1,4 @@
-//! 进程辅助：判断当前进程是否提权、以管理员身份拉起索引子进程、以及子进程侧的
-//! 「父进程一死就跟着退出」守卫。
-//!
-//! 索引子进程用的是**同一个可执行文件** + `--index-helper`，所以打包时不需要额外的
-//! 二进制（cargo-packager 只收主二进制）。
+//! 服务安装维护的提权执行与命名管道服务端身份检查。
 
 use std::mem::size_of;
 
@@ -13,12 +9,11 @@ use windows::Win32::Security::{
     GetTokenInformation, IsWellKnownSid, TOKEN_QUERY, TOKEN_USER, TokenUser, WinLocalSystemSid,
 };
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentProcessId, GetExitCodeProcess, GetProcessId, INFINITE,
-    OpenProcess, OpenProcessToken, PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION,
-    TerminateProcess, WaitForSingleObject,
+    GetCurrentProcessId, GetExitCodeProcess, GetProcessId, INFINITE, OpenProcess, OpenProcessToken,
+    PROCESS_QUERY_LIMITED_INFORMATION, TerminateProcess, WaitForSingleObject,
 };
 use windows::Win32::UI::Shell::{
-    SEE_MASK_FLAG_NO_UI, SEE_MASK_NOCLOSEPROCESS, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW,
+    SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
     ShellExecuteExW,
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
@@ -27,12 +22,6 @@ use windows::core::PCWSTR;
 use super::super::{CoreError, Result};
 use super::pipe::win32_code;
 use super::to_wide;
-
-/// `SYNCHRONIZE`：等待进程退出的最小权限。
-///
-/// windows crate 把它归在 `FileSystem` 下（`FILE_ACCESS_RIGHTS`），但数值对所有
-/// 内核对象通用，这里按 `PROCESS_ACCESS_RIGHTS` 用。
-const SYNCHRONIZE: u32 = 0x0010_0000;
 
 /// 当前进程 id
 pub fn current_pid() -> u32 {
@@ -114,9 +103,7 @@ pub fn spawn_elevated(parameters: &str) -> Result<ElevatedChild> {
     }
 
     if info.hProcess.is_invalid() {
-        return Err(CoreError::Helper(
-            "提权子进程没有返回进程句柄".to_string(),
-        ));
+        return Err(CoreError::Helper("提权子进程没有返回进程句柄".to_string()));
     }
     let pid = unsafe { GetProcessId(info.hProcess) };
     if pid == 0 {
@@ -142,31 +129,6 @@ pub fn run_elevated_and_wait(flag: &str) -> Result<()> {
         ))),
         None => Err(CoreError::Helper(format!("等待 {flag} 结束失败"))),
     }
-}
-
-/// 子进程侧的守卫：父进程退出后立刻自杀。
-///
-/// 子进程平时阻塞在管道读取或 USN 读取上，**没有**机会发现父进程已经不在了；
-/// 一条只做等待的线程是最省事的办法，也能保证不会留下提权孤儿进程。
-pub fn exit_with_parent(parent_pid: u32) {
-    let _ = std::thread::Builder::new()
-        .name("rastflow-helper-guard".to_string())
-        .spawn(move || {
-            // 提权进程对普通用户的父进程拿 SYNCHRONIZE 是允许的
-            let Ok(parent) = (unsafe {
-                OpenProcess(PROCESS_ACCESS_RIGHTS(SYNCHRONIZE), false, parent_pid)
-            }) else {
-                // 拿不到句柄就退化成「靠管道断开发现」，不影响正确性
-                return;
-            };
-            let waited = unsafe { WaitForSingleObject(parent, INFINITE) };
-            let _ = unsafe { CloseHandle(parent) };
-            if waited == WAIT_OBJECT_0 {
-                unsafe {
-                    let _ = TerminateProcess(GetCurrentProcess(), 0);
-                }
-            }
-        });
 }
 
 /// 这个进程是否可信地“以更高权限运行”（典型就是索引服务的 `LocalSystem`）。
