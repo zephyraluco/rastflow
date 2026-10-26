@@ -29,7 +29,7 @@ use windows::Win32::System::Services::{
     QueryServiceStatusEx, RegisterServiceCtrlHandlerExW, SC_HANDLE, SC_MANAGER_ALL_ACCESS,
     SC_MANAGER_CONNECT, SC_STATUS_PROCESS_INFO, SERVICE_ACCEPT_STOP, SERVICE_ALL_ACCESS,
     SERVICE_AUTO_START, SERVICE_CONTROL_STOP, SERVICE_ERROR_NORMAL, SERVICE_QUERY_STATUS,
-    SERVICE_RUNNING, SERVICE_START, SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STATUS_HANDLE,
+    SERVICE_RUNNING, SERVICE_STOP_PENDING, SERVICE_ACCEPT_SHUTDOWN, SERVICE_START, SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STATUS_HANDLE,
     SERVICE_STATUS_PROCESS, SERVICE_STOP, SERVICE_STOPPED, SERVICE_TABLE_ENTRYW,
     SERVICE_WIN32_OWN_PROCESS, SetServiceStatus, StartServiceCtrlDispatcherW, StartServiceW,
 };
@@ -100,6 +100,20 @@ fn open_service(manager: SC_HANDLE, access: u32) -> Result<SC_HANDLE> {
         OpenServiceW(manager, PCWSTR(name.as_ptr()), access)
             .map_err(|err| CoreError::win32("OpenServiceW", err))
     }
+}
+
+/// SCM 注册项对应的实际进程，用于验证命名管道服务端身份。
+pub fn process_id() -> Option<u32> {
+    let manager = open_manager(SC_MANAGER_CONNECT).ok()?;
+    let service = open_service(manager, SERVICE_QUERY_STATUS);
+    let _ = unsafe { CloseServiceHandle(manager) };
+    let service = service.ok()?;
+    let mut status = SERVICE_STATUS_PROCESS::default();
+    let mut needed = 0;
+    let result = unsafe { QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, Some(status_bytes(&mut status)), &mut needed) };
+    let _ = unsafe { CloseServiceHandle(service) };
+    result.ok()?;
+    (status.dwProcessId != 0 && status.dwCurrentState == SERVICE_RUNNING).then_some(status.dwProcessId)
 }
 
 /// 查询服务当前状态。**不需要管理员**（`SC_MANAGER_CONNECT` + `SERVICE_QUERY_STATUS`）。
@@ -189,8 +203,9 @@ pub fn install() -> Result<()> {
         }
         Err(err) if win32_code(&err) == ERROR_SERVICE_EXISTS.0 => {
             // 已安装：先停下来，否则 `ChangeServiceConfigW` 只改注册表、不换进程
-            if let Err(err) = stop(STOP_TIMEOUT) {
-                eprintln!("[rastflow] 停止旧索引服务失败（继续改配置）：{err}");
+            if !stop(STOP_TIMEOUT)? {
+                let _ = unsafe { CloseServiceHandle(manager) };
+                return Err(CoreError::Helper("旧索引服务停止超时，取消升级".into()));
             }
             // 停过一次之后句柄要重新取：SCM 可能已经把这条服务换成了 pending-delete
             let service = open_service(manager, SERVICE_ALL_ACCESS);
@@ -287,7 +302,10 @@ pub fn uninstall() -> Result<()> {
     };
 
     // 先等它停：服务进程还开着 exe 时，安装器删不掉那个文件（要拖到重启）
-    let _ = stop(UNINSTALL_STOP_TIMEOUT);
+    if !stop(UNINSTALL_STOP_TIMEOUT)? {
+        let _ = unsafe { CloseServiceHandle(manager) };
+        return Err(CoreError::Helper("索引服务停止超时，取消卸载".into()));
+    }
 
     let service = match open_service(manager, SERVICE_ALL_ACCESS) {
         Ok(handle) => handle,
@@ -356,7 +374,7 @@ fn report(state: windows::Win32::System::Services::SERVICE_STATUS_CURRENT_STATE,
         dwCurrentState: state,
         // 只在 RUNNING 之后才接受 STOP；start-pending 阶段拒绝任何控制
         dwControlsAccepted: if state == SERVICE_RUNNING {
-            SERVICE_ACCEPT_STOP
+            SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN
         } else {
             0
         },
@@ -396,6 +414,7 @@ unsafe extern "system" fn control_handler(
 ) -> u32 {
     // SERVICE_CONTROL_STOP = 1，SERVICE_CONTROL_SHUTDOWN = 5
     if control == SERVICE_CONTROL_STOP || control == 5 {
+        report(SERVICE_STOP_PENDING, 10_000);
         STOP.store(true, Ordering::SeqCst);
         // 主线程可能正阻塞在 `ReadFile`（等客户端的下一条指令）或 `ConnectNamedPipe` 上。
         // 光置标志它看不到，必须把这次同步 IO 取消掉。

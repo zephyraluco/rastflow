@@ -75,7 +75,10 @@ pub fn run_service_loop(stop: &AtomicBool, pipe_name: &str) {
             Err(_) => continue,
         }
 
-        // 会话期间才有意义：拒绝远程客户端已经由 PIPE_REJECT_REMOTE_CLIENTS 保证
+        if !server.client_pid().is_some_and(super::win::process::is_desktop_client) {
+            eprintln!("[rastflow-index-service] 拒绝非本安装目录客户端");
+            continue;
+        }
         let reader = PipeReader::new(Arc::clone(&server));
         let writer = Arc::new(PipeWriter::new(Arc::clone(&server)));
         if let Err(err) = serve_session(&reader, &writer, Some(stop)) {

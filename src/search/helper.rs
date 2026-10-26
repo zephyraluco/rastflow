@@ -135,7 +135,7 @@ impl HelperSession {
         let pid = handle
             .server_pid()
             .ok_or_else(|| CoreError::Helper("取不到索引服务的进程 id".to_string()))?;
-        if !process::is_trusted_server_process(pid) {
+        if service::process_id() != Some(pid) {
             // 有人抢先把管道名占了：拒绝，而不是把文件名列表交给一个陌生进程
             return Err(CoreError::Helper(format!(
                 "索引管道的服务端不是索引服务（pid {pid}）"

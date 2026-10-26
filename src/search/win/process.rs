@@ -2,12 +2,7 @@
 
 use std::mem::size_of;
 
-use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, ERROR_CANCELLED, HANDLE, WAIT_OBJECT_0,
-};
-use windows::Win32::Security::{
-    GetTokenInformation, IsWellKnownSid, TOKEN_QUERY, TOKEN_USER, TokenUser, WinLocalSystemSid,
-};
+use windows::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::{
     GetCurrentProcessId, GetExitCodeProcess, GetProcessId, INFINITE, OpenProcess, OpenProcessToken,
     PROCESS_QUERY_LIMITED_INFORMATION, TerminateProcess, WaitForSingleObject,
@@ -131,58 +126,29 @@ pub fn run_elevated_and_wait(flag: &str) -> Result<()> {
     }
 }
 
-/// 这个进程是否可信地“以更高权限运行”（典型就是索引服务的 `LocalSystem`）。
-///
-/// 用来识别「连上的管道对面到底是不是我们装的索引服务」。判定分两种情况：
-///
-/// - **令牌读得到**：严格要求 `TokenUser` 是 `WinLocalSystemSid`。
-/// - **令牌读不到**：普通用户打不开 `LocalSystem` 进程的句柄与令牌（`ACCESS_DENIED`），
-///   而普通用户自己的进程一定能打开。所以“拒绝访问”本身就已经证明对方权限高于本进程。
-///
-/// 第二类是必需的：如果把它当成失败，主进程就会误判服务不可用而回退到 `runas`，
-/// 导致每次启动都弹 UAC。已经拿到管理员权限的进程本来就能做更多，不在威胁模型内。
-pub fn is_trusted_server_process(pid: u32) -> bool {
+/// 服务只接受从同一安装位置运行的客户端。此检查不等同于代码签名验证。
+pub fn is_desktop_client(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
+    let Ok(expected) = std::env::current_exe() else {
+        return false;
+    };
     unsafe {
-        let process = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
-            Ok(process) => process,
-            // 打不开只可能是权限不足（进程已退出会是 INVALID_PARAMETER）
-            Err(err) => return win32_code(&err) == ERROR_ACCESS_DENIED.0,
+        let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return false;
         };
-        let mut token = HANDLE::default();
-        let opened = OpenProcessToken(process, TOKEN_QUERY, &mut token).is_ok();
+        let mut buffer = vec![0u16; 32768];
+        let mut length = buffer.len() as u32;
+        let result = windows::Win32::System::Threading::QueryFullProcessImageNameW(
+            process,
+            windows::Win32::System::Threading::PROCESS_NAME_WIN32,
+            windows::core::PWSTR(buffer.as_mut_ptr()),
+            &mut length,
+        );
         let _ = CloseHandle(process);
-        if !opened {
-            // 同上：句柄已经打开，令牌却拿不到，只能是对方权限更高
-            return true;
-        }
-
-        // 先问需要多大（TokenUser 的数据长度取决于 SID 长度）
-        let mut needed = 0u32;
-        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut needed);
-        if needed == 0 {
-            let _ = CloseHandle(token);
-            return false;
-        }
-        let mut buffer = vec![0u8; needed as usize];
-        let ok = GetTokenInformation(
-            token,
-            TokenUser,
-            Some(buffer.as_mut_ptr() as *mut core::ffi::c_void),
-            needed,
-            &mut needed,
-        )
-        .is_ok();
-        let _ = CloseHandle(token);
-        if !ok {
-            return false;
-        }
-
-        // `TokenUser` 返回的是 TOKEN_USER，首字段是 SID_AND_ATTRIBUTES
-        let user = buffer.as_ptr() as *const TOKEN_USER;
-        let sid = (*user).User.Sid;
-        !sid.is_invalid() && IsWellKnownSid(sid, WinLocalSystemSid).as_bool()
+        result.is_ok()
+            && String::from_utf16_lossy(&buffer[..length as usize]).to_lowercase()
+                == expected.to_string_lossy().to_lowercase()
     }
 }
