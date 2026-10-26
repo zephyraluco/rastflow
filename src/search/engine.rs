@@ -87,6 +87,7 @@ pub struct Engine {
     /// 每个盘已经处理到的 USN 位点（随快照落盘）
     marks: Mutex<HashMap<char, JournalMark>>,
     snapshot: PathBuf,
+    staging: Mutex<HashMap<char, FileIndex>>,
     queries: OnceLock<std::io::Result<LatestWorker<(SearchQuery, Arc<SessionState>)>>>,
     /// 预编译的忽略规则
     ignore: IgnoreRules,
@@ -143,6 +144,7 @@ impl Engine {
             index: RwLock::new(index),
             priorities: RwLock::new(priorities),
             marks: Mutex::new(marks),
+            staging: Mutex::new(HashMap::new()),
             snapshot,
             queries: OnceLock::new(),
             ignore,
@@ -271,19 +273,28 @@ impl Engine {
     /// 之后用 [`Engine::insert_scanned_batch`] 灌记录，最后 [`Engine::finish_scan`] 收尾。
     /// 这三步对应子进程流过来的 `ScanStarted` / `Records` / `ScanFinished`。
     pub fn begin_scan(&self, disk: char) {
-        let mut index = write(&self.index);
-        index.clear_disk(disk);
+        let mut index = FileIndex::new();
         index.ensure_root(disk);
+        lock(&self.staging).insert(disk, index);
+    }
+
+    pub fn abort_scan(&self, disk: char) { lock(&self.staging).remove(&disk); }
+
+    pub fn abort_scans(&self) {
+        lock(&self.staging).clear();
     }
 
     /// 落入一批扫描记录，返回真正插进去的条数。
     ///
     /// 这里**不**做路径级过滤：忽略规则要等祖先都到齐、能拼出完整路径之后再判。
     pub fn insert_scanned_batch(&self, entries: &[MftEntry]) -> usize {
-        let mut index = write(&self.index);
+        let mut staging = lock(&self.staging);
         let priorities = read(&self.priorities);
         let mut inserted = 0;
         for entry in entries {
+            let Some(index) = staging.get_mut(&entry.disk) else {
+                continue;
+            };
             let priority = entry.priority(&priorities);
             if index
                 .insert(
@@ -304,7 +315,13 @@ impl Engine {
 
     /// 扫描收尾：按忽略规则清理、收掉孤儿，并记下本次扫描覆盖到的位点。
     pub fn finish_scan(&self, disk: char, mark: JournalMark) -> ScanStats {
+        let Some(mut staged) = lock(&self.staging).remove(&disk) else {
+            return ScanStats::default();
+        };
         let mut index = write(&self.index);
+        staged.drop_ignored(disk, &self.ignore);
+        staged.prune_orphans_of(disk);
+        index.replace_disk(disk, &staged);
         let ignored = index.drop_ignored(disk, &self.ignore) as u64;
         let broken = index.prune_orphans_of(disk) as u64;
         let written = index.count_disk(disk) as u64;
@@ -331,6 +348,22 @@ impl Engine {
     ///
     /// 返回 `Ok(true)` 表示确实改动了索引。日志重放也走这里。
     pub fn apply_event(&self, event: &MonitorEvent) -> Result<bool> {
+        let disk = match event {
+            MonitorEvent::Added { disk, .. }
+            | MonitorEvent::Removed { disk, .. }
+            | MonitorEvent::DiskWarning { disk, .. }
+            | MonitorEvent::DiskStopped(disk) => *disk,
+        };
+        let mut staging = lock(&self.staging);
+        if let Some(index) = staging.get_mut(&disk) {
+            return Ok(apply_to_index(
+                index,
+                event,
+                &self.ignore,
+                &read(&self.priorities),
+            ));
+        }
+        drop(staging);
         let mut index = write(&self.index);
         Ok(apply_to_index(
             &mut index,
@@ -497,11 +530,6 @@ fn apply_to_index(
             is_dir,
             renamed,
         } => {
-            // 父目录必须已经在索引里。不在的话这条记录永远解析不出路径、
-            // 搜不到，插进去只是白占内存 —— 等下次全量重建再收它。
-            if !is_root(*parent) && index.lookup(*disk, *parent).is_none() {
-                return false;
-            }
             let priority = if *is_dir {
                 DIR_PRIORITY
             } else {
@@ -710,6 +738,7 @@ mod tests {
             index: RwLock::new(FileIndex::new()),
             priorities: RwLock::new(PriorityTable::with_builtin_defaults()),
             marks: Mutex::new(HashMap::new()),
+            staging: Mutex::new(HashMap::new()),
             snapshot,
             queries: OnceLock::new(),
             ignore,
@@ -1159,6 +1188,7 @@ mod tests {
             index: RwLock::new(FileIndex::new()),
             priorities: RwLock::new(PriorityTable::with_builtin_defaults()),
             marks: Mutex::new(HashMap::new()),
+            staging: Mutex::new(HashMap::new()),
             snapshot: PathBuf::new(),
             queries: OnceLock::new(),
             ignore: IgnoreRules::new(&[r"C:\$Recycle.Bin".to_string(), r"C:\skipme".to_string()]),

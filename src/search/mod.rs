@@ -9,16 +9,29 @@
 //!
 //! 模块划分、索引布局、生命周期与并发约束见 `docs/search-engine.md`。
 
+#[cfg(windows)]
 pub mod engine;
+#[cfg(windows)]
 pub mod helper;
+#[cfg(windows)]
 pub mod helper_main;
 pub mod index;
+pub mod lifecycle;
 pub mod matcher;
+#[cfg(windows)]
 pub mod monitor;
 pub mod pathutil;
 pub mod priority;
 mod scheduler;
+#[cfg(windows)]
 pub mod win;
+
+#[cfg(not(windows))]
+pub mod win {
+    pub use super::usn;
+}
+#[path = "win/usn.rs"]
+pub mod usn;
 
 pub type Result<T> = std::result::Result<T, CoreError>;
 
@@ -28,6 +41,7 @@ pub type Result<T> = std::result::Result<T, CoreError>;
 pub enum CoreError {
     /// 读写索引快照、目录遍历等
     Io(std::io::Error),
+    #[cfg(windows)]
     Win32 {
         /// 失败的系统调用，如 `"DeviceIoControl(FSCTL_ENUM_USN_DATA)"`
         api: &'static str,
@@ -47,6 +61,7 @@ pub enum CoreError {
 }
 
 impl CoreError {
+    #[cfg(windows)]
     pub(crate) fn win32(api: &'static str, err: windows::core::Error) -> Self {
         Self::Win32 { api, err }
     }
@@ -64,6 +79,7 @@ impl std::fmt::Display for CoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(e) => write!(f, "IO 错误：{e}"),
+            #[cfg(windows)]
             Self::Win32 { api, err } => write!(f, "{api} 失败：{err}"),
             Self::UnsupportedDisk { letter, reason } => {
                 write!(f, "{letter}: 盘不可用：{reason}")
@@ -79,6 +95,7 @@ impl std::error::Error for CoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(e) => Some(e),
+            #[cfg(windows)]
             Self::Win32 { err, .. } => Some(err),
             _ => None,
         }

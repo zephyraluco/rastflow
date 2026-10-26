@@ -16,6 +16,7 @@ use std::time::Duration;
 use crate::search::engine::{CoreConfig, Engine, ScanStats};
 use crate::search::helper::{self, HelperSession, Message, Request};
 use crate::search::index::JournalMark;
+use crate::search::lifecycle::plan_start;
 use crate::search::matcher::SearchQuery;
 use crate::search::monitor::MonitorEvent;
 use crate::search::win::service;
@@ -349,27 +350,6 @@ pub fn open_result(result: &FileResult) -> std::io::Result<()> {
 
 // ---------- 内部实现 ----------
 
-/// 启动时走哪条路：补课，还是全量重扫。
-///
-/// 抽成纯函数，让这条策略有个明确、可测的位置。只要有**任何一个盘**没有位点，
-/// 就没法只补课（那个盘得从头枚举），于是整轮重扫 —— 简单，而且不会留下半个索引。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StartPlan {
-    CatchUp,
-    Scan,
-}
-
-fn plan_start(indexed: bool, disks: &[char], marked: &HashSet<char>) -> StartPlan {
-    if !indexed || disks.is_empty() {
-        return StartPlan::Scan;
-    }
-    if disks.iter().all(|disk| marked.contains(disk)) {
-        StartPlan::CatchUp
-    } else {
-        StartPlan::Scan
-    }
-}
-
 /// 打散引擎、拉起提权子进程、起一条泵线程。
 ///
 /// 本函数**不阻塞**等索引建完：界面靠轮询 [`status`] 看进度。
@@ -434,29 +414,16 @@ struct PumpState {
 fn run_pump(inner: Arc<Inner>, engine: Arc<Engine>, session: HelperSession) {
     let marks = engine.marks();
     let marked: HashSet<char> = marks.keys().copied().collect();
-    let first = match plan_start(engine.is_indexed(), engine.disks(), &marked) {
-        StartPlan::CatchUp => Request::CatchUp {
-            marks: marks.iter().map(|(disk, mark)| (*disk, *mark)).collect(),
-        },
-        StartPlan::Scan => Request::Scan {
-            disks: engine.disks().to_vec(),
-        },
-    };
-    // 子进程连上之前状态还是 Uninitialized；先摆成「正在建索引」，
-    // 免得补课/扫描的这几十秒界面一片空白
-    inner.set_status(SearchStatus::Indexing {
-        disk: None,
-        written: 0,
-    });
-    eprintln!(
-        "[rastflow] 索引会话：{}（pid {}）：{:?}",
-        "索引服务",
-        session.child_pid(),
-        first
-    );
-    if let Err(err) = session.send(&first) {
-        fail(&inner, err);
-        return;
+    engine.abort_scans();
+    let plan = plan_start(engine.disks(), &marked);
+    inner.set_status(SearchStatus::Indexing { disk: None, written: 0 });
+    let mut requests = Vec::new();
+    if !plan.catch_up.is_empty() {
+        requests.push(Request::CatchUp { marks: plan.catch_up.iter().filter_map(|disk| marks.get(disk).map(|mark| (*disk, *mark))).collect() });
+    }
+    if !plan.scan.is_empty() { requests.push(Request::Scan { disks: plan.scan }); }
+    for request in requests {
+        if let Err(err) = session.send(&request) { fail(&inner, err); return; }
     }
 
     let mut state = PumpState {
@@ -500,11 +467,12 @@ fn run_pump(inner: Arc<Inner>, engine: Arc<Engine>, session: HelperSession) {
                 }
             }
             Message::ScanFinished { disk, records } => {
-                // 位点用子进程「枚举那一刻」的 NextUsn，与本次枚举覆盖的范围严格对齐
-                let mark = state.scan_marks.get(&disk).copied().unwrap_or_default();
-                let stats = engine.finish_scan(disk, mark);
-                log_scan(disk, records, stats);
-                state.pending.remove(&disk);
+                if let Some(mark) = state.scan_marks.get(&disk).copied() {
+                    eprintln!("[rastflow] {disk}: 枚举 {records} 条，开始补读扫描期间变更");
+                    if let Err(err) = session.send(&Request::CatchUp { marks: vec![(disk, mark)] }) {
+                        fail(&inner, err); return;
+                    }
+                }
             }
             Message::CatchUpFinished {
                 disk,
@@ -514,24 +482,25 @@ fn run_pump(inner: Arc<Inner>, engine: Arc<Engine>, session: HelperSession) {
                 if events > 0 {
                     eprintln!("[rastflow] {disk}: 从 USN 日志补齐了 {events} 条变更");
                 }
-                engine.set_mark(disk, mark);
+                if state.scan_marks.remove(&disk).is_some() {
+                    let stats = engine.finish_scan(disk, mark);
+                    log_scan(disk, stats.written, stats);
+                } else { engine.set_mark(disk, mark); }
                 state.pending.remove(&disk);
             }
             Message::NeedsRebuild { disk } => {
                 eprintln!("[rastflow] {disk}: USN 日志已覆盖上次位点，改为全量重扫");
-                state = PumpState {
-                    pending: engine.disks().iter().copied().collect(),
-                    ..Default::default()
-                };
+                state.scan_marks.remove(&disk);
+                state.pending.insert(disk);
                 requested_monitor = false;
-                if let Err(err) = session.send(&Request::Scan {
-                    disks: engine.disks().to_vec(),
-                }) {
+                if let Err(err) = session.send(&Request::Scan { disks: vec![disk] }) {
                     fail(&inner, err);
                     return;
                 }
             }
             Message::Unavailable { disk, reason } => {
+                engine.abort_scan(disk);
+                state.scan_marks.remove(&disk);
                 eprintln!("[rastflow] {disk}: 无法处理该盘（{reason}），沿用已有索引");
                 state.last_error = Some(format!("{disk}: {reason}"));
                 state.pending.remove(&disk);
@@ -600,6 +569,7 @@ fn run_pump(inner: Arc<Inner>, engine: Arc<Engine>, session: HelperSession) {
         }
     }
 
+    engine.abort_scans();
     // 退出前把关：把最后的变更落盘，下次启动就能少补一段日志
     if state.applied_since_save > 0 {
         save_snapshot(&engine);
@@ -813,31 +783,6 @@ mod tests {
     #[test]
     fn empty_query_is_rejected() {
         assert_eq!(search("   "), Err(SearchError::NotReady));
-    }
-
-    #[test]
-    fn fresh_install_scans() {
-        assert_eq!(plan_start(false, &['C'], &HashSet::new()), StartPlan::Scan);
-    }
-
-    #[test]
-    fn index_with_all_marks_only_catches_up() {
-        let marked: HashSet<char> = ['C', 'D'].into_iter().collect();
-        assert_eq!(plan_start(true, &['C', 'D'], &marked), StartPlan::CatchUp);
-    }
-
-    #[test]
-    fn a_disk_without_mark_forces_a_rescan() {
-        // 新加的盘没有位点：只补课会让它永远是空的
-        let marked: HashSet<char> = ['C'].into_iter().collect();
-        assert_eq!(plan_start(true, &['C', 'D'], &marked), StartPlan::Scan);
-        // 索引是空的（快照丢了/首次运行）也一样
-        assert_eq!(plan_start(true, &['C'], &HashSet::new()), StartPlan::Scan);
-    }
-
-    #[test]
-    fn no_disks_never_catches_up() {
-        assert_eq!(plan_start(true, &[], &HashSet::new()), StartPlan::Scan);
     }
 
     #[test]

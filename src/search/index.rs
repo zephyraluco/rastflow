@@ -12,8 +12,10 @@ use std::time::Instant;
 
 use super::pathutil::{self, IgnoreRules};
 use super::priority::{DIR_PRIORITY, PriorityTable};
+#[cfg(windows)]
 use super::win::disk;
-use super::win::usn::{is_root, mft_index, UsnRecord, ROOT_MFT_INDEX};
+use super::win::usn::{ROOT_MFT_INDEX, UsnRecord, is_root, mft_index};
+#[cfg(windows)]
 use super::win::volume::Volume;
 use super::{CoreError, MAX_PATH_DEPTH, Result};
 
@@ -284,7 +286,9 @@ impl FileIndex {
         let disk = disk.to_ascii_uppercase();
         if is_root(frn) {
             // 盘根条目记的是第一次见到它时的 FRN，序列号可能与当下不同，所以不比
-            return self.root_slot(disk).filter(|slot| self.live_slot_of(*slot, disk).is_some());
+            return self
+                .root_slot(disk)
+                .filter(|slot| self.live_slot_of(*slot, disk).is_some());
         }
         let record = mft_index(frn) as u32;
         let primary = self.slot_of(disk, record).filter(|slot| {
@@ -295,13 +299,10 @@ impl FileIndex {
             return Some(slot);
         }
         // 主槽位可能已被删掉（逐个删除硬链接），退到同一记录号的其它链接
-        self.link_slots(disk, record)
-            .iter()
-            .copied()
-            .find(|slot| {
-                self.live_slot_of(*slot, disk)
-                    .is_some_and(|entry| entry.frn == frn)
-            })
+        self.link_slots(disk, record).iter().copied().find(|slot| {
+            self.live_slot_of(*slot, disk)
+                .is_some_and(|entry| entry.frn == frn)
+        })
     }
 
     /// 按 `(FRN, 名字)` 精确定位一条链接的槽位。
@@ -367,6 +368,36 @@ impl FileIndex {
         // 盘根也要登记进查找表：别人的父是它
         self.set_slot(disk, ROOT_MFT_INDEX, slot);
         slot
+    }
+
+    /// 将已完成的新代次发布到一个卷；其它卷保持原样。
+    pub fn replace_disk(&mut self, disk: char, source: &Self) {
+        self.clear_disk(disk);
+        self.ensure_root(disk);
+        for (slot, entry) in source.iter_live() {
+            if entry.disk() != disk || is_root(entry.frn) {
+                continue;
+            }
+            let Some(parent) = source
+                .parent_of(entry)
+                .map(|slot| source.entries[slot as usize].frn)
+            else {
+                continue;
+            };
+            if let Some(name) = source
+                .name_bytes(slot)
+                .and_then(|name| std::str::from_utf8(name).ok())
+            {
+                self.insert(
+                    disk,
+                    entry.frn,
+                    parent,
+                    name,
+                    entry.priority == DIR_PRIORITY,
+                    entry.priority,
+                );
+            }
+        }
     }
 
     // ── 增删 ───────────────────────────────────────────────────────────
@@ -794,9 +825,8 @@ impl FileIndex {
             });
         }
 
-        let mut buf: Vec<u8> = Vec::with_capacity(
-            64 + names.len() + out_entries.len() * std::mem::size_of::<Entry>(),
-        );
+        let mut buf: Vec<u8> =
+            Vec::with_capacity(64 + names.len() + out_entries.len() * std::mem::size_of::<Entry>());
         buf.extend_from_slice(MAGIC);
         put_u32(&mut buf, SNAPSHOT_VERSION);
         put_u32(&mut buf, out_entries.len() as u32);
@@ -1320,6 +1350,7 @@ pub struct ScanOutcome {
 /// 位点取的是**枚举开始时**的 `NextUsn`（同时用作 `MFT_ENUM_DATA_V0.HighUsn`）。
 /// 用扫描结束后重新查到的 `NextUsn` 当位点会跳过这期间的变更 —— 那些变更既不在
 /// 这次枚举里，也不会被重放。
+#[cfg(windows)]
 pub fn scan_disk(disk: char, sink: &mut dyn ScanSink) -> Result<ScanOutcome> {
     disk::ensure_supported(disk)?;
     let volume = Volume::open(disk)?;
@@ -1391,7 +1422,7 @@ impl ScanSink for IndexSink<'_> {
 /// 重建一个盘的索引：清旧条目 + 建盘根 → 枚举 MFT 灌进索引 → 按忽略规则清理、收孤儿。
 ///
 /// 清理不能并进枚举那一趟：忽略规则是路径级的，而路径解析要求祖先已在索引里。
-#[cfg(test)]
+#[cfg(all(test, windows))]
 pub fn rebuild_disk(
     disk: char,
     index: &mut FileIndex,
@@ -1443,7 +1474,7 @@ pub fn rebuild_disk(
 }
 
 /// 按 [`IndexConfig::disks`] 依次重建索引（串行，不同时持有多个卷句柄）
-#[cfg(test)]
+#[cfg(all(test, windows))]
 pub fn rebuild_all(
     index: &mut FileIndex,
     priorities: &PriorityTable,
@@ -1527,13 +1558,35 @@ mod tests {
     }
 
     #[test]
+    fn publishing_a_volume_replaces_only_that_volume() {
+        let mut current = sample_tree();
+        current.ensure_root('D');
+        current.insert('D', frn(80), ROOT, "keep.txt", false, 0);
+        let mut staged = FileIndex::new();
+        staged.ensure_root('C');
+        staged.insert('C', frn(90), ROOT, "replacement.txt", false, 0);
+        // 准备新代次期间旧索引仍完整。
+        assert!(current.lookup('C', frn(30)).is_some());
+        current.replace_disk('C', &staged);
+        assert!(current.lookup('C', frn(30)).is_none());
+        assert_eq!(current.path_of(current.lookup('C', frn(90)).unwrap()).as_deref(), Some(r"C:\replacement.txt"));
+        assert_eq!(current.path_of(current.lookup('D', frn(80)).unwrap()).as_deref(), Some(r"D:\keep.txt"));
+    }
+
+    #[test]
     fn path_is_assembled_from_ancestors() {
         let index = sample_tree();
         let slot = index.lookup('C', frn(40)).unwrap();
-        assert_eq!(index.path_of(slot).as_deref(), Some(r"C:\Windows\System32\ntfs.sys"));
+        assert_eq!(
+            index.path_of(slot).as_deref(),
+            Some(r"C:\Windows\System32\ntfs.sys")
+        );
 
         let slot = index.lookup('C', frn(30)).unwrap();
-        assert_eq!(index.path_of(slot).as_deref(), Some(r"C:\Windows\notepad.exe"));
+        assert_eq!(
+            index.path_of(slot).as_deref(),
+            Some(r"C:\Windows\notepad.exe")
+        );
 
         // 盘根本身的名字就是盘符
         let root = index.root_slot('C').unwrap();
@@ -1544,10 +1597,17 @@ mod tests {
     fn name_pool_stores_each_name_once() {
         let index = sample_tree();
         // 5 个条目 + 盘根 = 6 个名字，池里字节数就是它们长度之和
-        let expected: usize = ["C:", "Windows", "Users", "System32", "notepad.exe", "ntfs.sys"]
-            .iter()
-            .map(|name| name.len())
-            .sum();
+        let expected: usize = [
+            "C:",
+            "Windows",
+            "Users",
+            "System32",
+            "notepad.exe",
+            "ntfs.sys",
+        ]
+        .iter()
+        .map(|name| name.len())
+        .sum();
         assert_eq!(index.names.len(), expected);
         assert_eq!(index.iter_live().count(), 6);
     }
@@ -1586,7 +1646,10 @@ mod tests {
         index.insert('C', frn(10), ROOT, "Windows", true, DIR_PRIORITY);
 
         let slot = index.lookup('C', frn(40)).unwrap();
-        assert_eq!(index.path_of(slot).as_deref(), Some(r"C:\Windows\System32\ntfs.sys"));
+        assert_eq!(
+            index.path_of(slot).as_deref(),
+            Some(r"C:\Windows\System32\ntfs.sys")
+        );
     }
 
     #[test]
@@ -1648,14 +1711,21 @@ mod tests {
             .filter_map(|(slot, _)| index.path_of(slot))
             .collect();
         paths.sort();
-        assert!(paths.contains(&r"C:\Windows\zh-CN.mui".to_string()), "{paths:?}");
+        assert!(
+            paths.contains(&r"C:\Windows\zh-CN.mui".to_string()),
+            "{paths:?}"
+        );
         assert!(
             paths.contains(&r"C:\WinSxS\zh-CN-origin.mui".to_string()),
             "{paths:?}"
         );
         // 两个名字都指向同一个 FRN
         assert!(index.lookup_link('C', frn(20), "zh-CN.mui").is_some());
-        assert!(index.lookup_link('C', frn(20), "zh-CN-origin.mui").is_some());
+        assert!(
+            index
+                .lookup_link('C', frn(20), "zh-CN-origin.mui")
+                .is_some()
+        );
     }
 
     #[test]
@@ -1674,7 +1744,11 @@ mod tests {
 
         // 名字对不上时什么也不做：不能把同一文件的其它链接一起删掉
         assert!(!index.remove_link('C', frn(20), "missing.mui"));
-        assert!(index.lookup_link('C', frn(20), "zh-CN-origin.mui").is_some());
+        assert!(
+            index
+                .lookup_link('C', frn(20), "zh-CN-origin.mui")
+                .is_some()
+        );
         assert_eq!(index.iter_live().count(), 4);
     }
 
@@ -1687,7 +1761,11 @@ mod tests {
 
         index.rename('C', frn(10), ROOT, "new-dir", true, DIR_PRIORITY);
 
-        assert_eq!(index.iter_live().count(), 3, "盘根 + 目录 + 文件，不该留下旧名");
+        assert_eq!(
+            index.iter_live().count(),
+            3,
+            "盘根 + 目录 + 文件，不该留下旧名"
+        );
         let slot = index.lookup('C', frn(20)).unwrap();
         assert_eq!(index.path_of(slot).as_deref(), Some(r"C:\new-dir\kept.exe"));
     }
@@ -1699,7 +1777,11 @@ mod tests {
         index.insert('C', new_frn, ROOT, "brand-new.txt", false, 0);
 
         assert!(index.lookup_link('C', frn(20), "zh-CN.mui").is_none());
-        assert!(index.lookup_link('C', frn(20), "zh-CN-origin.mui").is_none());
+        assert!(
+            index
+                .lookup_link('C', frn(20), "zh-CN-origin.mui")
+                .is_none()
+        );
         let slot = index.lookup('C', new_frn).expect("新条目要在");
         assert_eq!(name_of(&index, slot), "brand-new.txt");
     }
@@ -1715,16 +1797,23 @@ mod tests {
 
         let mut loaded = FileIndex::load(&path).unwrap().expect("应当能读回来");
         assert_eq!(loaded.index.iter_live().count(), 5);
-        assert!(loaded.index.lookup_link('C', frn(20), "zh-CN.mui").is_some());
         assert!(
-            loaded.index
+            loaded
+                .index
+                .lookup_link('C', frn(20), "zh-CN.mui")
+                .is_some()
+        );
+        assert!(
+            loaded
+                .index
                 .lookup_link('C', frn(20), "zh-CN-origin.mui")
                 .is_some()
         );
         // 载入后仍能精确删掉一条链接
         assert!(loaded.index.remove_link('C', frn(20), "zh-CN.mui"));
         assert!(
-            loaded.index
+            loaded
+                .index
                 .lookup_link('C', frn(20), "zh-CN-origin.mui")
                 .is_some()
         );
@@ -1786,7 +1875,14 @@ mod tests {
         index.ensure_root('C');
         // 造出大量垃圾名字
         for n in 0..200 {
-            index.insert('C', frn(100 + n), ROOT, &format!("junk-name-{n}.tmp"), false, 0);
+            index.insert(
+                'C',
+                frn(100 + n),
+                ROOT,
+                &format!("junk-name-{n}.tmp"),
+                false,
+                0,
+            );
         }
         for n in 0..200 {
             index.remove('C', frn(100 + n));
@@ -1807,9 +1903,11 @@ mod tests {
         // 这里验证它被上限挡住了（而且不影响其它条目正常工作）。
         let mut index = FileIndex::new();
         index.ensure_root('C');
-        assert!(index
-            .insert('C', 0x0000_FFFF_FFFF_FFFF, ROOT, "huge.txt", false, 0)
-            .is_some());
+        assert!(
+            index
+                .insert('C', 0x0000_FFFF_FFFF_FFFF, ROOT, "huge.txt", false, 0)
+                .is_some()
+        );
         // 条目还在（能被扫描到），只是按 FRN 查不到
         assert_eq!(index.lookup('C', 0x0000_FFFF_FFFF_FFFF), None);
         assert_eq!(index.iter_live().count(), 2);
@@ -1963,7 +2061,9 @@ mod tests {
             index.insert('C', current, parent, &format!("d{n}"), true, DIR_PRIORITY);
             parent = current;
         }
-        let slot = index.lookup('C', frn(1000 + MAX_PATH_DEPTH as u64 + 9)).unwrap();
+        let slot = index
+            .lookup('C', frn(1000 + MAX_PATH_DEPTH as u64 + 9))
+            .unwrap();
         assert_eq!(index.path_of(slot), None);
     }
 
@@ -2046,7 +2146,10 @@ mod tests {
         assert!(insert_mft_record(&mut index, 'C', &priorities, &file));
 
         let slot = index.lookup('C', frn(30)).unwrap();
-        assert_eq!(index.path_of(slot).as_deref(), Some(r"C:\Windows\notepad.exe"));
+        assert_eq!(
+            index.path_of(slot).as_deref(),
+            Some(r"C:\Windows\notepad.exe")
+        );
         // 目录固定 DIR_PRIORITY，文件按后缀查表
         assert_eq!(index.entries[slot as usize].priority, 30, "exe 是最高档");
         let dir_slot = index.lookup('C', frn(10)).unwrap();
@@ -2074,8 +2177,8 @@ mod tests {
         assert!(config.drop_previous, "重建默认丢开旧记录");
         assert!(config.ignore_paths.is_empty());
 
-        let config =
-            IndexConfig::new(vec!['C']).with_ignore_paths([r"C:\Windows".to_string(), "  ".to_string()]);
+        let config = IndexConfig::new(vec!['C'])
+            .with_ignore_paths([r"C:\Windows".to_string(), "  ".to_string()]);
         assert_eq!(config.ignore_paths.len(), 1, "空白项会被过滤掉");
     }
 }

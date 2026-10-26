@@ -1,14 +1,14 @@
+#[cfg(windows)]
 use std::env;
+#[cfg(windows)]
 use std::path::{Path, PathBuf};
 
 fn main() {
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
-        return;
+    #[cfg(windows)]
+    {
+        let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is not set"));
+        embed_windows_resources(&manifest_dir);
     }
-
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is not set"));
-
-    embed_windows_resources(&manifest_dir);
 }
 
 /// 把应用图标与版本信息写进 exe 的资源段。
@@ -19,6 +19,7 @@ fn main() {
 /// 注意：这里**不能**再写自定义清单。rustc 链接 Windows 可执行文件时已经会内嵌
 /// 一份默认清单（含 asInvoker 与 DPI 感知），再通过 winresource 加一份会得到
 /// `CVTRES error CVT1100: 资源重复。类型: MANIFEST，名称: 1` → 链接失败。
+#[cfg(windows)]
 fn embed_windows_resources(manifest_dir: &Path) {
     let icon = manifest_dir.join("assets").join("app-icon.ico");
     // 图标随仓库提交；缺失时不应让整个构建失败，只是 exe 没有图标而已。
