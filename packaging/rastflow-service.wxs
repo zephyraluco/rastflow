@@ -35,13 +35,21 @@
                   Impersonate="no"
                   Return="ignore" />
 
+    <!-- 卸载或升级失败回滚：文件恢复后重新注册并启动旧版本服务。 -->
+    <CustomAction Id="RestoreIndexService"
+                  FileKey="Path"
+                  ExeCommand="--install-service"
+                  Execute="rollback"
+                  Impersonate="no"
+                  Return="ignore" />
+
     <!-- 卸载：先停服务再删。否则服务进程占着 exe，RemoveFiles 只能延到重启。 -->
     <CustomAction Id="UninstallIndexService"
                   FileKey="Path"
                   ExeCommand="--uninstall-service"
                   Execute="deferred"
                   Impersonate="no"
-                  Return="ignore" />
+                  Return="check" />
 
     <InstallExecuteSequence>
       <Custom Action="RollbackIndexService" Before="InstallIndexService">
@@ -57,6 +65,9 @@
         rastflow.exe，InstallFiles 覆盖不了，只能标记"重启后完成"，升级完等于没升。
         新产品稍后会用 InstallIndexService 重新注册并启动服务。
       -->
+      <Custom Action="RestoreIndexService" Before="UninstallIndexService">
+        REMOVE~="ALL"
+      </Custom>
       <Custom Action="UninstallIndexService" Before="RemoveFiles">
         REMOVE~="ALL"
       </Custom>

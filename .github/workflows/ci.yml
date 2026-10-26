@@ -1,7 +1,6 @@
 # 持续集成：构建、Lint、测试
 #
-# 只在 windows-latest 上跑：本应用是 Windows 专有的（#![windows_subsystem]、
-# Win32 直接调用、NSIS 打包），gpui 在 Linux 上还要额外准备 X11/Wayland 开发库。
+# 桌面、服务与完整测试在 Windows 运行；Linux 只验证不依赖平台的核心库。
 #
 # 仓库尚未整体跑过 rustfmt，也还有既有 clippy 告警，故 fmt 与 `-D warnings`
 # 都不作门禁，等这两项干净了再升级成阻断式检查。
@@ -25,6 +24,17 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  core:
+    name: Platform-independent core tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: core
+      - run: cargo test --lib --locked
+
   check:
     name: Build / clippy / test
     runs-on: windows-latest

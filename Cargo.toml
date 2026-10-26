@@ -54,6 +54,7 @@ fragmentPaths = ["packaging/rastflow-service.wxs"]
 customActionRefs = [
     "InstallIndexService",
     "RollbackIndexService",
+    "RestoreIndexService",
     "UninstallIndexService",
 ]
 # MSI 界面语言（同时影响生成的 msi 文件名后缀）。

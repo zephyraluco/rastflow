@@ -1,4 +1,4 @@
-# 持续交付：打包 NSIS 安装包，可选发布为 GitHub Release
+# 持续交付：打包 MSI 安装包，可选发布为 GitHub Release
 #
 # 触发：推 v* 标签（测完打包并发布），或手动触发（默认只构建并上传产物，
 # 勾选 publish 并填 tag 才发 Release）。打包由 Cargo.toml 的
@@ -95,13 +95,12 @@ jobs:
         shell: pwsh
         run: Get-ChildItem dist -File | Select-Object Name, Length
 
-      # 只传安装包本体。glob 写到 .exe 为止：dist/*setup.exe* 会连本地签名
-      # 产出的 .sig 一并带上
+      # 只上传 MSI 本体，不包含签名侧文件
       - name: Upload the installer
         uses: actions/upload-artifact@v4
         with:
           name: rastflow-setup
-          path: dist/*setup.exe
+          path: dist/*.msi
           if-no-files-found: error
 
       - name: Publish the GitHub Release
@@ -112,4 +111,4 @@ jobs:
           name: ${{ env.RELEASE_TAG }}
           generate_release_notes: true
           fail_on_unmatched_files: true
-          files: dist/*setup.exe
+          files: dist/*.msi
