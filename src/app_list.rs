@@ -15,6 +15,7 @@ pub struct AppEntry {
     pub category: SharedString,
     pub launch_target: Option<String>,
     pub launch_count: u64,
+    pub discovered: bool,
 }
 
 impl AppEntry {
@@ -26,6 +27,7 @@ impl AppEntry {
             category: category.into(),
             launch_target: None,
             launch_count: 0,
+            discovered: category == crate::catalog::SYSTEM_SOURCE,
         }
     }
 
@@ -41,6 +43,7 @@ impl AppEntry {
             category: category.into(),
             launch_target,
             launch_count: 0,
+            discovered: category == crate::catalog::SYSTEM_SOURCE,
         }
     }
 
@@ -70,7 +73,7 @@ fn db() -> &'static std::sync::mpsc::Sender<DbCommand> {
             for command in receiver {
                 match command {
                     DbCommand::Load(reply) => { let records = store.load().unwrap_or_else(|error| { eprintln!("[rastflow] 读取应用目录失败：{error}"); Vec::new() });
-                        let _ = reply.send(records.into_iter().map(|record| AppEntry { id: record.id.into(),name: record.name.into(),category: record.category.into(),launch_target: record.target,launch_count: record.launches }).collect()); }
+                        let _ = reply.send(records.into_iter().map(|record| AppEntry { id: record.id.into(),name: record.name.into(),category: record.category.into(),launch_target: record.target,launch_count: record.launches, discovered: record.discovered }).collect()); }
                     DbCommand::Save(entries) => if let Err(error) = store.save(&entries) { eprintln!("[rastflow] 保存应用目录失败：{error}"); },
                     DbCommand::Launch(id) => if let Err(error) = store.record_launch(&id) { eprintln!("[rastflow] 保存启动次数失败：{error}"); },
                     DbCommand::Flush(reply) => { let _ = reply.send(()); }
@@ -111,7 +114,7 @@ fn load_all_from_db() -> Vec<AppEntry> {
 pub fn save_entries(entries: &[AppEntry]) {
     let records = entries.iter().map(|entry| crate::catalog::Record {
         id: entry.id.to_string(),name: entry.name.to_string(),category: entry.category.to_string(),
-        target: entry.launch_target.clone(),launches: entry.launch_count,
+        target: entry.launch_target.clone(),launches: entry.launch_count, discovered: entry.discovered,
     }).collect();
     let _ = db().send(DbCommand::Save(records));
 }
@@ -162,6 +165,7 @@ pub fn upsert_custom_entry(
     }) {
         existing.name = resolved_name.into();
         existing.category = resolved_category.into();
+        existing.discovered = false;
         // launch_target 不变，id 也不变
     } else {
         entries.push(AppEntry::with_launch_target(
@@ -436,9 +440,10 @@ fn merge_discovered(stored: Vec<AppEntry>, discovered: Vec<AppEntry>) -> Vec<App
             if let Some(previous) = counts.get(&entry_key(&entry)) {
                 entry.id = previous.id.clone();
                 entry.launch_count = previous.launch_count;
-                if previous.category.as_ref() != SYSTEM_APP_CATEGORY {
+                if !previous.discovered {
                     entry.name = previous.name.clone();
                     entry.category = previous.category.clone();
+                    entry.discovered = false;
                 }
             }
             entry
@@ -451,7 +456,7 @@ fn merge_discovered(stored: Vec<AppEntry>, discovered: Vec<AppEntry>) -> Vec<App
     for entry in stored {
         // 「系统程序」以这次扫描为准；没有启动目标的占位条目（内置示例）本来也
         // 启动不了，一并丢掉。用户自定义的条目都带启动目标，不受影响。
-        if entry.category.as_ref() == SYSTEM_APP_CATEGORY || entry.launch_target.is_none() {
+        if entry.discovered || entry.launch_target.is_none() {
             continue;
         }
         if !merged_keys.contains(&entry_key(&entry)) {
