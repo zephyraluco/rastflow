@@ -2,3 +2,5 @@
 pub mod search;
 
 pub mod catalog;
+
+pub mod storage;

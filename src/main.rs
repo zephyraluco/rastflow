@@ -150,6 +150,7 @@ fn main() {
             let s = cx.global_mut::<AppSettings>();
             if !persisted.theme.is_empty() { s.theme = persisted.theme.into(); }
             if !persisted.language.is_empty() { s.language = persisted.language.into(); }
+            if parse_hotkey(&persisted.hotkey).is_some() { s.hotkey = persisted.hotkey.into(); }
         }
         // 设置变更时自动写入 settings.json
         cx.observe_global::<AppSettings>(|cx| {
@@ -306,6 +307,7 @@ fn main() {
                         if event == TrayEvent::Quit {
                             layout::filesearch::shutdown();
                             app_list::flush();
+                            settings::flush();
                             cx.update(|cx| cx.quit());
                             return;
                         }
@@ -355,3 +357,5 @@ fn main() {
 }
 
 mod catalog;
+
+mod storage;

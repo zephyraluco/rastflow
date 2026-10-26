@@ -1,45 +1,65 @@
-//! 设置持久化：读写 settings.json
-
+//! 版本化用户偏好；串行后台保存，原子替换并保留上一代。
 use serde::{Deserialize, Serialize};
-
+use std::sync::{mpsc, Mutex, OnceLock};
 use super::global::AppSettings;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PersistedSettings {
+    pub version: u32,
     pub theme: String,
     pub language: String,
+    pub hotkey: String,
 }
-
 impl Default for PersistedSettings {
     fn default() -> Self {
-        let d = AppSettings::default();
-        Self {
-            theme: d.theme.to_string(),
-            language: d.language.to_string(),
-        }
+        Self { version: 1, theme: "system".into(), language: "zh".into(), hotkey: "alt+space".into() }
     }
 }
+pub fn settings_path() -> std::path::PathBuf { crate::utils::app_data_dir().join("settings.json") }
 
-pub fn settings_path() -> std::path::PathBuf {
-    crate::utils::app_data_dir().join("settings.json")
-}
-
-/// 从 settings.json 加载持久化设置，文件不存在时返回默认值。
 pub fn load_settings() -> PersistedSettings {
-    std::fs::read_to_string(settings_path())
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    let path = settings_path();
+    for candidate in [path.clone(), crate::storage::sibling(&path,".bak")] {
+        if let Ok(bytes) = std::fs::read(candidate) {
+            if let Ok(settings) = serde_json::from_slice::<PersistedSettings>(&bytes) {
+                if settings.version == 1 { return settings; }
+            }
+        }
+    }
+    PersistedSettings::default()
 }
 
-/// 将 AppSettings 中需要持久化的字段写入 settings.json。
-pub fn save_settings(s: &AppSettings) {
-    let p = PersistedSettings {
-        theme: s.theme.to_string(),
-        language: s.language.to_string(),
-    };
-    if let Ok(data) = serde_json::to_string_pretty(&p) {
-        let _ = std::fs::write(settings_path(), data);
+enum Command { Save(PersistedSettings), Flush(mpsc::Sender<()>) }
+static WRITER: OnceLock<mpsc::Sender<Command>> = OnceLock::new();
+static PREVIOUS: Mutex<Option<PersistedSettings>> = Mutex::new(None);
+fn writer() -> &'static mpsc::Sender<Command> {
+    WRITER.get_or_init(|| {
+        let (sender, receiver) = mpsc::channel();
+        std::thread::Builder::new().name("rastflow-settings".into()).spawn(move || {
+            for command in receiver {
+                match command {
+                    Command::Save(settings) => {
+                        match serde_json::to_vec_pretty(&settings).map_err(std::io::Error::other).and_then(|bytes| crate::storage::atomic_replace(&settings_path(), &bytes)) {
+                            Ok(()) => {}, Err(error) => eprintln!("[rastflow] 保存设置失败：{error}"),
+                        }
+                    }
+                    Command::Flush(reply) => { let _ = reply.send(()); }
+                }
+            }
+        }).expect("cannot start settings writer");
+        sender
+    })
+}
+pub fn save_settings(settings: &AppSettings) {
+    let next = PersistedSettings { version: 1, theme: settings.theme.to_string(), language: settings.language.to_string(), hotkey: settings.hotkey.to_string() };
+    let mut previous = PREVIOUS.lock().unwrap_or_else(|e| e.into_inner());
+    if previous.as_ref() == Some(&next) { return; }
+    if writer().send(Command::Save(next.clone())).is_ok() { *previous = Some(next); }
+}
+pub fn flush() {
+    if let Some(writer) = WRITER.get() {
+        let (reply, done) = mpsc::channel();
+        if writer.send(Command::Flush(reply)).is_ok() { let _ = done.recv_timeout(std::time::Duration::from_secs(5)); }
     }
 }

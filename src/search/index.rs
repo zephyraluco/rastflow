@@ -914,28 +914,27 @@ impl FileIndex {
             file_bytes: buf.len() as u64,
         };
 
-        let temp = temp_path(path);
-        std::fs::write(&temp, &buf)?;
-        // 改名是原子的：要么还是旧快照，要么就是完整的这一份
-        std::fs::rename(&temp, path)?;
+        crate::storage::atomic_replace(path, &buf)?;
         Ok(stats)
     }
 
     /// 读快照。文件不存在、版本不对、校验和不符都返回 `Ok(None)` ——
     /// 调用方按「没有快照」处理，重扫 MFT 即可，快照本来就只是加速手段。
     pub fn load(path: &Path) -> Result<Option<LoadedIndex>> {
-        let Ok(buf) = std::fs::read(path) else {
-            return Ok(None);
-        };
-        let Ok(loaded) = Self::decode(&buf) else {
-            return Ok(None);
-        };
-        Ok(Some(loaded))
+        for candidate in [path.to_path_buf(), crate::storage::sibling(path, ".bak")] {
+            if let Ok(buf) = std::fs::read(candidate) {
+                if let Ok(loaded) = Self::decode(&buf) { return Ok(Some(loaded)); }
+            }
+        }
+        Ok(None)
     }
 
     fn decode(buf: &[u8]) -> Result<LoadedIndex> {
         let corrupt = || CoreError::InvalidArgument("索引快照已损坏".to_string());
 
+        if buf.len() < 16 || fnv1a(&buf[..buf.len()-8]) != u64::from_le_bytes(buf[buf.len()-8..].try_into().map_err(|_| corrupt())?) {
+            return Err(corrupt());
+        }
         let mut cursor = Cursor::new(buf);
         if cursor.take(8)? != MAGIC {
             return Err(corrupt());
@@ -947,11 +946,13 @@ impl FileIndex {
         let names_len = cursor.u32()? as usize;
 
         let disk_count = cursor.u32()? as usize;
+        if disk_count > 26 || entry_count > buf.len()/24 || names_len > buf.len() { return Err(corrupt()); }
         let mut raw_tables: Vec<(char, u32, Vec<u32>)> = Vec::with_capacity(disk_count);
         for _ in 0..disk_count {
             let letter = cursor.u8()? as char;
             let root = cursor.u32()?;
             let len = cursor.u32()? as usize;
+            if len > buf.len()/4 { return Err(corrupt()); }
             let mut slots = Vec::with_capacity(len);
             for _ in 0..len {
                 slots.push(cursor.u32()?);
@@ -973,6 +974,7 @@ impl FileIndex {
         }
 
         let priority_count = cursor.u32()? as usize;
+        if priority_count > buf.len()/8 { return Err(corrupt()); }
         let mut priorities = Vec::with_capacity(priority_count);
         for _ in 0..priority_count {
             let len = cursor.u32()? as usize;
@@ -983,6 +985,7 @@ impl FileIndex {
         }
 
         let mark_count = cursor.u32()? as usize;
+        if mark_count > 26 { return Err(corrupt()); }
         let mut marks = HashMap::with_capacity(mark_count);
         for _ in 0..mark_count {
             let letter = cursor.u8()? as char;
@@ -1077,12 +1080,6 @@ pub struct SaveStats {
 /// 快照路径
 pub fn snapshot_path(dir: &Path) -> PathBuf {
     dir.join(SNAPSHOT_FILE)
-}
-
-fn temp_path(path: &Path) -> PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(".tmp");
-    path.with_file_name(name)
 }
 
 // ── 小工具 ─────────────────────────────────────────────────────────────
@@ -1982,6 +1979,19 @@ mod tests {
         let slot = loaded.index.lookup('C', frn(400)).unwrap();
         assert_eq!(name_of(&loaded.index, slot), "kept.txt");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_current_snapshot_recovers_previous_generation() {
+        let dir = temp_dir("backup");
+        let path = snapshot_path(&dir);
+        let mut index = sample_tree();
+        let priorities = PriorityTable::with_builtin_defaults();
+        index.save(&path, &priorities, &HashMap::new()).unwrap();
+        index.save(&path, &priorities, &HashMap::new()).unwrap();
+        std::fs::write(&path,b"broken").unwrap();
+        assert!(FileIndex::load(&path).unwrap().unwrap().index.lookup('C',frn(30)).is_some());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

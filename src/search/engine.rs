@@ -201,7 +201,6 @@ impl Engine {
         let priorities = read(&self.priorities).clone();
         let marks = lock(&self.marks).clone();
         let mut index = write(&self.index);
-        index.prune_orphans();
         index.save(&self.snapshot, &priorities, &marks)
     }
 
