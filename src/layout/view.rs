@@ -9,12 +9,8 @@ use gpui_kit::component::{
 };
 use std::time::{Duration, Instant};
 
-const FILE_SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
-
-/// 每批从后台取回的图标数量。分批是为了让首屏先拿到图标、其余陆续补齐；
-/// 一次全提完再回填的话，列表要等很久才能显示图标。
 use crate::components::{
-    file_search::{index_status_panel, no_results, result_header, result_row, searching_row},
+    file_search::{index_status_panel, no_results, result_header, result_row},
     launcher_footer::LauncherFooter,
     search_bar::SearchBar,
 };
@@ -30,6 +26,7 @@ use super::filesearch::{
 actions!(launcher, [ToggleFileMode]);
 
 struct FileSearchDelegate {
+    icons: super::icon_cache::IconCache,
     results: Vec<FileResult>,
     selected_index: Option<IndexPath>,
 }
@@ -37,6 +34,7 @@ struct FileSearchDelegate {
 impl FileSearchDelegate {
     fn new() -> Self {
         Self {
+            icons: super::icon_cache::IconCache::default(),
             results: Vec::new(),
             selected_index: None,
         }
@@ -72,11 +70,23 @@ impl ListDelegate for FileSearchDelegate {
     ) -> Option<Self::Item> {
         let result = self.results.get(ix.row)?;
         let selected = Some(ix) == self.selected_index;
+        let target = result.path.to_string_lossy().into_owned();
+        let icon = self.icons.get(Some(&target));
+        if self.icons.request(&target) {
+            cx.spawn(async move |this, cx| {
+                let icon = crate::app_icon::load_async(target.clone()).await;
+                let _ = this.update(cx, |state, cx| {
+                    state.delegate_mut().icons.insert(vec![(target, icon)]);
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
 
         Some(
             ListItem::new(ix.row)
                 .selected(selected)
-                .child(result_row(result, cx)),
+                .child(result_row(result, icon, cx)),
         )
     }
 
@@ -100,10 +110,11 @@ impl ListDelegate for FileSearchDelegate {
         _cx: &mut Context<ListState<Self>>,
     ) {
         if let Some(ix) = self.selected_index
-            && let Some(result) = self.results.get(ix.row) {
-                let _ = open_result(result);
-                hide_window(window);
-            }
+            && let Some(result) = self.results.get(ix.row)
+        {
+            let _ = open_result(result);
+            hide_window(window);
+        }
     }
 
     fn render_empty(
@@ -373,7 +384,6 @@ impl LauncherView {
 
         let entity = cx.entity().downgrade();
         cx.spawn(async move |_this, cx: &mut gpui::AsyncApp| {
-            cx.background_executor().timer(FILE_SEARCH_DEBOUNCE).await;
             let should_search = cx.update(|app| {
                 entity
                     .read_with(app, |this, _| this.file_search_generation == generation)
@@ -579,10 +589,11 @@ impl Render for LauncherView {
                     )
                     .on_mouse_move(cx.listener(|this, _ev: &MouseMoveEvent, window, _cx| {
                         if let Some(start) = this.drag_start
-                            && start.elapsed() >= std::time::Duration::from_millis(200) {
-                                this.drag_start = None;
-                                window.start_window_move();
-                            }
+                            && start.elapsed() >= std::time::Duration::from_millis(200)
+                        {
+                            this.drag_start = None;
+                            window.start_window_move();
+                        }
                     }))
                     .on_mouse_up(
                         MouseButton::Left,
@@ -648,21 +659,17 @@ impl LauncherView {
             },
             cx.listener(|this, _ev, _window, cx| this.detect_file_search(cx)),
             cx,
-        )
-            && !super::filesearch::can_search() {
-                return panel;
-            }
+        ) && !super::filesearch::can_search()
+        {
+            return panel;
+        }
 
-        // 索引就绪：搜索进度、错误、空态与结果列表
+        // 索引就绪：错误、空态与结果列表
         v_flex()
             .flex_1()
             .min_w_0()
             .p_2()
             .gap_1()
-            .when(
-                self.file_searching && self.file_results.is_empty(),
-                |this| this.child(searching_row(cx)),
-            )
             .when_some(self.file_error.as_ref(), |this, error| {
                 this.child(Alert::error(
                     "filesearch-error",

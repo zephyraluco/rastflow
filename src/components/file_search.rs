@@ -59,7 +59,11 @@ pub fn index_status_panel(
                     t("filesearch.indexing.hint", cx).to_string(),
                 ],
             };
-            Some(busy_panel(t("filesearch.indexing", cx).to_string(), detail, cx))
+            Some(busy_panel(
+                t("filesearch.indexing", cx).to_string(),
+                detail,
+                cx,
+            ))
         }
 
         SearchStatus::Unavailable { reason, .. } => Some(unavailable_panel(
@@ -87,14 +91,27 @@ pub fn result_header(cx: &App) -> AnyElement {
         .font_semibold()
         .text_color(muted)
         .child(div().w(px(NAME_COL)).child(t("filesearch.column.name", cx)))
-        .child(div().flex_1().min_w_0().child(t("filesearch.column.path", cx)))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(t("filesearch.column.path", cx)),
+        )
         .child(div().w(px(SIZE_COL)).child(t("filesearch.column.size", cx)))
-        .child(div().w(px(MODIFIED_COL)).child(t("filesearch.column.modified", cx)))
+        .child(
+            div()
+                .w(px(MODIFIED_COL))
+                .child(t("filesearch.column.modified", cx)),
+        )
         .into_any_element()
 }
 
 /// 结果表的一行。
-pub fn result_row(result: &FileResult, cx: &App) -> AnyElement {
+pub fn result_row(
+    result: &FileResult,
+    icon: Option<std::sync::Arc<RenderImage>>,
+    cx: &App,
+) -> AnyElement {
     let muted = cx.theme().muted_foreground;
 
     h_flex()
@@ -104,12 +121,31 @@ pub fn result_row(result: &FileResult, cx: &App) -> AnyElement {
         .px_3()
         .py_1()
         .child(
-            div()
+            h_flex()
                 .w(px(NAME_COL))
-                .truncate()
-                .text_sm()
-                .font_semibold()
-                .child(result.name.clone()),
+                .flex_shrink_0()
+                .gap_1()
+                .child(match icon {
+                    Some(icon) => img(icon)
+                        .w(px(16.))
+                        .h(px(16.))
+                        .flex_shrink_0()
+                        .into_any_element(),
+                    None => Icon::new(if result.is_dir {
+                        IconName::Folder
+                    } else {
+                        IconName::File
+                    })
+                    .size(px(16.))
+                    .into_any_element(),
+                })
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_sm()
+                        .child(result.name.clone()),
+                ),
         )
         .child(
             div()
@@ -139,20 +175,6 @@ pub fn result_row(result: &FileResult, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-/// 搜索进行中、但还没有结果时的提示行。
-pub fn searching_row(cx: &App) -> AnyElement {
-    h_flex()
-        .items_center()
-        .gap_2()
-        .px_2()
-        .py_1()
-        .text_xs()
-        .text_color(cx.theme().muted_foreground)
-        .child(Spinner::new().xsmall())
-        .child(t("filesearch.searching", cx))
-        .into_any_element()
-}
-
 /// 查无结果时的空态：朴素的一行弱化文字（与重构前一致）。
 ///
 /// 不用 `Empty`：它自带虚线边框与大内边距，在小窗口的结果区里会变成一个
@@ -173,7 +195,12 @@ pub fn no_results(cx: &App) -> AnyElement {
 /// 不用 `Empty`：那是一个带虚线边框的占位盒子，而这里要的是「裸」居中内容，
 /// 边框会把小窗口撑得很重。
 fn centered() -> Div {
-    v_flex().flex_1().items_center().justify_center().gap_1().p_6()
+    v_flex()
+        .flex_1()
+        .items_center()
+        .justify_center()
+        .gap_1()
+        .p_6()
 }
 
 /// 「等待中 / 进行中」：转圈 + 标题 + 若干行明细。

@@ -69,6 +69,7 @@ impl SearchStatus {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileResult {
+    pub is_dir: bool,
     pub name: String,
     pub dir: String,
     pub path: PathBuf,
@@ -359,9 +360,9 @@ pub fn cancel_search() {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
-        {
-            cancel.store(true, Ordering::Relaxed);
-        }
+    {
+        cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 /// 按关键字搜索。
@@ -419,20 +420,21 @@ impl FileResult {
             .map(|value| value.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        let (size, modified) = match std::fs::metadata(&path_buf) {
+        let (is_dir, size, modified) = match std::fs::metadata(&path_buf) {
             Ok(meta) => {
                 let size = if meta.is_dir() {
                     "-".to_string()
                 } else {
                     format_size(meta.len())
                 };
-                (size, format_system_time(meta.modified()))
+                (meta.is_dir(), size, format_system_time(meta.modified()))
             }
-            // stat 失败说明这条记录已经过期了，交给搜索时的懒删除去清理
-            Err(_) => ("-".to_string(), "-".to_string()),
+            // 元数据不可读时仍保留索引结果。
+            Err(_) => (false, "-".to_string(), "-".to_string()),
         };
 
         Self {
+            is_dir,
             name,
             dir,
             path: path_buf,
